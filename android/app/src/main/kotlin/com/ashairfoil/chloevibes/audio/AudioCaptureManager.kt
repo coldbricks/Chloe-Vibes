@@ -83,20 +83,17 @@ class AudioCaptureManager(private val context: Context) {
     private var hasFreshSamples = false
     @Volatile private var lastSampleTimeMs = 0L
 
+    // Visualizer FFT magnitude data (0.0-1.0 per bin, already dB-normalized)
+    private var capturedMagnitudes = FloatArray(0)
+    private var hasFreshMagnitudes = false
+    @Volatile private var useVisualizerFft = false
+    @Volatile private var visualizerSampleRate = 48000
+
     // Silence / stall detection for Visualizer fallback
     @Volatile private var silentFrameCount = 0
     private companion object {
-        /** After this many consecutive silent frames, restart Visualizer. */
-        const val SILENT_FRAMES_BEFORE_FALLBACK = 90 // ~1.5 seconds at 60Hz
-        /** If Visualizer stops delivering samples for this long, it's dead. */
+        const val SILENT_FRAMES_BEFORE_FALLBACK = 90
         const val STALL_TIMEOUT_MS = 3000L
-        /**
-         * Gain applied to Visualizer waveform data. The Visualizer API delivers
-         * 8-bit unsigned bytes (resolution ~0.008 per step), which produces
-         * energy values roughly 10x lower than raw PCM. This gain brings the
-         * signal into the range the gate/envelope chain expects.
-         */
-        const val VISUALIZER_GAIN = 10f
     }
 
     // Signal processing parameters (set from UI thread)
@@ -226,18 +223,7 @@ class AudioCaptureManager(private val context: Context) {
                         waveform: ByteArray,
                         samplingRate: Int
                     ) {
-                        // Convert unsigned byte waveform to float and apply
-                        // Visualizer gain. The API gives 8-bit data (~10x quieter
-                        // than raw PCM), so we scale up here before the pipeline.
-                        val samples = FloatArray(waveform.size) { i ->
-                            val raw = (waveform[i].toInt() and 0xFF).toFloat() / 128f - 1f
-                            (raw * VISUALIZER_GAIN).coerceIn(-1f, 1f)
-                        }
-                        synchronized(sampleLock) {
-                            capturedSamples = samples
-                            hasFreshSamples = true
-                        }
-                        lastSampleTimeMs = System.currentTimeMillis()
+                        // Not used — we use FFT data instead for reliable amplitude
                     }
 
                     override fun onFftDataCapture(
@@ -245,16 +231,41 @@ class AudioCaptureManager(private val context: Context) {
                         fft: ByteArray,
                         samplingRate: Int
                     ) {
-                        // We use waveform capture + our own FFT for consistency
-                        // with the Rust version's spectral analysis
+                        // Android Visualizer FFT format: [DC_real, DC_imag,
+                        // bin1_real, bin1_imag, ...]. Convert to magnitudes
+                        // normalized to 0.0-1.0, matching the Web Audio
+                        // AnalyserNode's getByteFrequencyData() output that
+                        // the original HTML ChloeVibes used.
+                        val numBins = fft.size / 2
+                        val mags = FloatArray(numBins)
+                        // minDb/maxDb matching the HTML version's AnalyserNode
+                        val minDb = -80f
+                        val maxDb = -10f
+                        val dbRange = maxDb - minDb
+
+                        for (i in 0 until numBins) {
+                            val re = fft[2 * i].toFloat()
+                            val im = fft[2 * i + 1].toFloat()
+                            val mag = kotlin.math.sqrt(re * re + im * im)
+                            // Convert to dB, then normalize to 0-1 like Web Audio
+                            val db = if (mag > 0f) 20f * kotlin.math.log10(mag / 128f) else minDb
+                            mags[i] = ((db - minDb) / dbRange).coerceIn(0f, 1f)
+                        }
+                        synchronized(sampleLock) {
+                            capturedMagnitudes = mags
+                            hasFreshMagnitudes = true
+                        }
+                        visualizerSampleRate = samplingRate / 1000 // API gives milliHz
+                        lastSampleTimeMs = System.currentTimeMillis()
                     }
                 },
                 Visualizer.getMaxCaptureRate(),
-                true,  // waveform
-                false  // fft
+                false, // waveform — not needed
+                true   // fft — use this instead
             )
             viz.enabled = true
             visualizer = viz
+            useVisualizerFft = true
             true
         } catch (e: Exception) {
             false
@@ -331,48 +342,106 @@ class AudioCaptureManager(private val context: Context) {
           try {
             val currentTimeMs = System.nanoTime() / 1_000_000f - startMs
 
-            // Grab latest samples
-            val samples: FloatArray
-            synchronized(sampleLock) {
-                if (!hasFreshSamples) {
-                    samples = FloatArray(FFT_SIZE)
+            val spectralData: SpectralData
+            val energy: Float
+
+            if (useVisualizerFft) {
+                // ---- Visualizer FFT path ----
+                // Use pre-computed magnitude data (dB-normalized to 0-1),
+                // matching the Web Audio AnalyserNode used by the HTML version.
+                val mags: FloatArray
+                synchronized(sampleLock) {
+                    if (!hasFreshMagnitudes) {
+                        mags = FloatArray(0)
+                    } else {
+                        mags = capturedMagnitudes.copyOf()
+                        hasFreshMagnitudes = false
+                    }
+                }
+
+                // Stall detection for Visualizer
+                if (sourceMode == AudioSourceMode.SystemAudio) {
+                    val stalled = visualizer != null &&
+                        (System.currentTimeMillis() - lastSampleTimeMs) > STALL_TIMEOUT_MS
+                    val isSilent = mags.isEmpty() || mags.all { it < 0.001f }
+                    if (isSilent) silentFrameCount++ else silentFrameCount = 0
+                    if (stalled || silentFrameCount >= SILENT_FRAMES_BEFORE_FALLBACK) {
+                        silentFrameCount = 0
+                        try { visualizer?.apply { enabled = false; release() } } catch (_: Exception) {}
+                        visualizer = null
+                        useVisualizerFft = false
+                        startVisualizer()
+                        lastSampleTimeMs = System.currentTimeMillis()
+                    }
+                }
+
+                if (mags.isEmpty()) {
+                    spectralData = SpectralData()
+                    energy = 0f
                 } else {
-                    samples = capturedSamples
-                    hasFreshSamples = false
+                    // Build SpectralData from Visualizer magnitudes.
+                    // Bin resolution depends on capture size and sample rate.
+                    val sr = visualizerSampleRate.toFloat()
+                    val captureSize = mags.size * 2
+                    val binRes = sr / captureSize
+
+                    // Calculate band energies from magnitude bins
+                    val bandEnergies = FloatArray(NUM_BANDS)
+                    for (b in 0 until NUM_BANDS) {
+                        val loHz = BAND_EDGES[b]
+                        val hiHz = BAND_EDGES[b + 1]
+                        val loBin = (loHz / binRes).toInt().coerceIn(0, mags.size - 1)
+                        val hiBin = (hiHz / binRes).toInt().coerceIn(loBin + 1, mags.size)
+                        var sum = 0f
+                        for (i in loBin until hiBin) sum += mags[i] * mags[i]
+                        val count = (hiBin - loBin).coerceAtLeast(1)
+                        bandEnergies[b] = kotlin.math.sqrt(sum / count)
+                    }
+
+                    // RMS of magnitudes as overall power proxy
+                    var rmsSum = 0f
+                    for (m in mags) rmsSum += m * m
+                    val rmsPower = kotlin.math.sqrt(rmsSum / mags.size)
+
+                    // Spectral centroid
+                    var wSum = 0f; var tMag = 0f
+                    for (i in mags.indices) {
+                        val freq = i * binRes
+                        wSum += freq * mags[i]; tMag += mags[i]
+                    }
+                    val centroid = if (tMag > 1e-6f) wSum / tMag else 0f
+
+                    // Spectral flux (use previous data stored in analyzer)
+                    val flux = state.analyzer.computeFluxFrom(mags)
+
+                    spectralData = SpectralData(
+                        bandEnergies = bandEnergies,
+                        rmsPower = rmsPower,
+                        spectralCentroid = centroid,
+                        spectralFlux = flux,
+                        dominantFrequency = 0f
+                    )
+
+                    // Apply volume as a gain on the energy
+                    energy = SpectralAnalyzer.extractEnergy(spectralData, frequencyMode, targetFrequency) * mainVolume
                 }
+            } else {
+                // ---- Raw sample path (mic or fallback) ----
+                val samples: FloatArray
+                synchronized(sampleLock) {
+                    if (!hasFreshSamples) {
+                        samples = FloatArray(FFT_SIZE)
+                    } else {
+                        samples = capturedSamples
+                        hasFreshSamples = false
+                    }
+                }
+                val gained = FloatArray(samples.size) { i -> samples[i] * mainVolume }
+                spectralData = state.analyzer.analyze(gained, 1)
+                energy = SpectralAnalyzer.extractEnergy(spectralData, frequencyMode, targetFrequency)
             }
 
-            // Detect dead Visualizer: either stopped calling back or producing silence.
-            // When detected, tear it down and re-create it (Samsung kills session 0
-            // periodically but a fresh Visualizer usually works again).
-            if (sourceMode == AudioSourceMode.SystemAudio) {
-                val stalled = visualizer != null &&
-                    (System.currentTimeMillis() - lastSampleTimeMs) > STALL_TIMEOUT_MS
-                var rmsCheck = 0f
-                for (s in samples) rmsCheck += s * s
-                val isSilent = samples.isEmpty() || (rmsCheck / samples.size.coerceAtLeast(1)) < 1e-10f
-
-                if (isSilent) silentFrameCount++ else silentFrameCount = 0
-
-                if (stalled || silentFrameCount >= SILENT_FRAMES_BEFORE_FALLBACK) {
-                    // Tear down and re-create the Visualizer
-                    silentFrameCount = 0
-                    try { visualizer?.apply { enabled = false; release() } } catch (_: Exception) {}
-                    visualizer = null
-                    startVisualizer()
-                    lastSampleTimeMs = System.currentTimeMillis()
-                }
-            }
-
-            // Apply volume gain
-            val gained = FloatArray(samples.size) { i -> samples[i] * mainVolume }
-
-            // Step 1: Spectral analysis
-            val spectralData = state.analyzer.analyze(gained, 1)
             state.lastSpectralData = spectralData
-
-            // Step 2: Extract energy for current frequency mode
-            val energy = SpectralAnalyzer.extractEnergy(spectralData, frequencyMode, targetFrequency)
             state.lastEnergy = energy
 
             // Step 3: Gate

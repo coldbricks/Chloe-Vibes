@@ -234,6 +234,24 @@ class SpectralAnalyzer(private val sampleRate: Float = 48000f) {
         )
     }
 
+    /**
+     * Compute spectral flux from external magnitude array (e.g. Visualizer FFT).
+     * Updates the internal previous-magnitude buffer.
+     */
+    fun computeFluxFrom(mags: FloatArray): Float {
+        var flux = 0f
+        val len = mags.size.coerceAtMost(prevMagnitude.size)
+        for (i in 0 until len) {
+            val diff = mags[i] - prevMagnitude[i]
+            if (diff > 0f) flux += diff
+        }
+        // Store for next frame (resize-safe copy)
+        for (i in prevMagnitude.indices) {
+            prevMagnitude[i] = if (i < mags.size) mags[i] else 0f
+        }
+        return flux
+    }
+
     companion object {
         /**
          * Extract energy from specific frequency range based on mode.
