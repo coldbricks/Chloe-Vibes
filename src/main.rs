@@ -15,7 +15,7 @@ fn main() {
     // (windows_subsystem = "windows" eats all stderr)
     std::panic::set_hook(Box::new(|info| {
         let msg = format!("{info}\n");
-        let _ = std::fs::write("music-vibes-crash.log", &msg);
+        let _ = std::fs::write("chloe-vibes-crash.log", &msg);
         // Also try stderr in case we have a console
         eprintln!("{msg}");
     }));

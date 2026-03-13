@@ -170,7 +170,7 @@ async fn start_embedded_client(client_name: &str) -> Result<ButtplugClient, Stri
 pub async fn start_bp_server(
     server_addr: Option<String>,
 ) -> Result<ButtplugClient, ButtplugClientError> {
-    let name = "music-vibes";
+    let name = "chloe-vibes";
     let client = if let Some(addr) = server_addr.as_deref() {
         match connect_remote(name, addr).await {
             Ok(client) => client,

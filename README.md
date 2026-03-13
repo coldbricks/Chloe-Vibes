@@ -1,4 +1,4 @@
-# Music Vibes v4
+# Chloe Vibes
 
 **Audio-reactive haptic controller** — A synthesizer for vibration motors. Captures system audio, analyzes it with FFT spectral analysis, and drives Bluetooth haptic devices through the [Buttplug.io](https://buttplug.io) protocol.
 
@@ -66,7 +66,7 @@ If you want to use Intiface, start it and pass `--server-addr ws://127.0.0.1:123
 
 ## Quick Start
 
-1. Run `music-vibes.exe`
+1. Run `chloe-vibes.exe`
 2. Click "Start scanning" to find devices
 3. Enable your device
 4. Select a preset, play music, adjust to taste

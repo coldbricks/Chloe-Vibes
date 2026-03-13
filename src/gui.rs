@@ -60,7 +60,7 @@ pub struct Gui {
 pub fn gui(args: Gui) {
     let native_options = eframe::NativeOptions::default();
     eframe::run_native(
-        "Music Vibes v4",
+        "Chloe Vibes",
         native_options,
         Box::new(|ctx| Ok(Box::new(GuiApp::new(args.server_addr, ctx)))),
     )
@@ -1501,7 +1501,7 @@ impl eframe::App for GuiApp {
                     (trimmed_intensity - self.vibration_level) * output_alpha;
                 self.vibration_level = self.vibration_level.clamp(0.0, 1.0);
             } else {
-                // ====== LEGACY PIPELINE (original Music Vibes) ======
+                // ====== LEGACY PIPELINE (original Chloe Vibes) ======
                 let source = sanitize_unit(self.sound_power.load());
                 let sound_power = sanitize_unit(source * main_mul);
                 self.input_level = source;
@@ -1656,7 +1656,7 @@ impl eframe::App for GuiApp {
 
                 let legacy_active = !self.settings.use_advanced_processing;
                 let legacy_btn = Button::new(
-                    RichText::new("Original Music Vibes (RMS)")
+                    RichText::new("Original Chloe Vibes (RMS)")
                         .size(10.0)
                         .monospace()
                         .color(if legacy_active {

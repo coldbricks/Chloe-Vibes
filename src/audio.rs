@@ -171,7 +171,7 @@ impl SharedSpectralData {
 // ---------------------------------------------------------------------------
 
 /// Performs FFT on audio samples and extracts perceptual features.
-/// This is the core upgrade over Music Vibes' simple RMS calculation.
+/// This is the core upgrade over Chloe Vibes' simple RMS calculation.
 ///
 /// Runs in the capture thread. Produces SpectralData each frame.
 pub struct SpectralAnalyzer {
@@ -555,7 +555,7 @@ impl Gate {
 /// Full Attack-Decay-Sustain-Release envelope processor.
 /// Transforms raw gate/trigger events into smooth, shaped output curves.
 ///
-/// This is the biggest single upgrade over Music Vibes' linear decay.
+/// This is the biggest single upgrade over Chloe Vibes' linear decay.
 /// Each stage has a configurable curve exponent:
 ///   - 1.0 = linear
 ///   - < 1.0 = fast start, slow finish (logarithmic feel)
