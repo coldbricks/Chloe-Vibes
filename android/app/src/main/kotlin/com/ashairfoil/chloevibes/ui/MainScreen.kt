@@ -235,7 +235,7 @@ fun MainScreen(
         SectionHeader("GATE", trailingContent = {
             GateIndicator(state.gateOpen)
         })
-        LabeledSlider("Threshold", state.gateThreshold, 0f, 0.5f, "%.2f") {
+        LabeledSlider("Threshold", state.gateThreshold, 0f, 1f, "%.2f") {
             state.gateThreshold = it; state.selectedPresetName = "Custom"; onParameterChanged()
         }
         LabeledSlider("Auto-Sense", state.autoGateAmount, 0f, 1f, "%.2f") {

@@ -96,10 +96,12 @@ class Gate {
         // Blend manual and auto thresholds
         val effectiveThreshold = lerp(manualThreshold, optimalThreshold, autoGateAmount)
 
-        // Soft-knee gate with hysteresis
-        val knee = thresholdKnee.coerceIn(0f, 0.45f)
-        val openThreshold = (effectiveThreshold - 0.2f * knee).coerceIn(0f, 1f)
-        val closeThreshold = (effectiveThreshold - knee - 0.08f * effectiveThreshold).coerceAtLeast(0f)
+        // Hysteresis: close threshold is slightly below open threshold to
+        // prevent chattering.  The gap scales with the threshold itself so
+        // low thresholds get a tight band and high thresholds get a wider one.
+        val hysteresis = (effectiveThreshold * 0.25f).coerceIn(0.005f, 0.08f)
+        val openThreshold = effectiveThreshold
+        val closeThreshold = (effectiveThreshold - hysteresis).coerceAtLeast(0f)
         val isAbove = if (!wasOpen) {
             energy > openThreshold
         } else {
