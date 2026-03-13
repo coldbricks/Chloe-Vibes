@@ -71,7 +71,14 @@ class EnvelopeProcessor {
         this.magnitude = scaledMagnitude.coerceIn(0f, 1.5f)
         state = EnvelopeState.Attack
         startTimeMs = currentTimeMs
-        phaseStartValue = value // Start from current value (retrigger)
+        // Start from current value, but ensure a minimum floor so the trigger
+        // frame produces non-zero output.  Without this, the first BLE command
+        // after a trigger is Vibrate:0 because value=0 and elapsed=0.  In
+        // foreground the next frame arrives in ~16ms so it's imperceptible, but
+        // when backgrounded Android throttles the thread and the follow-up
+        // command may be delayed hundreds of milliseconds — leaving the device
+        // silent through the entire attack phase.
+        phaseStartValue = value.coerceAtLeast(0.15f)
         lastTriggerTimeMs = currentTimeMs
     }
 

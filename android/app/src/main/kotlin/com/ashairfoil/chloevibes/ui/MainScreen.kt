@@ -30,13 +30,21 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.PathEffect
+import androidx.compose.ui.graphics.drawscope.Stroke as DrawStroke
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.text.KeyboardOptions
 import com.ashairfoil.chloevibes.audio.*
 import com.ashairfoil.chloevibes.device.ConnectionState
+import kotlin.math.exp
+import kotlin.math.ln
 
 // ---------------------------------------------------------------------------
 // ViewModel state
@@ -215,7 +223,8 @@ fun MainScreen(
             state.frequencyMode = it; state.selectedPresetName = "Custom"; onParameterChanged()
         }
         if (state.frequencyMode != FrequencyMode.Full) {
-            LabeledSlider("Target Freq", state.targetFrequency, 20f, 16000f, "%.0f Hz") {
+            LabeledSlider("Target Freq", state.targetFrequency, 20f, 16000f, "%.0f Hz",
+                logarithmic = true) {
                 state.targetFrequency = it; state.selectedPresetName = "Custom"; onParameterChanged()
             }
         }
@@ -270,6 +279,19 @@ fun MainScreen(
         LabeledSlider("Release", state.releaseMs, 1f, 2000f, "%.0f ms", ChloeColors.Release) {
             state.releaseMs = it; state.selectedPresetName = "Custom"; onParameterChanged()
         }
+
+        Spacer(modifier = Modifier.height(10.dp))
+
+        // ADSR waveform scope
+        EnvelopeScopeView(
+            attackMs = state.attackMs,
+            decayMs = state.decayMs,
+            sustainLevel = state.sustainLevel,
+            releaseMs = state.releaseMs,
+            attackCurve = state.attackCurve,
+            decayCurve = state.decayCurve,
+            releaseCurve = state.releaseCurve
+        )
 
         Spacer(modifier = Modifier.height(8.dp))
         Text("Curves", color = ChloeColors.OnSurfaceDim, fontSize = 11.sp, letterSpacing = 1.sp)
@@ -825,7 +847,7 @@ private fun SectionHeader(title: String, trailingContent: @Composable (() -> Uni
 }
 
 // ---------------------------------------------------------------------------
-// Labeled slider
+// Labeled slider (with tap-to-edit and optional logarithmic scale)
 // ---------------------------------------------------------------------------
 
 @Composable
@@ -836,8 +858,21 @@ private fun LabeledSlider(
     max: Float,
     format: String,
     accentColor: Color = ChloeColors.OnSurface,
+    logarithmic: Boolean = false,
     onValueChange: (Float) -> Unit
 ) {
+    var showDialog by remember { mutableStateOf(false) }
+
+    // For logarithmic sliders, map actual value ↔ 0..1 slider position
+    val sliderValue = if (logarithmic) {
+        val minLog = ln(min)
+        val maxLog = ln(max)
+        ((ln(value.coerceIn(min, max)) - minLog) / (maxLog - minLog)).coerceIn(0f, 1f)
+    } else {
+        value
+    }
+    val sliderRange = if (logarithmic) 0f..1f else min..max
+
     Row(
         verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier
@@ -851,9 +886,17 @@ private fun LabeledSlider(
             modifier = Modifier.width(80.dp)
         )
         Slider(
-            value = value,
-            onValueChange = onValueChange,
-            valueRange = min..max,
+            value = sliderValue,
+            onValueChange = { pos ->
+                if (logarithmic) {
+                    val minLog = ln(min)
+                    val maxLog = ln(max)
+                    onValueChange(exp(minLog + pos * (maxLog - minLog)))
+                } else {
+                    onValueChange(pos)
+                }
+            },
+            valueRange = sliderRange,
             modifier = Modifier.weight(1f),
             colors = SliderDefaults.colors(
                 thumbColor = accentColor,
@@ -865,8 +908,254 @@ private fun LabeledSlider(
             format.format(value),
             color = ChloeColors.OnSurfaceDim,
             fontSize = 11.sp,
-            modifier = Modifier.width(56.dp),
+            modifier = Modifier
+                .width(56.dp)
+                .clip(RoundedCornerShape(4.dp))
+                .clickable { showDialog = true }
+                .background(ChloeColors.SurfaceVariant.copy(alpha = 0.4f))
+                .padding(horizontal = 4.dp, vertical = 2.dp),
             textAlign = TextAlign.End
         )
+    }
+
+    if (showDialog) {
+        ManualEntryDialog(
+            label = label,
+            currentValue = value,
+            min = min,
+            max = max,
+            format = format,
+            onDismiss = { showDialog = false },
+            onConfirm = { onValueChange(it); showDialog = false }
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Manual entry dialog
+// ---------------------------------------------------------------------------
+
+@Composable
+private fun ManualEntryDialog(
+    label: String,
+    currentValue: Float,
+    min: Float,
+    max: Float,
+    format: String,
+    onDismiss: () -> Unit,
+    onConfirm: (Float) -> Unit
+) {
+    // Strip unit suffix from format for the initial text value
+    val numericStr = format.format(currentValue).replace(Regex("[^0-9.\\-]"), "").trim()
+    var textValue by remember { mutableStateOf(numericStr) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Text(label, color = ChloeColors.OnSurface, fontWeight = FontWeight.Bold)
+        },
+        text = {
+            Column {
+                Text(
+                    "Range: ${"%.4g".format(min)} – ${"%.4g".format(max)}",
+                    color = ChloeColors.OnSurfaceDim,
+                    fontSize = 11.sp
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = textValue,
+                    onValueChange = { textValue = it },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = ChloeColors.Teal,
+                        unfocusedBorderColor = ChloeColors.SurfaceVariant,
+                        focusedTextColor = ChloeColors.OnSurface,
+                        unfocusedTextColor = ChloeColors.OnSurface,
+                        cursorColor = ChloeColors.Teal
+                    ),
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                textValue.toFloatOrNull()?.let { v ->
+                    onConfirm(v.coerceIn(min, max))
+                } ?: onDismiss()
+            }) {
+                Text("OK", color = ChloeColors.Teal)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel", color = ChloeColors.OnSurfaceDim)
+            }
+        },
+        containerColor = ChloeColors.Surface
+    )
+}
+
+// ---------------------------------------------------------------------------
+// ADSR Envelope Scope
+// ---------------------------------------------------------------------------
+
+@Composable
+private fun EnvelopeScopeView(
+    attackMs: Float,
+    decayMs: Float,
+    sustainLevel: Float,
+    releaseMs: Float,
+    attackCurve: Float,
+    decayCurve: Float,
+    releaseCurve: Float
+) {
+    // Sustain gets a proportional display width so the scope looks balanced
+    val sustainDisplayMs = (attackMs + decayMs + releaseMs).coerceAtLeast(1f) * 0.3f
+    val totalMs = attackMs + decayMs + sustainDisplayMs + releaseMs
+    if (totalMs <= 0f) return
+
+    val attackFrac = attackMs / totalMs
+    val decayFrac = decayMs / totalMs
+    val sustainFrac = sustainDisplayMs / totalMs
+    val samples = 48
+
+    // Phase labels with times
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(bottom = 2.dp),
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        @Composable
+        fun PhaseLabel(letter: String, timeMs: Float, color: Color, weight: Float) {
+            Row(
+                modifier = Modifier.weight(weight.coerceAtLeast(0.05f)),
+                horizontalArrangement = Arrangement.Center
+            ) {
+                Text(letter, color = color, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                Spacer(modifier = Modifier.width(3.dp))
+                Text(
+                    if (letter == "S") "%.2f".format(sustainLevel)
+                    else "%.0fms".format(timeMs),
+                    color = color.copy(alpha = 0.6f),
+                    fontSize = 9.sp
+                )
+            }
+        }
+        PhaseLabel("A", attackMs, ChloeColors.Attack, attackFrac)
+        PhaseLabel("D", decayMs, ChloeColors.Decay, decayFrac)
+        PhaseLabel("S", sustainDisplayMs, ChloeColors.Sustain, sustainFrac)
+        PhaseLabel("R", releaseMs, ChloeColors.Release, 1f - attackFrac - decayFrac - sustainFrac)
+    }
+
+    Canvas(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(72.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .background(ChloeColors.Surface)
+    ) {
+        val w = size.width
+        val h = size.height
+        val pad = 4f
+
+        val drawH = h - pad * 2
+        val drawW = w - pad * 2
+        fun xOf(frac: Float) = pad + frac * drawW
+        fun yOf(level: Float) = pad + (1f - level) * drawH
+
+        // Phase x boundaries
+        val xA = xOf(attackFrac)
+        val xD = xOf(attackFrac + decayFrac)
+        val xS = xOf(attackFrac + decayFrac + sustainFrac)
+        val xR = xOf(1f)
+
+        // --- Build per-phase paths (fill + stroke) ---
+
+        // Attack: 0 → 1.0
+        val attackPath = Path().apply {
+            moveTo(pad, yOf(0f))
+            for (i in 1..samples) {
+                val t = i.toFloat() / samples
+                val level = applyCurve(t, attackCurve)
+                lineTo(pad + t * (xA - pad), yOf(level))
+            }
+        }
+        val attackFill = Path().apply {
+            addPath(attackPath)
+            lineTo(xA, yOf(0f))
+            lineTo(pad, yOf(0f))
+            close()
+        }
+
+        // Decay: 1.0 → sustainLevel
+        val decayPath = Path().apply {
+            moveTo(xA, yOf(1f))
+            for (i in 1..samples) {
+                val t = i.toFloat() / samples
+                val decayFactor = applyCurve(1f - t, decayCurve)
+                val level = sustainLevel + (1f - sustainLevel) * decayFactor
+                lineTo(xA + t * (xD - xA), yOf(level))
+            }
+        }
+        val decayFill = Path().apply {
+            addPath(decayPath)
+            lineTo(xD, yOf(0f))
+            lineTo(xA, yOf(0f))
+            close()
+        }
+
+        // Sustain: flat at sustainLevel
+        val sustainPath = Path().apply {
+            moveTo(xD, yOf(sustainLevel))
+            lineTo(xS, yOf(sustainLevel))
+        }
+        val sustainFill = Path().apply {
+            moveTo(xD, yOf(sustainLevel))
+            lineTo(xS, yOf(sustainLevel))
+            lineTo(xS, yOf(0f))
+            lineTo(xD, yOf(0f))
+            close()
+        }
+
+        // Release: sustainLevel → 0
+        val releasePath = Path().apply {
+            moveTo(xS, yOf(sustainLevel))
+            for (i in 1..samples) {
+                val t = i.toFloat() / samples
+                val relFactor = applyCurve(1f - t, releaseCurve)
+                val level = sustainLevel * relFactor
+                lineTo(xS + t * (xR - xS), yOf(level))
+            }
+        }
+        val releaseFill = Path().apply {
+            addPath(releasePath)
+            lineTo(xR, yOf(0f))
+            lineTo(xS, yOf(0f))
+            close()
+        }
+
+        // Draw fills
+        drawPath(attackFill, ChloeColors.Attack.copy(alpha = 0.12f))
+        drawPath(decayFill, ChloeColors.Decay.copy(alpha = 0.12f))
+        drawPath(sustainFill, ChloeColors.Sustain.copy(alpha = 0.10f))
+        drawPath(releaseFill, ChloeColors.Release.copy(alpha = 0.12f))
+
+        // Draw strokes
+        val strokeWidth = 2.dp.toPx()
+        drawPath(attackPath, ChloeColors.Attack, style = DrawStroke(strokeWidth, cap = StrokeCap.Round))
+        drawPath(decayPath, ChloeColors.Decay, style = DrawStroke(strokeWidth, cap = StrokeCap.Round))
+        drawPath(sustainPath, ChloeColors.Sustain, style = DrawStroke(strokeWidth, cap = StrokeCap.Round))
+        drawPath(releasePath, ChloeColors.Release, style = DrawStroke(strokeWidth, cap = StrokeCap.Round))
+
+        // Phase boundary lines (dashed)
+        val dashEffect = PathEffect.dashPathEffect(floatArrayOf(4f, 4f))
+        val boundaryColor = ChloeColors.OnSurfaceDim.copy(alpha = 0.25f)
+        for (bx in listOf(xA, xD, xS)) {
+            drawLine(boundaryColor, Offset(bx, pad), Offset(bx, h - pad),
+                strokeWidth = 1f, pathEffect = dashEffect)
+        }
+
+        // Baseline
+        drawLine(ChloeColors.SurfaceVariant, Offset(pad, yOf(0f)), Offset(xR, yOf(0f)), strokeWidth = 1f)
     }
 }

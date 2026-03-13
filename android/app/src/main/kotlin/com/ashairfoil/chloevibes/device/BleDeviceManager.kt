@@ -308,6 +308,13 @@ class BleDeviceManager(private val context: Context) {
 
         synchronized(writeLock) {
             val now = System.currentTimeMillis()
+            // Auto-clear writeInFlight if the BLE callback hasn't arrived
+            // within 200ms.  When the app is backgrounded, Android may delay
+            // onCharacteristicWrite callbacks, leaving writeInFlight stuck and
+            // blocking all subsequent vibration commands.
+            if (writeInFlight && (now - lastWriteMs) > 200) {
+                writeInFlight = false
+            }
             if (writeInFlight || (now - lastWriteMs) < minWriteIntervalMs) {
                 // Queue this as the next command (overwrites any stale pending)
                 pendingCommand = command
