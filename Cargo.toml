@@ -1,0 +1,23 @@
+[package]
+name = "music-vibes"
+version = "0.4.0"
+edition = "2021"
+license = "MIT"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+buttplug = { version = "9.0.9", features = ["server"] }
+flume = "0.12.0"
+clap = { version = "4.5.54", features = ["derive"] }
+audio-capture = { git = "https://github.com/Shadlock0133/audio-capture", rev = "26e326cffcf00cdc564a2b840c6421e021e0c27f" }
+parking_lot = "0.12.5"
+eframe = { version = "0.33.3", features = ["persistence"] }
+tokio = { version = "1.49.0", features = ["rt-multi-thread"] }
+serde = { version = "1.0.228", features = ["derive"] }
+
+# NEW: FFT for spectral analysis (the ChloeVibes engine upgrade)
+rustfft = "6.2"
+
+# Image loading for embedded logo
+image = { version = "0.24", default-features = false, features = ["png"] }
