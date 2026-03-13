@@ -81,12 +81,15 @@ class AudioCaptureManager(private val context: Context) {
     private val sampleLock = Object()
     private var capturedSamples = FloatArray(0)
     private var hasFreshSamples = false
+    @Volatile private var lastSampleTimeMs = 0L
 
-    // Silence detection for Visualizer fallback
+    // Silence / stall detection for Visualizer fallback
     @Volatile private var silentFrameCount = 0
     private companion object {
         /** After this many consecutive silent frames, fall back to mic. */
         const val SILENT_FRAMES_BEFORE_FALLBACK = 90 // ~1.5 seconds at 60Hz
+        /** If Visualizer stops delivering samples for this long, it's dead. */
+        const val STALL_TIMEOUT_MS = 3000L
     }
 
     // Signal processing parameters (set from UI thread)
@@ -224,6 +227,7 @@ class AudioCaptureManager(private val context: Context) {
                             capturedSamples = samples
                             hasFreshSamples = true
                         }
+                        lastSampleTimeMs = System.currentTimeMillis()
                     }
 
                     override fun onFftDataCapture(
@@ -311,15 +315,16 @@ class AudioCaptureManager(private val context: Context) {
 
     private fun processingLoop() {
         val startMs = System.nanoTime() / 1_000_000f
+        lastSampleTimeMs = System.currentTimeMillis()
 
         while (running) {
+          try {
             val currentTimeMs = System.nanoTime() / 1_000_000f - startMs
 
             // Grab latest samples
             val samples: FloatArray
             synchronized(sampleLock) {
                 if (!hasFreshSamples) {
-                    // No new audio -- use empty buffer (gate will close naturally)
                     samples = FloatArray(FFT_SIZE)
                 } else {
                     samples = capturedSamples
@@ -327,25 +332,24 @@ class AudioCaptureManager(private val context: Context) {
                 }
             }
 
-            // Silence detection: if Visualizer is producing all zeros, fall back to mic
+            // Detect dead Visualizer: either producing silence or stopped calling back entirely
             if (sourceMode == AudioSourceMode.SystemAudio && visualizer != null) {
+                val stalled = (System.currentTimeMillis() - lastSampleTimeMs) > STALL_TIMEOUT_MS
                 var rmsCheck = 0f
                 for (s in samples) rmsCheck += s * s
                 val isSilent = samples.isEmpty() || (rmsCheck / samples.size.coerceAtLeast(1)) < 1e-10f
-                if (isSilent) {
-                    silentFrameCount++
-                    if (silentFrameCount >= SILENT_FRAMES_BEFORE_FALLBACK) {
-                        // Visualizer is dead — switch to mic
-                        silentFrameCount = 0
-                        visualizer?.apply { enabled = false; release() }
-                        visualizer = null
-                        sourceMode = AudioSourceMode.Microphone
-                        if (startMicrophone()) {
-                            onFallbackToMic?.invoke()
-                        }
-                    }
-                } else {
+
+                if (isSilent) silentFrameCount++ else silentFrameCount = 0
+
+                if (stalled || silentFrameCount >= SILENT_FRAMES_BEFORE_FALLBACK) {
+                    // Visualizer is dead — switch to mic
                     silentFrameCount = 0
+                    try { visualizer?.apply { enabled = false; release() } } catch (_: Exception) {}
+                    visualizer = null
+                    sourceMode = AudioSourceMode.Microphone
+                    if (startMicrophone()) {
+                        onFallbackToMic?.invoke()
+                    }
                 }
             }
 
@@ -431,6 +435,9 @@ class AudioCaptureManager(private val context: Context) {
             } catch (_: InterruptedException) {
                 break
             }
+          } catch (_: Exception) {
+              // Don't let a single frame crash kill the processing thread
+          }
         }
     }
 }

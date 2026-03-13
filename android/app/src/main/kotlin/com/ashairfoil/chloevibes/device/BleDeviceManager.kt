@@ -59,6 +59,14 @@ class BleDeviceManager(private val context: Context) {
     @Volatile var batteryLevel: Int = -1
         private set
 
+    // BLE write gating -- Lovense devices drop commands if sent too fast.
+    // We wait for the onCharacteristicWrite callback before sending the next.
+    @Volatile private var writeInFlight = false
+    private var pendingCommand: String? = null
+    private val writeLock = Object()
+    private var lastWriteMs: Long = 0
+    private val minWriteIntervalMs = 50L  // 20Hz max command rate
+
     // Scan results
     private val discoveredDevices = mutableMapOf<String, BleDeviceInfo>()
     private var isScanning = false
@@ -219,6 +227,15 @@ class BleDeviceManager(private val context: Context) {
             }
         }
 
+        override fun onCharacteristicWrite(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            status: Int
+        ) {
+            // Previous write completed — flush any queued command
+            flushPendingWrite()
+        }
+
         override fun onCharacteristicChanged(
             gatt: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic
@@ -236,14 +253,37 @@ class BleDeviceManager(private val context: Context) {
 
     /**
      * Send a raw string command to the connected device.
+     * Respects BLE write gating — only one write in flight at a time.
      */
     fun sendCommand(command: String): Boolean {
         val characteristic = writeCharacteristic ?: return false
         val g = gatt ?: return false
 
+        synchronized(writeLock) {
+            val now = System.currentTimeMillis()
+            if (writeInFlight || (now - lastWriteMs) < minWriteIntervalMs) {
+                // Queue this as the next command (overwrites any stale pending)
+                pendingCommand = command
+                return false
+            }
+            writeInFlight = true
+            lastWriteMs = now
+        }
+
         characteristic.value = command.toByteArray(Charsets.US_ASCII)
         characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
         return g.writeCharacteristic(characteristic)
+    }
+
+    /** Flush pending command after a write completes. */
+    private fun flushPendingWrite() {
+        val cmd: String?
+        synchronized(writeLock) {
+            writeInFlight = false
+            cmd = pendingCommand
+            pendingCommand = null
+        }
+        cmd?.let { sendCommand(it) }
     }
 
     /**
