@@ -687,13 +687,19 @@ impl EnvelopeProcessor {
                 }
             }
             EnvelopeState::Sustain => {
-                // Perceptible modulation to avoid "dead buzzing" feeling.
-                // Two layered sine waves for organic movement:
-                //   Primary: ~1.5Hz, ±10%  (motor can track this)
-                //   Secondary: ~0.4Hz, ±5% (slow drift for variety)
-                let primary = 0.10 * (current_time_ms * 0.0094).sin();   // ~1.5Hz
-                let secondary = 0.05 * (current_time_ms * 0.0025).sin(); // ~0.4Hz
-                let modulation = 1.0 + primary + secondary;
+                // Multi-layer modulation to prevent neural adaptation.
+                // Total variation ±25-35% keeps nerve endings sensitized.
+                //   Primary: ~1.2Hz, ±20% (slow, deep oscillation)
+                //   Secondary: ~0.3Hz, ±12% (breathing rhythm)
+                //   Perlin-style noise: ±8% (irrational-ratio sines prevent pattern lock)
+                let primary = 0.20 * (current_time_ms * 0.0075).sin();   // ~1.2Hz, ±20%
+                let secondary = 0.12 * (current_time_ms * 0.0019).sin(); // ~0.3Hz, ±12%
+                let noise = 0.08 * (
+                    (current_time_ms * 0.00317).sin() * 0.5 +
+                    (current_time_ms * 0.00713).sin() * 0.3 +
+                    (current_time_ms * 0.01137).sin() * 0.2
+                );
+                let modulation = 1.0 + primary + secondary + noise;
                 self.value = sustain_level * modulation;
             }
             EnvelopeState::Release => {
@@ -921,7 +927,14 @@ pub struct ClimaxEngine {
     cycle_anchor_ms: f32,
     last_time_ms: f32,
     micro_phase: f32,
+    micro_phase2: f32,
+    micro_phase3: f32,
     onset_boost: f32,
+    // Edge tracking — forces intensity dips to prevent plateau adaptation
+    high_output_ms: f32,
+    deny_active: bool,
+    deny_start_ms: f32,
+    deny_duration_ms: f32,
 }
 
 impl ClimaxEngine {
@@ -930,7 +943,13 @@ impl ClimaxEngine {
             cycle_anchor_ms: 0.0,
             last_time_ms: 0.0,
             micro_phase: 0.0,
+            micro_phase2: 0.0,
+            micro_phase3: 0.0,
             onset_boost: 0.0,
+            high_output_ms: 0.0,
+            deny_active: false,
+            deny_start_ms: 0.0,
+            deny_duration_ms: 0.0,
         }
     }
 
@@ -938,7 +957,13 @@ impl ClimaxEngine {
         self.cycle_anchor_ms = current_time_ms;
         self.last_time_ms = current_time_ms;
         self.micro_phase = 0.0;
+        self.micro_phase2 = 0.0;
+        self.micro_phase3 = 0.0;
         self.onset_boost = 0.0;
+        self.high_output_ms = 0.0;
+        self.deny_active = false;
+        self.deny_start_ms = 0.0;
+        self.deny_duration_ms = 0.0;
     }
 
     /// Returns current cycle progress in [0, 1).
@@ -1014,7 +1039,8 @@ impl ClimaxEngine {
 
         let surge_factor = if progress >= 0.84 {
             let t = ((progress - 0.84) / 0.16).clamp(0.0, 1.0);
-            1.0 + surge_boost.clamp(0.0, 1.2) * t.powf(0.5)
+            // Steeper power curve (0.3 vs 0.5) — hits harder at the end
+            1.0 + surge_boost.clamp(0.0, 1.2) * t.powf(0.3)
         } else {
             1.0
         };
@@ -1025,19 +1051,58 @@ impl ClimaxEngine {
         self.onset_boost = (self.onset_boost - dt * 0.9).max(0.0);
 
         let pulse_depth = pulse_depth.clamp(0.0, 0.45);
-        // Cap micro-pulse at 6Hz — Domi 2 motor can't physically modulate faster.
-        // Deeper modulation at slower rates is far more perceptible than fast buzz.
-        let pulse_rate_hz = (2.0 + intensity * 2.0 + energy * 1.5 + ramp * 0.5).min(6.0);
+        // During surge phase, allow up to 8Hz micro-pulse; otherwise cap at 6Hz.
+        let max_pulse_hz = if progress >= 0.84 { 8.0 } else { 6.0 };
+        let pulse_rate_hz = (2.0 + intensity * 2.0 + energy * 1.5 + ramp * 0.5).min(max_pulse_hz);
+        // Triple-oscillator detuned micro-pulse — prevents single-frequency adaptation
+        let detune = 0.07; // ±7% frequency spread
         self.micro_phase = (self.micro_phase + dt * pulse_rate_hz * TAU).rem_euclid(TAU);
-        let pulse = 1.0 - pulse_depth + pulse_depth * (0.5 + 0.5 * self.micro_phase.sin());
+        self.micro_phase2 = (self.micro_phase2 + dt * pulse_rate_hz * (1.0 + detune) * TAU).rem_euclid(TAU);
+        self.micro_phase3 = (self.micro_phase3 + dt * pulse_rate_hz * (1.0 - detune) * TAU).rem_euclid(TAU);
+        let pulse_raw = 0.5 * self.micro_phase.sin()
+            + 0.3 * self.micro_phase2.sin()
+            + 0.2 * self.micro_phase3.sin();
+        let pulse = 1.0 - pulse_depth + pulse_depth * (0.5 + 0.5 * pulse_raw);
 
         // Arousal gain: never attenuate below dry signal. Build UP from the audio-reactive base.
         // At ramp=0 (cycle start): gain = 1.0 (passthrough).
-        // At ramp=1 (cycle peak):  gain = up to 1.45 (amplified).
-        let arousal_gain = (1.0 + 0.45 * ramp) * (1.0 + intensity * 0.20);
+        // At ramp=1 (cycle peak):  gain = up to 1.85 (amplified).
+        let arousal_gain = (1.0 + 0.85 * ramp) * (1.0 + intensity * 0.20);
         let gated_boost = if gate_open { self.onset_boost } else { 0.0 };
 
-        (dry * arousal_gain * tease_factor * surge_factor * pulse + gated_boost).clamp(0.0, 1.0)
+        let raw_output = (dry * arousal_gain * tease_factor * surge_factor * pulse + gated_boost).clamp(0.0, 1.0);
+
+        // Edge-and-deny: when output has been >0.8 for >3 seconds, force a dip
+        // to 60% for 2-4 seconds, then surge back. Prevents plateau adaptation.
+        if raw_output > 0.8 {
+            self.high_output_ms += dt * 1000.0;
+        } else {
+            self.high_output_ms = (self.high_output_ms - dt * 500.0).max(0.0);
+        }
+
+        if !self.deny_active && self.high_output_ms > 3000.0 {
+            self.deny_active = true;
+            self.deny_start_ms = current_time_ms;
+            // Randomized deny duration: 2000-4000ms using cheap pseudo-random
+            self.deny_duration_ms = 2000.0 + 2000.0 * (0.5 + 0.5 * (current_time_ms * 0.00137).sin());
+            self.high_output_ms = 0.0;
+        }
+
+        if self.deny_active {
+            let deny_elapsed = current_time_ms - self.deny_start_ms;
+            if deny_elapsed >= self.deny_duration_ms {
+                self.deny_active = false;
+            } else {
+                // Smooth envelope: fade down then back up
+                let deny_t = deny_elapsed / self.deny_duration_ms;
+                // Parabolic dip: peaks at center of deny window
+                let deny_depth = 0.40; // 40% reduction at deepest point
+                let deny_envelope = deny_depth * (1.0 - (2.0 * deny_t - 1.0).powi(2));
+                return (raw_output * (1.0 - deny_envelope)).clamp(0.0, 1.0);
+            }
+        }
+
+        raw_output
     }
 }
 
