@@ -120,7 +120,13 @@ class BleDeviceManager(private val context: Context) {
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             val device = result.device
-            val name = device.name ?: return
+            // Device name can be null in early advertisements — try scanRecord
+            // first (more reliable), then fall back to device.name, then skip
+            // only if both are null AND we haven't seen this address before.
+            val name = result.scanRecord?.deviceName
+                ?: device.name
+                ?: discoveredDevices[device.address]?.name
+                ?: return
             val isLovense = name.startsWith("LVS-") || name.contains("Lovense", ignoreCase = true)
 
             val info = BleDeviceInfo(

@@ -204,6 +204,7 @@ class MainActivity : ComponentActivity() {
         val needed = mutableListOf<String>()
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            // Android 12+: need BLUETOOTH_SCAN and BLUETOOTH_CONNECT
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN)
                 != PackageManager.PERMISSION_GRANTED
             ) {
@@ -213,6 +214,13 @@ class MainActivity : ComponentActivity() {
                 != PackageManager.PERMISSION_GRANTED
             ) {
                 needed.add(Manifest.permission.BLUETOOTH_CONNECT)
+            }
+        } else {
+            // Pre-Android 12: BLE scanning requires ACCESS_FINE_LOCATION
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
+                != PackageManager.PERMISSION_GRANTED
+            ) {
+                needed.add(Manifest.permission.ACCESS_FINE_LOCATION)
             }
         }
 
