@@ -291,4 +291,4 @@ class EnvelopeProcessor {
 }
 
 /** Kotlin Float.pow extension for readability. */
-private fun Float.pow(exp: Float): Float = kotlin.math.pow(this.toDouble(), exp.toDouble()).toFloat()
+private fun Float.pow(exp: Float): Float = Math.pow(this.toDouble(), exp.toDouble()).toFloat()
