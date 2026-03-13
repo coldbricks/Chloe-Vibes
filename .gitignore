@@ -1,2 +1,9 @@
 /target
 /target_alt*
+
+# Android build artifacts
+android/.gradle/
+android/app/build/
+android/build/
+android/local.properties
+*.apk
