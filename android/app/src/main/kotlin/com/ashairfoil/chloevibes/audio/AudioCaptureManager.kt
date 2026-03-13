@@ -82,6 +82,13 @@ class AudioCaptureManager(private val context: Context) {
     private var capturedSamples = FloatArray(0)
     private var hasFreshSamples = false
 
+    // Silence detection for Visualizer fallback
+    @Volatile private var silentFrameCount = 0
+    private companion object {
+        /** After this many consecutive silent frames, fall back to mic. */
+        const val SILENT_FRAMES_BEFORE_FALLBACK = 90 // ~1.5 seconds at 60Hz
+    }
+
     // Signal processing parameters (set from UI thread)
     @Volatile var mainVolume: Float = 1.15f
     @Volatile var frequencyMode: FrequencyMode = FrequencyMode.Full
@@ -116,6 +123,9 @@ class AudioCaptureManager(private val context: Context) {
 
     // Output callback
     var onOutputUpdate: ((Float) -> Unit)? = null
+
+    /** Called when Visualizer produces silence and we auto-fallback to mic. */
+    var onFallbackToMic: (() -> Unit)? = null
 
     /** Apply a preset to all signal processing parameters. */
     fun applyPreset(preset: Preset) {
@@ -197,7 +207,8 @@ class AudioCaptureManager(private val context: Context) {
 
         return try {
             val viz = Visualizer(0) // session 0 = system audio output mix
-            viz.captureSize = Visualizer.getCaptureSizeRange()[1].coerceAtMost(FFT_SIZE)
+            val maxCapture = Visualizer.getCaptureSizeRange()[1]
+            viz.captureSize = maxCapture.coerceAtMost(FFT_SIZE)
             viz.setDataCaptureListener(
                 object : Visualizer.OnDataCaptureListener {
                     override fun onWaveFormDataCapture(
@@ -313,6 +324,28 @@ class AudioCaptureManager(private val context: Context) {
                 } else {
                     samples = capturedSamples
                     hasFreshSamples = false
+                }
+            }
+
+            // Silence detection: if Visualizer is producing all zeros, fall back to mic
+            if (sourceMode == AudioSourceMode.SystemAudio && visualizer != null) {
+                var rmsCheck = 0f
+                for (s in samples) rmsCheck += s * s
+                val isSilent = samples.isEmpty() || (rmsCheck / samples.size.coerceAtLeast(1)) < 1e-10f
+                if (isSilent) {
+                    silentFrameCount++
+                    if (silentFrameCount >= SILENT_FRAMES_BEFORE_FALLBACK) {
+                        // Visualizer is dead — switch to mic
+                        silentFrameCount = 0
+                        visualizer?.apply { enabled = false; release() }
+                        visualizer = null
+                        sourceMode = AudioSourceMode.Microphone
+                        if (startMicrophone()) {
+                            onFallbackToMic?.invoke()
+                        }
+                    }
+                } else {
+                    silentFrameCount = 0
                 }
             }
 
