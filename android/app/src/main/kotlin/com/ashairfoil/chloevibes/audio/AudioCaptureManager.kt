@@ -86,10 +86,17 @@ class AudioCaptureManager(private val context: Context) {
     // Silence / stall detection for Visualizer fallback
     @Volatile private var silentFrameCount = 0
     private companion object {
-        /** After this many consecutive silent frames, fall back to mic. */
+        /** After this many consecutive silent frames, restart Visualizer. */
         const val SILENT_FRAMES_BEFORE_FALLBACK = 90 // ~1.5 seconds at 60Hz
         /** If Visualizer stops delivering samples for this long, it's dead. */
         const val STALL_TIMEOUT_MS = 3000L
+        /**
+         * Gain applied to Visualizer waveform data. The Visualizer API delivers
+         * 8-bit unsigned bytes (resolution ~0.008 per step), which produces
+         * energy values roughly 10x lower than raw PCM. This gain brings the
+         * signal into the range the gate/envelope chain expects.
+         */
+        const val VISUALIZER_GAIN = 10f
     }
 
     // Signal processing parameters (set from UI thread)
@@ -219,9 +226,12 @@ class AudioCaptureManager(private val context: Context) {
                         waveform: ByteArray,
                         samplingRate: Int
                     ) {
-                        // Convert unsigned byte waveform to float [-1, 1]
+                        // Convert unsigned byte waveform to float and apply
+                        // Visualizer gain. The API gives 8-bit data (~10x quieter
+                        // than raw PCM), so we scale up here before the pipeline.
                         val samples = FloatArray(waveform.size) { i ->
-                            (waveform[i].toInt() and 0xFF).toFloat() / 128f - 1f
+                            val raw = (waveform[i].toInt() and 0xFF).toFloat() / 128f - 1f
+                            (raw * VISUALIZER_GAIN).coerceIn(-1f, 1f)
                         }
                         synchronized(sampleLock) {
                             capturedSamples = samples

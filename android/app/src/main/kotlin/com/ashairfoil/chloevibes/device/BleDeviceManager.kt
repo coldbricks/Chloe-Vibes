@@ -351,12 +351,25 @@ class BleDeviceManager(private val context: Context) {
     }
 
     private fun parseLovenseResponse(response: String) {
-        // Battery response format: "X;" where X is 0-100
         val trimmed = response.trim().removeSuffix(";")
+
+        // Simple numeric response: "85;" → battery 85%
         trimmed.toIntOrNull()?.let { level ->
             if (level in 0..100) {
                 batteryLevel = level
                 handler.post { onBatteryUpdate?.invoke(level) }
+                return
+            }
+        }
+
+        // Newer Lovense firmware: battery response as "Bxx;" where xx is 1-100,
+        // or device type "Axx:yy:zzzzzz;" etc.  Also "OK;" is just an ACK.
+        if (trimmed.length >= 2 && trimmed[0].uppercaseChar() == 'B') {
+            trimmed.substring(1).toIntOrNull()?.let { level ->
+                if (level in 0..100) {
+                    batteryLevel = level
+                    handler.post { onBatteryUpdate?.invoke(level) }
+                }
             }
         }
     }
