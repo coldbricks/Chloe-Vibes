@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.ChloeVibes" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor">#FF0D0D1A</item>
+        <item name="android:navigationBarColor">#FF0D0D1A</item>
+        <item name="android:windowBackground">#FF0D0D1A</item>
+    </style>
+</resources>

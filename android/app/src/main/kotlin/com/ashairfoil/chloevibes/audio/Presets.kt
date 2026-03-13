@@ -1,0 +1,580 @@
+// ==========================================================================
+// Presets.kt -- Named Preset Configurations
+// Ported from presets.rs -- all 20 factory presets
+//
+// Presets snap all signal-processing parameters to known-good values.
+// Think of these like synth patches -- each one is tuned for a specific
+// use case. Users pick a preset as a starting point, then tweak.
+// ==========================================================================
+
+package com.ashairfoil.chloevibes.audio
+
+// ---------------------------------------------------------------------------
+// Preset data class
+// ---------------------------------------------------------------------------
+
+/**
+ * A complete snapshot of all signal-processing settings.
+ * Does NOT include connection/device settings -- only the "patch."
+ */
+data class Preset(
+    val name: String,
+    val description: String,
+    val category: PresetCategory,
+
+    // Volume / Input
+    val mainVolume: Float,
+
+    // Frequency
+    val frequencyMode: FrequencyMode,
+    val targetFrequency: Float,
+
+    // Gate
+    val gateThreshold: Float,
+    val autoGateAmount: Float,
+    val gateSmoothing: Float,
+
+    // Trigger
+    val triggerMode: TriggerMode,
+    val binaryLevel: Float,
+    val hybridBlend: Float,
+
+    // ADSR Envelope
+    val attackMs: Float,
+    val decayMs: Float,
+    val sustainLevel: Float,
+    val releaseMs: Float,
+    val attackCurve: Float,
+    val decayCurve: Float,
+    val releaseCurve: Float,
+
+    // Output Range
+    val minVibe: Float,
+    val maxVibe: Float
+)
+
+// ---------------------------------------------------------------------------
+// Preset categories
+// ---------------------------------------------------------------------------
+
+enum class PresetCategory(val label: String) {
+    /** Starting points / neutral */
+    Init("INIT"),
+    /** Tracks beats/drums -- short, punchy envelopes */
+    Percussion("DRUMS"),
+    /** Follows melody/vocals -- smooth, sustained */
+    Musical("MUSICAL"),
+    /** Bass-focused -- heavy, slow */
+    Bass("BASS"),
+    /** Special effects and creative use cases */
+    Effect("FX");
+
+    companion object {
+        fun all(): List<PresetCategory> = listOf(Init, Percussion, Musical, Bass, Effect)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Factory Presets -- all 20 from the Rust version
+// ---------------------------------------------------------------------------
+
+fun factoryPresets(): List<Preset> = listOf(
+    // === INIT ===
+    Preset(
+        name = "Ride Intensity",
+        description = "Neutral follower - smooth, non-rhythmic response that rides loudness",
+        category = PresetCategory.Init,
+        mainVolume = 1.15f,
+        frequencyMode = FrequencyMode.Full,
+        targetFrequency = 200f,
+        gateThreshold = 0.07f,
+        autoGateAmount = 0f,
+        gateSmoothing = 0.22f,
+        triggerMode = TriggerMode.Dynamic,
+        binaryLevel = 0.8f,
+        hybridBlend = 0.5f,
+        attackMs = 30f,
+        decayMs = 160f,
+        sustainLevel = 0.9f,
+        releaseMs = 320f,
+        attackCurve = 1f,
+        decayCurve = 1f,
+        releaseCurve = 1.15f,
+        minVibe = 0f,
+        maxVibe = 1f
+    ),
+    Preset(
+        name = "Transparent",
+        description = "Minimal processing -- raw audio level drives output",
+        category = PresetCategory.Init,
+        mainVolume = 1.5f,
+        frequencyMode = FrequencyMode.Full,
+        targetFrequency = 200f,
+        gateThreshold = 0.05f,
+        autoGateAmount = 0f,
+        gateSmoothing = 0f,
+        triggerMode = TriggerMode.Dynamic,
+        binaryLevel = 0.8f,
+        hybridBlend = 0.5f,
+        attackMs = 1f,
+        decayMs = 10f,
+        sustainLevel = 0.9f,
+        releaseMs = 50f,
+        attackCurve = 1f,
+        decayCurve = 1f,
+        releaseCurve = 1f,
+        minVibe = 0f,
+        maxVibe = 1f
+    ),
+    // === PERCUSSION ===
+    Preset(
+        name = "Drum Hit",
+        description = "Tight punch -- snappy attack, fast decay, minimal sustain",
+        category = PresetCategory.Percussion,
+        mainVolume = 1.2f,
+        frequencyMode = FrequencyMode.Full,
+        targetFrequency = 200f,
+        gateThreshold = 0.20f,
+        autoGateAmount = 0f,
+        gateSmoothing = 0f,
+        triggerMode = TriggerMode.Dynamic,
+        binaryLevel = 0.8f,
+        hybridBlend = 0.5f,
+        attackMs = 1f,
+        decayMs = 40f,
+        sustainLevel = 0.2f,
+        releaseMs = 60f,
+        attackCurve = 0.3f,
+        decayCurve = 2f,
+        releaseCurve = 2.5f,
+        minVibe = 0f,
+        maxVibe = 1f
+    ),
+    Preset(
+        name = "Kick Follow",
+        description = "Locks to the kick drum -- bass-only, binary pulse",
+        category = PresetCategory.Percussion,
+        mainVolume = 1.5f,
+        frequencyMode = FrequencyMode.LowPass,
+        targetFrequency = 120f,
+        gateThreshold = 0.25f,
+        autoGateAmount = 0f,
+        gateSmoothing = 0f,
+        triggerMode = TriggerMode.Binary,
+        binaryLevel = 0.9f,
+        hybridBlend = 0.5f,
+        attackMs = 2f,
+        decayMs = 30f,
+        sustainLevel = 0.1f,
+        releaseMs = 80f,
+        attackCurve = 0.3f,
+        decayCurve = 2.5f,
+        releaseCurve = 3f,
+        minVibe = 0f,
+        maxVibe = 1f
+    ),
+    Preset(
+        name = "Staccato Pulse",
+        description = "Sharp on/off -- like a trance gate effect",
+        category = PresetCategory.Percussion,
+        mainVolume = 1f,
+        frequencyMode = FrequencyMode.Full,
+        targetFrequency = 200f,
+        gateThreshold = 0.18f,
+        autoGateAmount = 0f,
+        gateSmoothing = 0f,
+        triggerMode = TriggerMode.Binary,
+        binaryLevel = 1f,
+        hybridBlend = 0.5f,
+        attackMs = 0.5f,
+        decayMs = 5f,
+        sustainLevel = 0.95f,
+        releaseMs = 30f,
+        attackCurve = 0.2f,
+        decayCurve = 1f,
+        releaseCurve = 3f,
+        minVibe = 0f,
+        maxVibe = 1f
+    ),
+    // === MUSICAL ===
+    Preset(
+        name = "Slow Swell",
+        description = "Gradual build like a string section -- long attack, full sustain",
+        category = PresetCategory.Musical,
+        mainVolume = 1f,
+        frequencyMode = FrequencyMode.Full,
+        targetFrequency = 200f,
+        gateThreshold = 0.10f,
+        autoGateAmount = 0f,
+        gateSmoothing = 0.3f,
+        triggerMode = TriggerMode.Dynamic,
+        binaryLevel = 0.8f,
+        hybridBlend = 0.5f,
+        attackMs = 200f,
+        decayMs = 100f,
+        sustainLevel = 0.85f,
+        releaseMs = 500f,
+        attackCurve = 0.7f,
+        decayCurve = 1f,
+        releaseCurve = 1.5f,
+        minVibe = 0.05f,
+        maxVibe = 0.85f
+    ),
+    Preset(
+        name = "Vocal Ride",
+        description = "Tracks vocal energy -- mid-range focus, smooth dynamics",
+        category = PresetCategory.Musical,
+        mainVolume = 1.3f,
+        frequencyMode = FrequencyMode.BandPass,
+        targetFrequency = 1000f,
+        gateThreshold = 0.12f,
+        autoGateAmount = 0.3f,
+        gateSmoothing = 0.2f,
+        triggerMode = TriggerMode.Hybrid,
+        binaryLevel = 0.5f,
+        hybridBlend = 0.3f,
+        attackMs = 15f,
+        decayMs = 60f,
+        sustainLevel = 0.7f,
+        releaseMs = 200f,
+        attackCurve = 0.5f,
+        decayCurve = 1.2f,
+        releaseCurve = 1.8f,
+        minVibe = 0.05f,
+        maxVibe = 0.9f
+    ),
+    Preset(
+        name = "Pluck",
+        description = "Quick strike, medium ring-out -- like a guitar pluck",
+        category = PresetCategory.Musical,
+        mainVolume = 1f,
+        frequencyMode = FrequencyMode.Full,
+        targetFrequency = 200f,
+        gateThreshold = 0.15f,
+        autoGateAmount = 0f,
+        gateSmoothing = 0f,
+        triggerMode = TriggerMode.Dynamic,
+        binaryLevel = 0.8f,
+        hybridBlend = 0.5f,
+        attackMs = 2f,
+        decayMs = 120f,
+        sustainLevel = 0.3f,
+        releaseMs = 300f,
+        attackCurve = 0.3f,
+        decayCurve = 1.8f,
+        releaseCurve = 2.5f,
+        minVibe = 0f,
+        maxVibe = 1f
+    ),
+    // === BASS ===
+    Preset(
+        name = "Sub Throb",
+        description = "Deep bass tracking -- heavy, slow, floor-shaking",
+        category = PresetCategory.Bass,
+        mainVolume = 2f,
+        frequencyMode = FrequencyMode.LowPass,
+        targetFrequency = 80f,
+        gateThreshold = 0.12f,
+        autoGateAmount = 0f,
+        gateSmoothing = 0.1f,
+        triggerMode = TriggerMode.Dynamic,
+        binaryLevel = 0.8f,
+        hybridBlend = 0.5f,
+        attackMs = 8f,
+        decayMs = 150f,
+        sustainLevel = 0.75f,
+        releaseMs = 400f,
+        attackCurve = 0.4f,
+        decayCurve = 1.2f,
+        releaseCurve = 1.5f,
+        minVibe = 0.1f,
+        maxVibe = 1f
+    ),
+    Preset(
+        name = "Wobble Bass",
+        description = "EDM-style -- binary bass pulse with max output",
+        category = PresetCategory.Bass,
+        mainVolume = 2.5f,
+        frequencyMode = FrequencyMode.LowPass,
+        targetFrequency = 150f,
+        gateThreshold = 0.15f,
+        autoGateAmount = 0f,
+        gateSmoothing = 0f,
+        triggerMode = TriggerMode.Hybrid,
+        binaryLevel = 0.85f,
+        hybridBlend = 0.6f,
+        attackMs = 3f,
+        decayMs = 60f,
+        sustainLevel = 0.5f,
+        releaseMs = 120f,
+        attackCurve = 0.3f,
+        decayCurve = 1.5f,
+        releaseCurve = 2f,
+        minVibe = 0f,
+        maxVibe = 1f
+    ),
+    // === EFFECTS ===
+    Preset(
+        name = "Ambient Wash",
+        description = "Always-on gentle hum that swells with the music",
+        category = PresetCategory.Effect,
+        mainVolume = 0.8f,
+        frequencyMode = FrequencyMode.Full,
+        targetFrequency = 200f,
+        gateThreshold = 0.03f,
+        autoGateAmount = 0f,
+        gateSmoothing = 0.5f,
+        triggerMode = TriggerMode.Dynamic,
+        binaryLevel = 0.8f,
+        hybridBlend = 0.5f,
+        attackMs = 300f,
+        decayMs = 200f,
+        sustainLevel = 0.9f,
+        releaseMs = 1500f,
+        attackCurve = 0.6f,
+        decayCurve = 1f,
+        releaseCurve = 1f,
+        minVibe = 0.15f,
+        maxVibe = 0.6f
+    ),
+    Preset(
+        name = "Heartbeat",
+        description = "Rhythmic pulse -- consistent intensity, dramatic on/off",
+        category = PresetCategory.Effect,
+        mainVolume = 1f,
+        frequencyMode = FrequencyMode.Full,
+        targetFrequency = 200f,
+        gateThreshold = 0.20f,
+        autoGateAmount = 0f,
+        gateSmoothing = 0f,
+        triggerMode = TriggerMode.Binary,
+        binaryLevel = 0.7f,
+        hybridBlend = 0.5f,
+        attackMs = 10f,
+        decayMs = 50f,
+        sustainLevel = 0.6f,
+        releaseMs = 100f,
+        attackCurve = 0.8f,
+        decayCurve = 2f,
+        releaseCurve = 2.5f,
+        minVibe = 0f,
+        maxVibe = 0.75f
+    ),
+    Preset(
+        name = "Hi-Hat Tingle",
+        description = "High frequency only -- sparkly, delicate, treble-reactive",
+        category = PresetCategory.Effect,
+        mainVolume = 2f,
+        frequencyMode = FrequencyMode.HighPass,
+        targetFrequency = 4000f,
+        gateThreshold = 0.10f,
+        autoGateAmount = 0f,
+        gateSmoothing = 0f,
+        triggerMode = TriggerMode.Dynamic,
+        binaryLevel = 0.8f,
+        hybridBlend = 0.5f,
+        attackMs = 1f,
+        decayMs = 25f,
+        sustainLevel = 0.15f,
+        releaseMs = 40f,
+        attackCurve = 0.2f,
+        decayCurve = 2.5f,
+        releaseCurve = 3f,
+        minVibe = 0f,
+        maxVibe = 0.7f
+    ),
+    // === DOMI 2 OPTIMIZED ===
+    Preset(
+        name = "Domi Bass Lock",
+        description = "Domi 2 optimized -- locks to bass/kick, punchy hybrid pulses with sustain body",
+        category = PresetCategory.Bass,
+        mainVolume = 1.90f,
+        frequencyMode = FrequencyMode.LowPass,
+        targetFrequency = 140f,
+        gateThreshold = 0.14f,
+        autoGateAmount = 0f,
+        gateSmoothing = 0.06f,
+        triggerMode = TriggerMode.Hybrid,
+        binaryLevel = 0.78f,
+        hybridBlend = 0.48f,
+        attackMs = 2f,
+        decayMs = 55f,
+        sustainLevel = 0.52f,
+        releaseMs = 85f,
+        attackCurve = 0.35f,
+        decayCurve = 1.6f,
+        releaseCurve = 1.9f,
+        minVibe = 0.05f,
+        maxVibe = 1f
+    ),
+    Preset(
+        name = "Domi Immerse",
+        description = "Domi 2 full-range -- smooth dynamic following with generous sustain and body",
+        category = PresetCategory.Musical,
+        mainVolume = 1.60f,
+        frequencyMode = FrequencyMode.Full,
+        targetFrequency = 200f,
+        gateThreshold = 0.08f,
+        autoGateAmount = 0f,
+        gateSmoothing = 0.12f,
+        triggerMode = TriggerMode.Dynamic,
+        binaryLevel = 0.8f,
+        hybridBlend = 0.5f,
+        attackMs = 12f,
+        decayMs = 110f,
+        sustainLevel = 0.78f,
+        releaseMs = 280f,
+        attackCurve = 0.55f,
+        decayCurve = 1.2f,
+        releaseCurve = 1.4f,
+        minVibe = 0.06f,
+        maxVibe = 0.92f
+    ),
+    Preset(
+        name = "Domi Edge",
+        description = "Domi 2 edging -- tight bass pulses, low sustain, dramatic contrast",
+        category = PresetCategory.Percussion,
+        mainVolume = 2.10f,
+        frequencyMode = FrequencyMode.LowPass,
+        targetFrequency = 120f,
+        gateThreshold = 0.20f,
+        autoGateAmount = 0f,
+        gateSmoothing = 0f,
+        triggerMode = TriggerMode.Hybrid,
+        binaryLevel = 0.92f,
+        hybridBlend = 0.55f,
+        attackMs = 1f,
+        decayMs = 35f,
+        sustainLevel = 0.28f,
+        releaseMs = 180f,
+        attackCurve = 0.25f,
+        decayCurve = 2.2f,
+        releaseCurve = 1.8f,
+        minVibe = 0f,
+        maxVibe = 1f
+    ),
+    // === NEW PRESETS ===
+    Preset(
+        name = "Deep Trance",
+        description = "Hypnotic bass pulse -- slow, deep, relentless build",
+        category = PresetCategory.Bass,
+        mainVolume = 1.8f,
+        frequencyMode = FrequencyMode.LowPass,
+        targetFrequency = 100f,
+        gateThreshold = 0.10f,
+        autoGateAmount = 0f,
+        gateSmoothing = 0.15f,
+        triggerMode = TriggerMode.Dynamic,
+        binaryLevel = 0.8f,
+        hybridBlend = 0.5f,
+        attackMs = 15f,
+        decayMs = 200f,
+        sustainLevel = 0.82f,
+        releaseMs = 600f,
+        attackCurve = 0.5f,
+        decayCurve = 0.8f,
+        releaseCurve = 1.2f,
+        minVibe = 0.12f,
+        maxVibe = 1f
+    ),
+    Preset(
+        name = "Edge & Deny",
+        description = "Builds intensity then deliberately pulls back -- designed to delay and intensify",
+        category = PresetCategory.Effect,
+        mainVolume = 1.6f,
+        frequencyMode = FrequencyMode.Full,
+        targetFrequency = 200f,
+        gateThreshold = 0.08f,
+        autoGateAmount = 0f,
+        gateSmoothing = 0.10f,
+        triggerMode = TriggerMode.Dynamic,
+        binaryLevel = 0.8f,
+        hybridBlend = 0.5f,
+        attackMs = 20f,
+        decayMs = 100f,
+        sustainLevel = 0.85f,
+        releaseMs = 350f,
+        attackCurve = 0.6f,
+        decayCurve = 1f,
+        releaseCurve = 1.3f,
+        minVibe = 0.08f,
+        maxVibe = 0.95f
+    ),
+    Preset(
+        name = "Slow Burn",
+        description = "Ultra-gradual build -- barely perceptible increase over minutes, then overwhelming",
+        category = PresetCategory.Effect,
+        mainVolume = 1.2f,
+        frequencyMode = FrequencyMode.Full,
+        targetFrequency = 200f,
+        gateThreshold = 0.06f,
+        autoGateAmount = 0f,
+        gateSmoothing = 0.25f,
+        triggerMode = TriggerMode.Dynamic,
+        binaryLevel = 0.8f,
+        hybridBlend = 0.5f,
+        attackMs = 50f,
+        decayMs = 300f,
+        sustainLevel = 0.90f,
+        releaseMs = 800f,
+        attackCurve = 0.4f,
+        decayCurve = 0.7f,
+        releaseCurve = 1f,
+        minVibe = 0.05f,
+        maxVibe = 0.80f
+    ),
+    Preset(
+        name = "Rhythm Rider",
+        description = "Locks to any beat -- punchy dynamic response with musical sustain tail",
+        category = PresetCategory.Percussion,
+        mainVolume = 1.4f,
+        frequencyMode = FrequencyMode.Full,
+        targetFrequency = 200f,
+        gateThreshold = 0.15f,
+        autoGateAmount = 0.2f,
+        gateSmoothing = 0.05f,
+        triggerMode = TriggerMode.Hybrid,
+        binaryLevel = 0.75f,
+        hybridBlend = 0.35f,
+        attackMs = 3f,
+        decayMs = 80f,
+        sustainLevel = 0.55f,
+        releaseMs = 180f,
+        attackCurve = 0.3f,
+        decayCurve = 1.5f,
+        releaseCurve = 2f,
+        minVibe = 0f,
+        maxVibe = 1f
+    ),
+    Preset(
+        name = "Crescendo",
+        description = "Designed for the climax engine -- builds relentlessly with musical dynamics",
+        category = PresetCategory.Musical,
+        mainVolume = 1.3f,
+        frequencyMode = FrequencyMode.Full,
+        targetFrequency = 200f,
+        gateThreshold = 0.07f,
+        autoGateAmount = 0f,
+        gateSmoothing = 0.18f,
+        triggerMode = TriggerMode.Dynamic,
+        binaryLevel = 0.8f,
+        hybridBlend = 0.5f,
+        attackMs = 25f,
+        decayMs = 150f,
+        sustainLevel = 0.88f,
+        releaseMs = 450f,
+        attackCurve = 0.5f,
+        decayCurve = 0.9f,
+        releaseCurve = 1.2f,
+        minVibe = 0.10f,
+        maxVibe = 0.95f
+    )
+)
+
+/** Get a preset by name (case-insensitive). */
+fun findPreset(name: String): Preset? =
+    factoryPresets().find { it.name.equals(name, ignoreCase = true) }
+
+/** Get all presets in a given category. */
+fun presetsInCategory(category: PresetCategory): List<Preset> =
+    factoryPresets().filter { it.category == category }

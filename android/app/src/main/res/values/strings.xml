@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Chloe Vibes</string>
+    <string name="permission_bluetooth_rationale">Bluetooth is required to connect to vibration devices.</string>
+    <string name="permission_audio_rationale">Audio access is required to capture system audio or microphone input for signal processing.</string>
+    <string name="no_device_connected">No device connected</string>
+    <string name="scanning">Scanning for devices...</string>
+    <string name="connected_to">Connected to %1$s</string>
+    <string name="battery_level">Battery: %1$d%%</string>
+</resources>
