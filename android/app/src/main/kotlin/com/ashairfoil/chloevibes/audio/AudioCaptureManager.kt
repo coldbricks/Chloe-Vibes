@@ -332,9 +332,12 @@ class AudioCaptureManager(private val context: Context) {
                 }
             }
 
-            // Detect dead Visualizer: either producing silence or stopped calling back entirely
-            if (sourceMode == AudioSourceMode.SystemAudio && visualizer != null) {
-                val stalled = (System.currentTimeMillis() - lastSampleTimeMs) > STALL_TIMEOUT_MS
+            // Detect dead Visualizer: either stopped calling back or producing silence.
+            // When detected, tear it down and re-create it (Samsung kills session 0
+            // periodically but a fresh Visualizer usually works again).
+            if (sourceMode == AudioSourceMode.SystemAudio) {
+                val stalled = visualizer != null &&
+                    (System.currentTimeMillis() - lastSampleTimeMs) > STALL_TIMEOUT_MS
                 var rmsCheck = 0f
                 for (s in samples) rmsCheck += s * s
                 val isSilent = samples.isEmpty() || (rmsCheck / samples.size.coerceAtLeast(1)) < 1e-10f
@@ -342,14 +345,12 @@ class AudioCaptureManager(private val context: Context) {
                 if (isSilent) silentFrameCount++ else silentFrameCount = 0
 
                 if (stalled || silentFrameCount >= SILENT_FRAMES_BEFORE_FALLBACK) {
-                    // Visualizer is dead — switch to mic
+                    // Tear down and re-create the Visualizer
                     silentFrameCount = 0
                     try { visualizer?.apply { enabled = false; release() } } catch (_: Exception) {}
                     visualizer = null
-                    sourceMode = AudioSourceMode.Microphone
-                    if (startMicrophone()) {
-                        onFallbackToMic?.invoke()
-                    }
+                    startVisualizer()
+                    lastSampleTimeMs = System.currentTimeMillis()
                 }
             }
 

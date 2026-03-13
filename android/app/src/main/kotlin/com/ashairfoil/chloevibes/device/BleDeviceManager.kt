@@ -77,11 +77,40 @@ class BleDeviceManager(private val context: Context) {
     var onConnectionStateChanged: ((ConnectionState) -> Unit)? = null
     var onBatteryUpdate: ((Int) -> Unit)? = null
 
-    // Lovense service/characteristic UUIDs
+    // Known Lovense service/characteristic UUID sets.
+    // Older devices use Nordic UART; newer firmware uses Lovense-specific UUIDs.
+    data class ServiceUuids(val service: UUID, val tx: UUID, val rx: UUID)
+
     companion object {
-        val LOVENSE_SERVICE_UUID: UUID = UUID.fromString("6e400001-b5a3-f393-e0a9-e50e24dcca9e")
-        val LOVENSE_TX_CHAR_UUID: UUID = UUID.fromString("6e400002-b5a3-f393-e0a9-e50e24dcca9e")
-        val LOVENSE_RX_CHAR_UUID: UUID = UUID.fromString("6e400003-b5a3-f393-e0a9-e50e24dcca9e")
+        private val KNOWN_SERVICES = listOf(
+            // Nordic UART Service (older Lovense firmware)
+            ServiceUuids(
+                UUID.fromString("6e400001-b5a3-f393-e0a9-e50e24dcca9e"),
+                UUID.fromString("6e400002-b5a3-f393-e0a9-e50e24dcca9e"),
+                UUID.fromString("6e400003-b5a3-f393-e0a9-e50e24dcca9e")
+            ),
+            // Lovense-specific service (newer firmware, Domi 2 / Mission etc.)
+            ServiceUuids(
+                UUID.fromString("50300001-0023-4bd4-bbd5-a6920e4c5653"),
+                UUID.fromString("50300002-0023-4bd4-bbd5-a6920e4c5653"),
+                UUID.fromString("50300003-0023-4bd4-bbd5-a6920e4c5653")
+            ),
+            // Alternate Lovense service (some newer models)
+            ServiceUuids(
+                UUID.fromString("53300001-0023-4bd4-bbd5-a6920e4c5653"),
+                UUID.fromString("53300002-0023-4bd4-bbd5-a6920e4c5653"),
+                UUID.fromString("53300003-0023-4bd4-bbd5-a6920e4c5653")
+            ),
+            // Another variant seen on some Lovense devices
+            ServiceUuids(
+                UUID.fromString("57300001-0023-4bd4-bbd5-a6920e4c5653"),
+                UUID.fromString("57300002-0023-4bd4-bbd5-a6920e4c5653"),
+                UUID.fromString("57300003-0023-4bd4-bbd5-a6920e4c5653")
+            )
+        )
+
+        /** CCCD descriptor UUID for enabling notifications. */
+        val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
         private const val SCAN_TIMEOUT_MS = 15_000L
     }
 
@@ -94,16 +123,12 @@ class BleDeviceManager(private val context: Context) {
         if (scanner == null || isScanning) return false
         discoveredDevices.clear()
 
-        val filters = listOf(
-            ScanFilter.Builder()
-                .setServiceUuid(ParcelUuid(LOVENSE_SERVICE_UUID))
-                .build()
-        )
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
 
-        // Also scan without filter to catch non-Lovense devices
+        // Scan without UUID filter — Lovense devices may advertise under any of
+        // several service UUIDs depending on firmware version
         try {
             scanner.startScan(scanCallback)
             isScanning = true
@@ -201,30 +226,52 @@ class BleDeviceManager(private val context: Context) {
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
             if (status != BluetoothGatt.GATT_SUCCESS) return
 
-            // Look for Lovense service
-            val service = gatt.getService(LOVENSE_SERVICE_UUID)
-            if (service != null) {
-                writeCharacteristic = service.getCharacteristic(LOVENSE_TX_CHAR_UUID)
-                notifyCharacteristic = service.getCharacteristic(LOVENSE_RX_CHAR_UUID)
+            // Try each known Lovense UUID set
+            for (uuids in KNOWN_SERVICES) {
+                val service = gatt.getService(uuids.service) ?: continue
+                val tx = service.getCharacteristic(uuids.tx) ?: continue
+                val rx = service.getCharacteristic(uuids.rx) ?: continue
+                writeCharacteristic = tx
+                notifyCharacteristic = rx
+                enableNotificationsAndFinish(gatt, rx)
+                return
+            }
 
-                // Enable notifications on RX characteristic
-                notifyCharacteristic?.let { rxChar ->
-                    gatt.setCharacteristicNotification(rxChar, true)
-                    val descriptor = rxChar.getDescriptor(
-                        UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
-                    )
-                    descriptor?.let {
-                        it.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                        gatt.writeDescriptor(it)
+            // Fallback: scan ALL services for a writable + notifiable pair
+            // (covers unknown firmware revisions)
+            for (service in gatt.services) {
+                var txCandidate: BluetoothGattCharacteristic? = null
+                var rxCandidate: BluetoothGattCharacteristic? = null
+                for (c in service.characteristics) {
+                    val props = c.properties
+                    if (props and BluetoothGattCharacteristic.PROPERTY_WRITE != 0 ||
+                        props and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0
+                    ) {
+                        txCandidate = c
+                    }
+                    if (props and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0) {
+                        rxCandidate = c
                     }
                 }
-
-                connectionState = ConnectionState.Ready
-                handler.post { onConnectionStateChanged?.invoke(connectionState) }
-
-                // Request battery level
-                handler.postDelayed({ sendCommand("Battery;") }, 500)
+                if (txCandidate != null && rxCandidate != null) {
+                    writeCharacteristic = txCandidate
+                    notifyCharacteristic = rxCandidate
+                    enableNotificationsAndFinish(gatt, rxCandidate)
+                    return
+                }
             }
+        }
+
+        private fun enableNotificationsAndFinish(gatt: BluetoothGatt, rxChar: BluetoothGattCharacteristic) {
+            gatt.setCharacteristicNotification(rxChar, true)
+            val descriptor = rxChar.getDescriptor(CCCD_UUID)
+            descriptor?.let {
+                it.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                gatt.writeDescriptor(it)
+            }
+            connectionState = ConnectionState.Ready
+            handler.post { onConnectionStateChanged?.invoke(connectionState) }
+            handler.postDelayed({ sendCommand("Battery;") }, 500)
         }
 
         override fun onCharacteristicWrite(
@@ -240,7 +287,7 @@ class BleDeviceManager(private val context: Context) {
             gatt: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic
         ) {
-            if (characteristic.uuid == LOVENSE_RX_CHAR_UUID) {
+            if (characteristic.uuid == notifyCharacteristic?.uuid) {
                 val response = characteristic.getStringValue(0) ?: return
                 parseLovenseResponse(response)
             }
