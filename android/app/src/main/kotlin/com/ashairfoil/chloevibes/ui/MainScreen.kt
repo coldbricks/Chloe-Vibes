@@ -82,6 +82,7 @@ class MainScreenState {
     // Output
     var minVibe by mutableFloatStateOf(0f)
     var maxVibe by mutableFloatStateOf(1f)
+    var outputGain by mutableFloatStateOf(1f)
 
     // Climax
     var climaxEnabled by mutableStateOf(false)
@@ -216,7 +217,7 @@ fun MainScreen(
 
         // INPUT section
         SectionHeader("INPUT")
-        LabeledSlider("Volume", state.mainVolume, 0f, 3f, "%.2f") {
+        LabeledSlider("Volume", state.mainVolume, 0f, 5f, "%.2f") {
             state.mainVolume = it; state.selectedPresetName = "Custom"; onParameterChanged()
         }
         FrequencyModeSelector(state.frequencyMode) {
@@ -309,6 +310,9 @@ fun MainScreen(
 
         // OUTPUT section
         SectionHeader("OUTPUT")
+        LabeledSlider("Gain", state.outputGain, 0f, 3f, "%.2f", ChloeColors.Pink) {
+            state.outputGain = it; state.selectedPresetName = "Custom"; onParameterChanged()
+        }
         LabeledSlider("Floor", state.minVibe, 0f, 1f, "%.2f") {
             state.minVibe = it; state.selectedPresetName = "Custom"; onParameterChanged()
         }

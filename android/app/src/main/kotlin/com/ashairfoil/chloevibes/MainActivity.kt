@@ -185,6 +185,7 @@ class MainActivity : ComponentActivity() {
             releaseCurve = uiState.releaseCurve
             minVibe = uiState.minVibe
             maxVibe = uiState.maxVibe
+            outputGain = uiState.outputGain
             climaxEnabled = uiState.climaxEnabled
             climaxIntensity = uiState.climaxIntensity
             climaxBuildUpMs = uiState.climaxBuildUpMs

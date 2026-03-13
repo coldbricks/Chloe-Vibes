@@ -117,6 +117,7 @@ class AudioCaptureManager(private val context: Context) {
     @Volatile var releaseCurve: Float = 1.15f
     @Volatile var minVibe: Float = 0f
     @Volatile var maxVibe: Float = 1f
+    @Volatile var outputGain: Float = 1f
 
     // Climax engine params
     @Volatile var climaxEnabled: Boolean = false
@@ -503,7 +504,7 @@ class AudioCaptureManager(private val context: Context) {
             } else {
                 0f
             }
-            val finalOutput = mapped.coerceIn(0f, 1f)
+            val finalOutput = (mapped * outputGain).coerceIn(0f, 1f)
             state.lastFinalOutput = finalOutput
 
             // Notify listener
