@@ -78,7 +78,7 @@ class EnvelopeProcessor {
         // when backgrounded Android throttles the thread and the follow-up
         // command may be delayed hundreds of milliseconds — leaving the device
         // silent through the entire attack phase.
-        phaseStartValue = value.coerceAtLeast(0.15f)
+        phaseStartValue = value.coerceAtLeast(0.4f)
         lastTriggerTimeMs = currentTimeMs
     }
 

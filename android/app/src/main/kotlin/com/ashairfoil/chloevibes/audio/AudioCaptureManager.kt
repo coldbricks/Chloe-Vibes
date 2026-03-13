@@ -131,6 +131,7 @@ class AudioCaptureManager(private val context: Context) {
 
     // Output callback
     var onOutputUpdate: ((Float) -> Unit)? = null
+    @Volatile private var lastSentOutput: Float = 0f
 
     /** Called when Visualizer produces silence and we auto-fallback to mic. */
     var onFallbackToMic: (() -> Unit)? = null
@@ -423,8 +424,9 @@ class AudioCaptureManager(private val context: Context) {
                         dominantFrequency = 0f
                     )
 
-                    // Apply volume as a gain on the energy
-                    energy = SpectralAnalyzer.extractEnergy(spectralData, frequencyMode, targetFrequency) * mainVolume
+                    // Extract raw energy (pre-volume) for gate, boosted for envelope
+                    val rawEnergy = SpectralAnalyzer.extractEnergy(spectralData, frequencyMode, targetFrequency)
+                    energy = rawEnergy * mainVolume
                 }
             } else {
                 // ---- Raw sample path (mic or fallback) ----
@@ -442,12 +444,17 @@ class AudioCaptureManager(private val context: Context) {
                 energy = SpectralAnalyzer.extractEnergy(spectralData, frequencyMode, targetFrequency)
             }
 
+            // Raw energy (0-1 normalized, no volume) for the gate so the
+            // threshold slider maps cleanly: 0% = always open, 100% = closed.
+            // Volume-boosted energy feeds the envelope for dynamics.
+            val rawEnergy = if (mainVolume > 0.001f) (energy / mainVolume).coerceIn(0f, 1f) else 0f
+
             state.lastSpectralData = spectralData
             state.lastEnergy = energy
 
-            // Step 3: Gate
+            // Step 3: Gate (uses raw energy so threshold isn't defeated by volume)
             val gateOpen = state.gate.process(
-                energy, gateThreshold, autoGateAmount, gateSmoothing, thresholdKnee
+                rawEnergy, gateThreshold, autoGateAmount, gateSmoothing, thresholdKnee
             )
             state.lastGateOpen = gateOpen
 
@@ -507,8 +514,13 @@ class AudioCaptureManager(private val context: Context) {
             val finalOutput = (mapped * outputGain).coerceIn(0f, 1f)
             state.lastFinalOutput = finalOutput
 
-            // Notify listener
-            onOutputUpdate?.invoke(finalOutput)
+            // Notify listener — skip redundant Vibrate:0 commands so the BLE
+            // write gate is clear when a real trigger arrives.  Send the stop
+            // command once when output drops to zero, then go silent.
+            if (finalOutput > 0.001f || lastSentOutput > 0.001f) {
+                onOutputUpdate?.invoke(finalOutput)
+                lastSentOutput = finalOutput
+            }
 
             // ~60Hz processing rate
             try {
