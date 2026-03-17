@@ -65,7 +65,10 @@ class BleDeviceManager(private val context: Context) {
     private var pendingCommand: String? = null
     private val writeLock = Object()
     private var lastWriteMs: Long = 0
-    private val minWriteIntervalMs = 50L  // 20Hz max command rate
+    private val minWriteIntervalMs = 38L  // ~26Hz command rate
+    private val writeTimeoutMs = 160L
+    private var pendingDrainScheduled = false
+    private var writeWatchdogScheduled = false
 
     // Scan results
     private val discoveredDevices = mutableMapOf<String, BleDeviceInfo>()
@@ -130,7 +133,7 @@ class BleDeviceManager(private val context: Context) {
         // Scan without UUID filter — Lovense devices may advertise under any of
         // several service UUIDs depending on firmware version
         try {
-            scanner.startScan(scanCallback)
+            scanner.startScan(emptyList(), settings, scanCallback)
             isScanning = true
             handler.postDelayed({ stopScan() }, SCAN_TIMEOUT_MS)
             return true
@@ -183,6 +186,7 @@ class BleDeviceManager(private val context: Context) {
 
     /** Connect to a device by address. */
     fun connect(address: String): Boolean {
+        resetWriteState()
         val device = bluetoothAdapter?.getRemoteDevice(address) ?: return false
         connectionState = ConnectionState.Connecting
         onConnectionStateChanged?.invoke(connectionState)
@@ -198,6 +202,7 @@ class BleDeviceManager(private val context: Context) {
         gatt = null
         writeCharacteristic = null
         notifyCharacteristic = null
+        resetWriteState()
         connectionState = ConnectionState.Disconnected
         connectedDeviceName = null
         batteryLevel = -1
@@ -211,6 +216,7 @@ class BleDeviceManager(private val context: Context) {
                     connectionState = ConnectionState.Connected
                     connectedDeviceName = gatt.device.name
                     handler.post { onConnectionStateChanged?.invoke(connectionState) }
+                    try { gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH) } catch (_: Exception) { }
                     gatt.discoverServices()
                 }
                 BluetoothGatt.STATE_DISCONNECTED -> {
@@ -218,6 +224,7 @@ class BleDeviceManager(private val context: Context) {
                     connectedDeviceName = null
                     writeCharacteristic = null
                     notifyCharacteristic = null
+                    resetWriteState()
                     handler.post { onConnectionStateChanged?.invoke(connectionState) }
                 }
             }
@@ -279,6 +286,9 @@ class BleDeviceManager(private val context: Context) {
             characteristic: BluetoothGattCharacteristic,
             status: Int
         ) {
+            synchronized(writeLock) {
+                writeWatchdogScheduled = false
+            }
             // Previous write completed — flush any queued command
             flushPendingWrite()
         }
@@ -306,27 +316,58 @@ class BleDeviceManager(private val context: Context) {
         val characteristic = writeCharacteristic ?: return false
         val g = gatt ?: return false
 
+        var shouldWrite = false
+        var queueBecauseInFlight = false
+        var pendingDelayMs = 0L
+
         synchronized(writeLock) {
             val now = System.currentTimeMillis()
             // Auto-clear writeInFlight if the BLE callback hasn't arrived
-            // within 200ms.  When the app is backgrounded, Android may delay
+            // within timeout.  When the app is backgrounded, Android may delay
             // onCharacteristicWrite callbacks, leaving writeInFlight stuck and
             // blocking all subsequent vibration commands.
-            if (writeInFlight && (now - lastWriteMs) > 200) {
+            if (writeInFlight && (now - lastWriteMs) > writeTimeoutMs) {
                 writeInFlight = false
             }
-            if (writeInFlight || (now - lastWriteMs) < minWriteIntervalMs) {
-                // Queue this as the next command (overwrites any stale pending)
+
+            if (writeInFlight) {
                 pendingCommand = command
-                return false
+                queueBecauseInFlight = true
+            } else {
+                val sinceLast = now - lastWriteMs
+                if (sinceLast < minWriteIntervalMs) {
+                    pendingCommand = command
+                    pendingDelayMs = minWriteIntervalMs - sinceLast
+                } else {
+                    writeInFlight = true
+                    lastWriteMs = now
+                    shouldWrite = true
+                }
             }
-            writeInFlight = true
-            lastWriteMs = now
+        }
+
+        if (queueBecauseInFlight) {
+            scheduleWriteWatchdog()
+            return false
+        }
+        if (!shouldWrite) {
+            schedulePendingDrain(pendingDelayMs)
+            return false
         }
 
         characteristic.value = command.toByteArray(Charsets.US_ASCII)
         characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-        return g.writeCharacteristic(characteristic)
+        val started = g.writeCharacteristic(characteristic)
+        if (!started) {
+            synchronized(writeLock) {
+                writeInFlight = false
+                pendingCommand = command
+            }
+            schedulePendingDrain(minWriteIntervalMs)
+        } else {
+            scheduleWriteWatchdog()
+        }
+        return started
     }
 
     /** Flush pending command after a write completes. */
@@ -338,6 +379,64 @@ class BleDeviceManager(private val context: Context) {
             pendingCommand = null
         }
         cmd?.let { sendCommand(it) }
+    }
+
+    /** Schedules pending command flush once min write interval has elapsed. */
+    private fun schedulePendingDrain(delayMs: Long) {
+        val shouldSchedule = synchronized(writeLock) {
+            if (pendingDrainScheduled) {
+                false
+            } else {
+                pendingDrainScheduled = true
+                true
+            }
+        }
+        if (!shouldSchedule) return
+
+        handler.postDelayed({
+            synchronized(writeLock) {
+                pendingDrainScheduled = false
+            }
+            flushPendingWrite()
+        }, delayMs.coerceAtLeast(1L))
+    }
+
+    /** Watchdog for missing onCharacteristicWrite callbacks. */
+    private fun scheduleWriteWatchdog() {
+        val shouldSchedule = synchronized(writeLock) {
+            if (writeWatchdogScheduled) {
+                false
+            } else {
+                writeWatchdogScheduled = true
+                true
+            }
+        }
+        if (!shouldSchedule) return
+
+        handler.postDelayed({
+            var shouldFlush = false
+            synchronized(writeLock) {
+                writeWatchdogScheduled = false
+                val now = System.currentTimeMillis()
+                if (writeInFlight && (now - lastWriteMs) > writeTimeoutMs) {
+                    writeInFlight = false
+                    shouldFlush = pendingCommand != null
+                }
+            }
+            if (shouldFlush) {
+                flushPendingWrite()
+            }
+        }, writeTimeoutMs)
+    }
+
+    private fun resetWriteState() {
+        synchronized(writeLock) {
+            writeInFlight = false
+            pendingCommand = null
+            lastWriteMs = 0L
+            pendingDrainScheduled = false
+            writeWatchdogScheduled = false
+        }
     }
 
     /**

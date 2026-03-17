@@ -57,7 +57,7 @@ class EnvelopeProcessor {
     private var lastGateOpen: Boolean = false
 
     /** Minimum time between retriggers (ms). */
-    private val minRetriggerMs: Float = 35f
+    private val minRetriggerMs: Float = 20f
 
     /** Time of last trigger (ms). */
     private var lastTriggerTimeMs: Float = 0f

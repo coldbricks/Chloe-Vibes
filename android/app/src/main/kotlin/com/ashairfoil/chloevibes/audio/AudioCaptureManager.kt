@@ -94,6 +94,7 @@ class AudioCaptureManager(private val context: Context) {
     private companion object {
         const val SILENT_FRAMES_BEFORE_FALLBACK = 90
         const val STALL_TIMEOUT_MS = 3000L
+        const val TARGET_FRAME_MS = 16L
     }
 
     // Signal processing parameters (set from UI thread)
@@ -342,6 +343,7 @@ class AudioCaptureManager(private val context: Context) {
 
         while (running) {
           try {
+            val frameStartNs = System.nanoTime()
             val currentTimeMs = System.nanoTime() / 1_000_000f - startMs
 
             val spectralData: SpectralData
@@ -522,11 +524,17 @@ class AudioCaptureManager(private val context: Context) {
                 lastSentOutput = finalOutput
             }
 
-            // ~60Hz processing rate
-            try {
-                Thread.sleep(16)
-            } catch (_: InterruptedException) {
-                break
+            // Maintain ~60Hz by sleeping only the remainder of this frame budget.
+            val elapsedMs = (System.nanoTime() - frameStartNs) / 1_000_000L
+            val sleepMs = TARGET_FRAME_MS - elapsedMs
+            if (sleepMs > 0L) {
+                try {
+                    Thread.sleep(sleepMs)
+                } catch (_: InterruptedException) {
+                    break
+                }
+            } else {
+                Thread.yield()
             }
           } catch (_: Exception) {
               // Don't let a single frame crash kill the processing thread
