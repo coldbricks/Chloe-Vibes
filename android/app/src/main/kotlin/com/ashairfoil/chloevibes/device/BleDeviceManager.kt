@@ -16,6 +16,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.ParcelUuid
 import java.util.*
+import kotlin.math.roundToInt
 
 // ---------------------------------------------------------------------------
 // Device info
@@ -69,6 +70,16 @@ class BleDeviceManager(private val context: Context) {
     private val writeTimeoutMs = 160L
     private var pendingDrainScheduled = false
     private var writeWatchdogScheduled = false
+
+    // Output dithering -- temporal sub-step resolution.
+    // Lovense has 21 intensity levels (0-20). By dithering between adjacent
+    // levels across frames, motor inertia integrates the rapid switching into
+    // smooth intermediate intensities, giving effective sub-step resolution.
+    // This makes micro-pulse, chaos, and sustain modulation physically
+    // expressible instead of being crushed to 5% steps.
+    @Volatile private var ditherErrorMain: Float = 0f
+    @Volatile private var ditherErrorMotor1: Float = 0f
+    @Volatile private var ditherErrorMotor2: Float = 0f
 
     // Scan results
     private val discoveredDevices = mutableMapOf<String, BleDeviceInfo>()
@@ -206,6 +217,7 @@ class BleDeviceManager(private val context: Context) {
         connectionState = ConnectionState.Disconnected
         connectedDeviceName = null
         batteryLevel = -1
+        isDualMotor = false
         onConnectionStateChanged?.invoke(connectionState)
     }
 
@@ -215,6 +227,15 @@ class BleDeviceManager(private val context: Context) {
                 BluetoothGatt.STATE_CONNECTED -> {
                     connectionState = ConnectionState.Connected
                     connectedDeviceName = gatt.device.name
+                    // Detect dual-motor devices from name at connection time
+                    gatt.device.name?.let { name ->
+                        if (name.contains("Domi", ignoreCase = true) ||
+                            name.contains("Edge", ignoreCase = true) ||
+                            name.contains("Nora", ignoreCase = true)
+                        ) {
+                            isDualMotor = true
+                        }
+                    }
                     handler.post { onConnectionStateChanged?.invoke(connectionState) }
                     try { gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH) } catch (_: Exception) { }
                     gatt.discoverServices()
@@ -437,16 +458,55 @@ class BleDeviceManager(private val context: Context) {
             pendingDrainScheduled = false
             writeWatchdogScheduled = false
         }
+        ditherErrorMain = 0f
+        ditherErrorMotor1 = 0f
+        ditherErrorMotor2 = 0f
     }
+
+    /** Whether connected device supports dual motors (Domi 2, Nora, etc). */
+    @Volatile var isDualMotor: Boolean = false
+        private set
 
     /**
      * Set vibration intensity (0.0 - 1.0).
-     * Maps to Lovense protocol: Vibrate:X; where X is 0-20
+     * Maps to Lovense protocol: Vibrate:X; where X is 0-20.
+     * Uses first-order noise-shaped dithering for sub-step resolution.
      */
     fun setIntensity(level: Float) {
         if (connectionState != ConnectionState.Ready) return
-        val lovenseLevel = (level * 20f).toInt().coerceIn(0, 20)
-        sendCommand(LovenseProtocol.vibrate(lovenseLevel))
+        val continuous = level * 20f
+        val withError = continuous + ditherErrorMain
+        val quantized = withError.roundToInt().coerceIn(0, 20)
+        ditherErrorMain = withError - quantized.toFloat()
+        sendCommand(LovenseProtocol.vibrate(quantized))
+    }
+
+    /**
+     * Set dual-motor intensity with independent motor levels.
+     * Motor 1 and motor 2 receive separate intensity values,
+     * creating spatial movement when they differ.
+     * Falls back to single-motor command for non-dual devices.
+     *
+     * @param motor1 primary motor intensity (0.0 - 1.0)
+     * @param motor2 secondary motor intensity (0.0 - 1.0)
+     */
+    fun setDualIntensity(motor1: Float, motor2: Float) {
+        if (connectionState != ConnectionState.Ready) return
+        if (isDualMotor) {
+            val cont1 = motor1 * 20f
+            val with1 = cont1 + ditherErrorMotor1
+            val q1 = with1.roundToInt().coerceIn(0, 20)
+            ditherErrorMotor1 = with1 - q1.toFloat()
+
+            val cont2 = motor2 * 20f
+            val with2 = cont2 + ditherErrorMotor2
+            val q2 = with2.roundToInt().coerceIn(0, 20)
+            ditherErrorMotor2 = with2 - q2.toFloat()
+
+            sendCommand(LovenseProtocol.vibrate2(q1, q2))
+        } else {
+            setIntensity(motor1)
+        }
     }
 
     /** Request battery level update. */
@@ -476,6 +536,23 @@ class BleDeviceManager(private val context: Context) {
                     batteryLevel = level
                     handler.post { onBatteryUpdate?.invoke(level) }
                 }
+            }
+        }
+
+        // Device type response -- detect dual-motor devices.
+        // Domi 2 responds with device type starting with "W" (wand)
+        // Nora responds with "A", Edge with "P" -- all dual motor.
+        val upperTrimmed = trimmed.uppercase()
+        if (upperTrimmed.startsWith("W") || upperTrimmed.startsWith("P")) {
+            isDualMotor = true
+        }
+        // Also detect from device name at connection time
+        connectedDeviceName?.let { name ->
+            if (name.contains("Domi", ignoreCase = true) ||
+                name.contains("Edge", ignoreCase = true) ||
+                name.contains("Nora", ignoreCase = true)
+            ) {
+                isDualMotor = true
             }
         }
     }

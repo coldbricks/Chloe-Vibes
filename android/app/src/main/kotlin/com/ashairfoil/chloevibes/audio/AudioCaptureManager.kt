@@ -130,8 +130,10 @@ class AudioCaptureManager(private val context: Context) {
     @Volatile var climaxPulseDepth: Float = 0.18f
     @Volatile var climaxPattern: ClimaxPattern = ClimaxPattern.Wave
 
-    // Output callback
+    // Output callback -- single motor (legacy) and dual motor
     var onOutputUpdate: ((Float) -> Unit)? = null
+    /** Dual-motor callback: (motor1, motor2) for devices with independent motors. */
+    var onDualOutputUpdate: ((Float, Float) -> Unit)? = null
     @Volatile private var lastSentOutput: Float = 0f
 
     /** Called when Visualizer produces silence and we auto-fallback to mic. */
@@ -157,6 +159,14 @@ class AudioCaptureManager(private val context: Context) {
         releaseCurve = preset.releaseCurve
         minVibe = preset.minVibe
         maxVibe = preset.maxVibe
+        climaxEnabled = preset.climaxEnabled
+        climaxIntensity = preset.climaxIntensity
+        climaxBuildUpMs = preset.climaxBuildUpMs
+        climaxTeaseRatio = preset.climaxTeaseRatio
+        climaxTeaseDrop = preset.climaxTeaseDrop
+        climaxSurgeBoost = preset.climaxSurgeBoost
+        climaxPulseDepth = preset.climaxPulseDepth
+        climaxPattern = preset.climaxPattern
     }
 
     /**
@@ -461,9 +471,25 @@ class AudioCaptureManager(private val context: Context) {
             state.lastGateOpen = gateOpen
 
             // Step 4: Beat detection
-            val (isOnset, onsetStrength) = state.beatDetector.process(
+            val (detectedOnset, onsetStrength) = state.beatDetector.process(
                 spectralData.spectralFlux, currentTimeMs
             )
+
+            // Predictive onset: when tempo is locked, pre-trigger ~2 BLE
+            // frames early so the attack command arrives on-beat instead
+            // of 85-115ms late. False positives feel like syncopation;
+            // late delivery feels like lag.
+            var isOnset = detectedOnset
+            if (!isOnset && state.beatDetector.tempoConfidence > 0.6f) {
+                val predicted = state.beatDetector.predictedNextOnsetMs
+                if (predicted > 0f) {
+                    val leadTimeMs = 76f // ~2 BLE write intervals
+                    val timeToPredicted = predicted - currentTimeMs
+                    if (timeToPredicted in 0f..leadTimeMs && gateOpen) {
+                        isOnset = true
+                    }
+                }
+            }
 
             // Step 5: Envelope
             val envelopeOutput = state.envelope.drive(
@@ -484,7 +510,8 @@ class AudioCaptureManager(private val context: Context) {
                 releaseMs = releaseMs,
                 attackCurve = attackCurve,
                 decayCurve = decayCurve,
-                releaseCurve = releaseCurve
+                releaseCurve = releaseCurve,
+                spectralCentroid = spectralData.spectralCentroid
             )
             state.lastEnvelopeOutput = envelopeOutput
             state.lastEnvelopeState = state.envelope.state
@@ -520,7 +547,21 @@ class AudioCaptureManager(private val context: Context) {
             // write gate is clear when a real trigger arrives.  Send the stop
             // command once when output drops to zero, then go silent.
             if (finalOutput > 0.001f || lastSentOutput > 0.001f) {
-                onOutputUpdate?.invoke(finalOutput)
+                // Dual-motor output: climax engine generates phase-offset
+                // signal for motor 2, creating spatial movement
+                val dualCb = onDualOutputUpdate
+                if (dualCb != null && climaxEnabled) {
+                    val motor2Raw = state.climaxEngine.motor2Output
+                    val motor2Mapped = if (motor2Raw > 0.001f) {
+                        minVibe + (maxVibe - minVibe) * motor2Raw
+                    } else {
+                        0f
+                    }
+                    val motor2Final = (motor2Mapped * outputGain).coerceIn(0f, 1f)
+                    dualCb.invoke(finalOutput, motor2Final)
+                } else {
+                    onOutputUpdate?.invoke(finalOutput)
+                }
                 lastSentOutput = finalOutput
             }
 

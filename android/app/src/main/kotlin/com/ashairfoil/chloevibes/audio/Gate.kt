@@ -108,10 +108,17 @@ class Gate {
             energy > closeThreshold
         }
 
-        // Smoothing: 0 = instant, 1 = very gradual
+        // Asymmetric smoothing: instant open, smooth close.
+        // Opening speed is critical for transient response — every ms
+        // of gate delay eats the attack phase. Closing smoothness
+        // prevents chatter without impacting onset timing.
         val gateSignal = if (isAbove) 1f else 0f
         if (smoothing > 0f) {
-            val alpha = 1f - smoothing.coerceIn(0f, 0.98f)
+            val alpha = if (gateSignal > smoothed) {
+                1f  // Instant open — don't filter the rising edge
+            } else {
+                1f - smoothing.coerceIn(0f, 0.98f)  // Smooth close
+            }
             smoothed = smoothed * (1f - alpha) + gateSignal * alpha
         } else {
             smoothed = gateSignal

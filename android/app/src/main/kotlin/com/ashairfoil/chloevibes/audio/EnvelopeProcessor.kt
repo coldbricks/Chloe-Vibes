@@ -50,6 +50,9 @@ class EnvelopeProcessor {
     /** Trigger magnitude (how hard the trigger was). */
     private var magnitude: Float = 0f
 
+    /** Attack target — normally 1.0, higher with velocity overshoot. */
+    private var attackTarget: Float = 1f
+
     /** Timestamp when current phase started (ms). */
     private var startTimeMs: Float = 0f
 
@@ -62,23 +65,46 @@ class EnvelopeProcessor {
     /** Time of last trigger (ms). */
     private var lastTriggerTimeMs: Float = 0f
 
+    /** Stochastic micro-pause: next pause timestamp (ms). */
+    private var nextMicroPauseMs: Float = 0f
+
+    /** Remaining micro-pause frames (0 = not pausing). */
+    private var microPauseFrames: Int = 0
+
     /** Trigger the envelope (gate just opened or strong onset detected). */
-    fun trigger(magnitude: Float, currentTimeMs: Float, velocity: Float) {
+    fun trigger(magnitude: Float, currentTimeMs: Float, velocity: Float, attackMs: Float = 30f) {
         // Enforce minimum retrigger interval
         if (currentTimeMs - lastTriggerTimeMs < minRetriggerMs) return
 
         val scaledMagnitude = magnitude * (0.5f + 0.5f * velocity)
         this.magnitude = scaledMagnitude.coerceIn(0f, 1.5f)
-        state = EnvelopeState.Attack
-        startTimeMs = currentTimeMs
-        // Start from current value, but ensure a minimum floor so the trigger
-        // frame produces non-zero output.  Without this, the first BLE command
-        // after a trigger is Vibrate:0 because value=0 and elapsed=0.  In
-        // foreground the next frame arrives in ~16ms so it's imperceptible, but
-        // when backgrounded Android throttles the thread and the follow-up
-        // command may be delayed hundreds of milliseconds — leaving the device
-        // silent through the entire attack phase.
-        phaseStartValue = value.coerceAtLeast(0.4f)
+
+        // Velocity overshoot: strong onsets briefly exceed normal peak.
+        // A hard drum hit should momentarily push past the normal ceiling,
+        // creating a visceral "punch" sensation.
+        attackTarget = if (velocity > 1.0f) {
+            (1.0f + 0.15f * (velocity - 1.0f)).coerceAtMost(1.2f)
+        } else {
+            1.0f
+        }
+
+        // For short attacks (< 50ms), skip directly to peak.
+        // Motor spin-up (~20ms) provides the physical ramp — sending peak
+        // immediately ensures the BLE command carries the full transient.
+        if (attackMs < 50f) {
+            state = EnvelopeState.Decay
+            value = attackTarget
+            phaseStartValue = attackTarget
+            startTimeMs = currentTimeMs
+        } else {
+            state = EnvelopeState.Attack
+            startTimeMs = currentTimeMs
+            phaseStartValue = value.coerceAtLeast(0.4f)
+        }
+
+        // Reset micro-pause on retrigger
+        microPauseFrames = 0
+        nextMicroPauseMs = 0f
         lastTriggerTimeMs = currentTimeMs
     }
 
@@ -122,20 +148,20 @@ class EnvelopeProcessor {
             EnvelopeState.Attack -> {
                 if (attackMs <= 0.5f) {
                     // Instant attack
-                    value = 1f
+                    value = attackTarget
                     state = EnvelopeState.Decay
                     startTimeMs = currentTimeMs
-                    phaseStartValue = 1f
+                    phaseStartValue = attackTarget
                 } else {
                     val progress = (elapsed / attackMs).coerceIn(0f, 1f)
                     val curved = applyCurve(progress, attackCurve)
-                    value = phaseStartValue + (1f - phaseStartValue) * curved
+                    value = phaseStartValue + (attackTarget - phaseStartValue) * curved
 
                     if (progress >= 1f) {
-                        value = 1f
+                        value = attackTarget
                         state = EnvelopeState.Decay
                         startTimeMs = currentTimeMs
-                        phaseStartValue = 1f
+                        phaseStartValue = attackTarget
                     }
                 }
             }
@@ -157,20 +183,45 @@ class EnvelopeProcessor {
             }
 
             EnvelopeState.Sustain -> {
-                // Multi-layer modulation to prevent neural adaptation.
-                // Total variation +/-25-35% keeps nerve endings sensitized.
-                //   Primary: ~1.2Hz, +/-20% (slow, deep oscillation)
-                //   Secondary: ~0.3Hz, +/-12% (breathing rhythm)
-                //   Perlin-style noise: +/-8% (irrational-ratio sines prevent pattern lock)
-                val primary = 0.20f * sin(currentTimeMs * 0.0075f)    // ~1.2Hz
-                val secondary = 0.12f * sin(currentTimeMs * 0.0019f)  // ~0.3Hz
-                val noise = 0.08f * (
-                        sin(currentTimeMs * 0.00317f) * 0.5f +
-                        sin(currentTimeMs * 0.00713f) * 0.3f +
-                        sin(currentTimeMs * 0.01137f) * 0.2f
-                )
-                val modulation = 1f + primary + secondary + noise
-                value = sustainLevel * modulation
+                // Stochastic micro-pauses: brief drops (1-3 frames, 16-48ms)
+                // that reset nerve endings without being consciously perceived
+                // as "stopping." Intermittent stimulation maintains sensitivity
+                // far longer than continuous vibration.
+                if (microPauseFrames > 0) {
+                    microPauseFrames--
+                    value = sustainLevel * 0.05f
+                } else if (nextMicroPauseMs > 0f && currentTimeMs >= nextMicroPauseMs) {
+                    // 1-3 frames at 60Hz = 16-48ms
+                    microPauseFrames = 1 + ((currentTimeMs * 7.13f).toInt() and 0x3).coerceAtMost(2)
+                    // Next pause in 2-8 seconds (deterministic pseudo-random)
+                    val pseudoRand = ((currentTimeMs * 13.37f).toInt() and 0xFFFF).toFloat() / 65535f
+                    nextMicroPauseMs = currentTimeMs + 2000f + pseudoRand * 6000f
+                    value = sustainLevel * 0.05f
+                } else {
+                    // Initialize micro-pause timer on first sustain frame
+                    if (nextMicroPauseMs <= 0f) {
+                        val pseudoRand = ((currentTimeMs * 13.37f).toInt() and 0xFFFF).toFloat() / 65535f
+                        nextMicroPauseMs = currentTimeMs + 2000f + pseudoRand * 6000f
+                    }
+
+                    // Multi-layer modulation to prevent neural adaptation.
+                    // 5 layers with irrational frequency ratios ensure the
+                    // combined waveform never exactly repeats, keeping nerve
+                    // endings from filtering out the stimulus.
+                    val primary = 0.22f * sin(currentTimeMs * 0.0075f)     // ~1.2Hz
+                    val secondary = 0.14f * sin(currentTimeMs * 0.0019f)   // ~0.3Hz
+                    val tertiary = 0.10f * sin(currentTimeMs * 0.01696f)   // ~2.7Hz
+                    val crossFreq = 0.08f * sin(currentTimeMs * 0.001068f) // ~0.17Hz
+                    val noise = 0.10f * (
+                            sin(currentTimeMs * 0.00317f) * 0.30f +
+                            sin(currentTimeMs * 0.00713f) * 0.25f +
+                            sin(currentTimeMs * 0.01137f) * 0.20f +
+                            sin(currentTimeMs * 0.02173f) * 0.15f +
+                            sin(currentTimeMs * 0.00491f) * 0.10f
+                    )
+                    val modulation = 1f + primary + secondary + tertiary + crossFreq + noise
+                    value = sustainLevel * modulation
+                }
             }
 
             EnvelopeState.Release -> {
@@ -224,8 +275,17 @@ class EnvelopeProcessor {
         releaseMs: Float,
         attackCurve: Float,
         decayCurve: Float,
-        releaseCurve: Float
+        releaseCurve: Float,
+        spectralCentroid: Float = 1000f
     ): Float {
+        // Frequency-dependent envelope shaping: bass = deep sustained
+        // pressure, treble = sharp surface tingling. Spectral centroid
+        // tells us whether the current sound is bass-heavy or bright.
+        val centroidNorm = ((spectralCentroid - 100f) / 4000f).coerceIn(0f, 1f)
+        // Bass: hold longer (continuous pressure). Treble: release faster (tap).
+        val adjSustainLevel = sustainLevel * (1f - 0.25f * centroidNorm)
+        val adjReleaseMs = releaseMs * (1f + 0.4f * (1f - centroidNorm))
+
         // Calculate dynamic component
         val dynamicComponent = run {
             val knee = thresholdKnee.coerceIn(0f, 0.45f)
@@ -260,10 +320,10 @@ class EnvelopeProcessor {
             } else {
                 1f
             }
-            trigger(mag.coerceAtLeast(0.03f), currentTimeMs, velocity)
+            trigger(mag.coerceAtLeast(0.03f), currentTimeMs, velocity, attackMs)
         } else if (gateOpen && state == EnvelopeState.Idle) {
             // Gate open but envelope idle -- retrigger
-            trigger(mag.coerceAtLeast(0.03f), currentTimeMs, 1f)
+            trigger(mag.coerceAtLeast(0.03f), currentTimeMs, 1f, attackMs)
         } else if (gateJustClosed) {
             release(currentTimeMs)
         }
@@ -277,13 +337,13 @@ class EnvelopeProcessor {
 
         lastGateOpen = gateOpen
 
-        // Process the envelope state machine
+        // Process the envelope state machine (using frequency-adjusted params)
         return process(
             currentTimeMs,
             attackMs,
             decayMs,
-            sustainLevel,
-            releaseMs,
+            adjSustainLevel,
+            adjReleaseMs,
             attackCurve,
             decayCurve,
             releaseCurve
@@ -294,6 +354,9 @@ class EnvelopeProcessor {
         state = EnvelopeState.Idle
         value = 0f
         magnitude = 0f
+        attackTarget = 1f
+        microPauseFrames = 0
+        nextMicroPauseMs = 0f
     }
 }
 

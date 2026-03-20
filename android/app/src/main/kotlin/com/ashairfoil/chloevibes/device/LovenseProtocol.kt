@@ -28,7 +28,8 @@ object LovenseProtocol {
     }
 
     /**
-     * Set vibration for devices with two motors (e.g., Nora).
+     * Set vibration for devices with two motors (e.g., Domi 2, Nora).
+     * Uses per-motor commands for independent control.
      * @param level1 motor 1 intensity (0-20)
      * @param level2 motor 2 intensity (0-20)
      */
@@ -36,6 +37,17 @@ object LovenseProtocol {
         val c1 = level1.coerceIn(0, 20)
         val c2 = level2.coerceIn(0, 20)
         return "Vibrate1:$c1;Vibrate2:$c2;"
+    }
+
+    /**
+     * Set vibration for dual-motor devices where both motors should
+     * run at the same level. Uses the single Vibrate command which
+     * drives all motors uniformly.
+     * @param level 0-20
+     */
+    fun vibrateAll(level: Int): String {
+        val clamped = level.coerceIn(0, 20)
+        return "Vibrate:$clamped;"
     }
 
     /**

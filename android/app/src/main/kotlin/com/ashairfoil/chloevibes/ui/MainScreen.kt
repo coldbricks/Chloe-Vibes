@@ -126,6 +126,14 @@ class MainScreenState {
         releaseCurve = preset.releaseCurve
         minVibe = preset.minVibe
         maxVibe = preset.maxVibe
+        climaxEnabled = preset.climaxEnabled
+        climaxIntensity = preset.climaxIntensity
+        climaxBuildUpMs = preset.climaxBuildUpMs
+        climaxTeaseRatio = preset.climaxTeaseRatio
+        climaxTeaseDrop = preset.climaxTeaseDrop
+        climaxSurgeBoost = preset.climaxSurgeBoost
+        climaxPulseDepth = preset.climaxPulseDepth
+        climaxPattern = preset.climaxPattern
     }
 }
 

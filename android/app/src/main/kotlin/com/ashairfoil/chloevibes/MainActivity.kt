@@ -67,6 +67,14 @@ class MainActivity : ComponentActivity() {
         audioCaptureManager.onOutputUpdate = { output ->
             bleDeviceManager.setIntensity(output)
         }
+        // Dual-motor output for devices like Domi 2
+        audioCaptureManager.onDualOutputUpdate = { motor1, motor2 ->
+            if (bleDeviceManager.isDualMotor) {
+                bleDeviceManager.setDualIntensity(motor1, motor2)
+            } else {
+                bleDeviceManager.setIntensity(motor1)
+            }
+        }
 
         // Wire BLE callbacks
         bleDeviceManager.onDeviceDiscovered = { device ->
