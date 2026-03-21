@@ -1320,7 +1320,7 @@ impl eframe::App for GuiApp {
             // AUDIO PROCESSING PIPELINE
             // ============================================================
             let delta_time = ctx.input(|x| x.stable_dt);
-            let main_mul = self.settings.main_volume.powi(2);
+            let main_mul = self.settings.main_volume;
             let current_time_ms = {
                 static START: std::sync::OnceLock<Instant> =
                     std::sync::OnceLock::new();

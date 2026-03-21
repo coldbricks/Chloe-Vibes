@@ -1,23 +1,16 @@
 // ==========================================================================
 // ClimaxEngine.kt -- Time-domain escalation with tease/surge cycle
-// Ported from audio.rs ClimaxEngine
+// Synced with audio.rs ClimaxEngine
 //
 // Adds a slow time-based "build -> tease -> surge" layer on top of the
 // audio-reactive envelope output. Features:
-//   - Slowly raising effective intensity over a cycle
-//   - Controlled dip near the end (tease)
-//   - Surge back up with faster micro-pulses
-//   - 5-oscillator detuned micro-pulse (prevents single-freq adaptation)
-//   - Edge-and-deny: forces intensity dips after sustained high output
-//     to prevent plateau adaptation
-//   - Arousal momentum: tracks cumulative stimulation history for
-//     escalating sensitivity across cycles
-//   - Sub-harmonic resonance: injects low-frequency flutter that
-//     couples with the device's mechanical resonance
-//   - Chaos layer: Lorenz-inspired aperiodic modulation prevents
-//     the nervous system from predicting and filtering patterns
-//   - Dual-motor phasing: generates offset signals for devices with
-//     two independent motors, creating spatial movement
+//   - Asymmetric tease: fast cliff → hold → slow sensual rebuild
+//   - Accelerating surge curve (slow build → explosive finish)
+//   - Progression-scaled chaos, sub-harmonics, and onset response
+//   - Breathing-rate modulation (couples to arousal breathing ~0.18Hz)
+//   - Escalating edge-and-deny across cycles
+//   - Arousal momentum: aggressive escalation compensates desensitization
+//   - Dual-motor phasing: spatial movement between independent motors
 // ==========================================================================
 
 package com.ashairfoil.chloevibes.audio
@@ -56,6 +49,9 @@ class ClimaxEngine {
     // Sub-harmonic resonance phase
     private var subHarmonicPhase: Float = 0f
 
+    // Breathing-rate modulation: couples to involuntary arousal breathing
+    private var breathingPhase: Float = 0f
+
     // Dual motor phasing
     /** Secondary motor output (0.0 - 1.0) for dual-motor devices. */
     var motor2Output: Float = 0f
@@ -81,6 +77,7 @@ class ClimaxEngine {
         chaosY = 0.0f
         chaosZ = 0.0f
         subHarmonicPhase = 0f
+        breathingPhase = 0f
         motor2Output = 0f
         motor2Phase = 0f
     }
@@ -93,25 +90,6 @@ class ClimaxEngine {
         return (raw - floor(raw)).coerceAtLeast(0f)
     }
 
-    /**
-     * Process one frame.
-     *
-     * @param input dry envelope output (0.0 - 1.0)
-     * @param energy current audio energy
-     * @param gateOpen whether the noise gate is open
-     * @param isOnset whether a beat onset was detected
-     * @param onsetStrength strength of the detected onset
-     * @param currentTimeMs current time in milliseconds
-     * @param enabled whether the climax engine is active
-     * @param intensity overall strength of climax modulation
-     * @param buildUpMs duration of one full build cycle in ms
-     * @param teaseRatio fraction of cycle used for tease behavior
-     * @param teaseDrop depth of the tease dip
-     * @param surgeBoost end-of-cycle surge boost amount
-     * @param pulseDepth depth of fast micro-pulse modulation
-     * @param pattern modulation pattern shape
-     * @return modulated output (0.0 - 1.0)
-     */
     fun process(
         input: Float,
         energy: Float,
@@ -142,24 +120,24 @@ class ClimaxEngine {
         val dt = ((currentTimeMs - lastTimeMs) * 0.001f).coerceIn(0f, 0.2f)
         lastTimeMs = currentTimeMs
 
-        // Wrap cycle and track momentum
+        // Wrap cycle and track arousal momentum across completed cycles.
+        // Momentum grows faster than it decays -- sessions escalate over time,
+        // compensating for neural desensitization from prolonged stimulation.
         if (currentTimeMs - cycleAnchorMs >= cycleLen) {
             val cycles = floor((currentTimeMs - cycleAnchorMs) / cycleLen).coerceAtLeast(1f)
             cycleAnchorMs += cycles * cycleLen
             cycleCount++
-            // Each completed cycle increases arousal momentum --
-            // sensitization builds faster than it decays
-            arousalMomentum = (arousalMomentum + 0.08f).coerceAtMost(0.50f)
+            arousalMomentum = (arousalMomentum + 0.12f).coerceAtMost(0.75f)
         }
-        // Slow momentum decay between peaks of activity
+        // Slow momentum decay during silence
         if (!gateOpen) {
-            arousalMomentum = (arousalMomentum - dt * 0.01f).coerceAtLeast(0f)
+            arousalMomentum = (arousalMomentum - dt * 0.008f).coerceAtLeast(0f)
         }
 
         val progress = ((currentTimeMs - cycleAnchorMs) / cycleLen).coerceIn(0f, 1f)
         val intensityClamped = intensity.coerceIn(0f, 1f)
+        val cycleMaturity = (cycleCount / 6f).coerceAtMost(1f) // 0→1 over first 6 cycles
 
-        // Ramp shape based on pattern
         val ramp = when (pattern) {
             ClimaxPattern.Wave -> smoothStep(progress)
             ClimaxPattern.Stairs -> {
@@ -169,41 +147,60 @@ class ClimaxEngine {
             ClimaxPattern.Surge -> progress.toDouble().pow(0.6).toFloat()
         }
 
-        // Tease factor: controlled dip near end of cycle
+        // ---- Tease factor: asymmetric dip near end of cycle ----
+        // Fast cliff down → hold at floor → slow sensual rebuild.
+        // Tease depth escalates across cycles -- first tease is gentle,
+        // later ones are devastating.
         val teaseStart = 1f - teaseRatio.coerceIn(0.05f, 0.5f)
         val teaseFactor = if (progress >= teaseStart) {
             val t = ((progress - teaseStart) / (1f - teaseStart)).coerceIn(0f, 1f)
-            val envelope = 1f - abs(2f * t - 1f)
-            1f - teaseDrop.coerceIn(0f, 0.9f) * envelope
+            val escalatingDrop = teaseDrop.coerceIn(0f, 0.9f) * (0.6f + 0.4f * cycleMaturity)
+            val envelope = when {
+                t < 0.10f -> {
+                    // Sharp cliff down (first 10% of tease window)
+                    smoothStep(t / 0.10f)
+                }
+                t < 0.55f -> {
+                    // Hold at floor -- nerve endings reset, anticipation builds
+                    1f
+                }
+                else -> {
+                    // Slow curved rebuild (last 45%) -- agonizingly gradual
+                    val rebuildT = (t - 0.55f) / 0.45f
+                    val ss = smoothStep(rebuildT)
+                    1f - ss * ss
+                }
+            }
+            1f - escalatingDrop * envelope
         } else {
             1f
         }
 
-        // Surge factor: aggressive boost in final 20% of cycle (was 16%)
-        // Wider surge window + steeper curve = more dramatic finish
+        // ---- Surge factor: accelerating curve (slow build → explosive finish) ----
+        // smooth_step² starts almost flat, then rockets upward in the final moments.
         val surgeStart = 0.80f
         val surgeFactor = if (progress >= surgeStart) {
             val t = ((progress - surgeStart) / (1f - surgeStart)).coerceIn(0f, 1f)
-            // Very steep power curve (0.2) -- exponential slam at the end
-            val surgeAmount = surgeBoost.coerceIn(0f, 1.5f)
-            1f + surgeAmount * t.toDouble().pow(0.2).toFloat()
+            val ss = smoothStep(t)
+            1f + surgeBoost.coerceIn(0f, 1.5f) * ss * ss
         } else {
             1f
         }
 
-        // Onset boost: accumulates from beat detections -- higher cap, faster build
+        // ---- Onset boost: scales with cycle progression ----
+        // A drum hit during surge should feel like being pushed over the edge.
         if (isOnset && gateOpen) {
-            onsetBoost = (onsetBoost + 0.14f * onsetStrength.coerceIn(0f, 2.5f)).coerceAtMost(0.50f)
+            val onsetScale = 0.14f + 0.22f * ramp // 0.14 → 0.36 across cycle
+            onsetBoost = (onsetBoost + onsetScale * onsetStrength.coerceIn(0f, 2.5f)).coerceAtMost(0.60f)
         }
         onsetBoost = (onsetBoost - dt * 0.7f).coerceAtLeast(0f)
 
         // ---- 5-oscillator detuned micro-pulse ----
-        // More oscillators = richer harmonic content, harder to adapt to
         val pd = pulseDepth.coerceIn(0f, 0.55f)
         val maxPulseHz = if (progress >= surgeStart) 10f else 7f
         val pulseRateHz = (2f + intensityClamped * 3f + energy * 2f + ramp * 1f).coerceAtMost(maxPulseHz)
         val detune1 = 0.07f
-        val detune2 = 0.13f  // wider spread for outer oscillators
+        val detune2 = 0.13f
         val tau = 2f * PI.toFloat()
         microPhase  = wrapPhase(microPhase  + dt * pulseRateHz * tau)
         microPhase2 = wrapPhase(microPhase2 + dt * pulseRateHz * (1f + detune1) * tau)
@@ -217,71 +214,72 @@ class ClimaxEngine {
                 0.10f * sin(microPhase5)
         val pulse = 1f - pd + pd * (0.5f + 0.5f * pulseRaw)
 
-        // ---- Sub-harmonic resonance ----
-        // Low-frequency flutter (1.5-4 Hz) that couples with the device motor's
-        // mechanical resonance. Most vibrator motors have a resonant frequency
-        // around 150-200Hz; modulating amplitude at sub-harmonic rates creates
-        // a "throbbing" sensation that penetrates deeper tissue.
+        // ---- Sub-harmonic resonance: scales with progression ----
+        // Base 8% depth, building to 24% during surge.
         val subFreqHz = 1.5f + ramp * 2.5f + energy * 0.5f
         subHarmonicPhase = wrapPhase(subHarmonicPhase + dt * subFreqHz * tau)
-        val subResonance = 1f + 0.12f * intensityClamped * sin(subHarmonicPhase)
+        val subDepth = 0.08f + 0.16f * ramp // 8% → 24%
+        val subResonance = 1f + subDepth * intensityClamped * sin(subHarmonicPhase)
 
-        // ---- Chaos layer (simplified Lorenz attractor) ----
-        // Aperiodic modulation prevents the nervous system from predicting
-        // the pattern and filtering it out. The Lorenz system generates
-        // deterministic but non-repeating waveforms.
+        // ---- Chaos layer (Lorenz attractor): scales with progression ----
+        // Barely noticeable at cycle start (6%), unmistakable at surge (18%).
         val sigma = 10f; val rho = 28f; val beta = 8f / 3f
-        val chaosStep = dt * 0.8f  // slow the chaos for musical timing
-        val dx = sigma * (chaosY - chaosX) * chaosStep
-        val dy = (chaosX * (rho - chaosZ) - chaosY) * chaosStep
-        val dz = (chaosX * chaosY - beta * chaosZ) * chaosStep
-        chaosX = (chaosX + dx).coerceIn(-30f, 30f)
-        chaosY = (chaosY + dy).coerceIn(-30f, 30f)
-        chaosZ = (chaosZ + dz).coerceIn(0f, 50f)
-        // Normalize chaos to a subtle modulation factor
-        val chaosMod = 1f + 0.06f * intensityClamped * (chaosX / 30f)
+        val chaosStep = dt * 0.8f
+        val cdx = sigma * (chaosY - chaosX) * chaosStep
+        val cdy = (chaosX * (rho - chaosZ) - chaosY) * chaosStep
+        val cdz = (chaosX * chaosY - beta * chaosZ) * chaosStep
+        chaosX = (chaosX + cdx).coerceIn(-30f, 30f)
+        chaosY = (chaosY + cdy).coerceIn(-30f, 30f)
+        chaosZ = (chaosZ + cdz).coerceIn(0f, 50f)
+        val chaosDepth = 0.06f + 0.12f * ramp // 6% → 18%
+        val chaosMod = 1f + chaosDepth * intensityClamped * (chaosX / 30f)
 
-        // Arousal gain: build UP from the audio-reactive base
-        // Momentum from previous cycles increases the ceiling
-        // At ramp=0: gain = 1.0 (passthrough)
-        // At ramp=1: gain = up to 2.4 with max momentum (was 1.85)
-        val momentumBonus = arousalMomentum * 0.5f
-        val arousalGain = (1f + (1.0f + momentumBonus) * ramp) * (1f + intensityClamped * 0.35f)
+        // ---- Breathing-rate modulation ----
+        // Human arousal breathing settles at ~0.15-0.25 Hz. This very slow
+        // sine couples with the user's involuntary breathing pattern,
+        // amplifying the physiological feedback loop between body and device.
+        val breathingHz = 0.18f
+        breathingPhase = wrapPhase(breathingPhase + dt * breathingHz * tau)
+        val breathingDepth = 0.06f + 0.10f * ramp // 6% → 16%
+        val breathingMod = 1f + breathingDepth * sin(breathingPhase)
+
+        // ---- Arousal gain: aggressive escalation ----
+        // At ramp=0: gain = 1.0 (passthrough).
+        // At ramp=1 with max momentum: up to 3.8x -- overwhelming crescendo.
+        val momentumBonus = arousalMomentum * 0.7f
+        val arousalGain = (1f + (1.2f + momentumBonus) * ramp) * (1f + intensityClamped * 0.40f)
         val gatedBoost = if (gateOpen) onsetBoost else 0f
 
-        val rawOutput = (dry * arousalGain * teaseFactor * surgeFactor * pulse * subResonance * chaosMod + gatedBoost)
-            .coerceIn(0f, 1f)
+        val rawOutput = (dry * arousalGain * teaseFactor * surgeFactor
+                * pulse * subResonance * chaosMod * breathingMod
+                + gatedBoost).coerceIn(0f, 1f)
 
-        // ---- Dual motor spatial contrast ----
-        // At high intensity: strong anti-phase creates a "traveling wave"
-        // sensation as vibration moves physically between motors.
-        // At low intensity: motors stay closer to unison for raw power.
-        // Phase rate scales with progression: slow build, fast surge.
-        val phaseOffsetHz = 0.3f + ramp * 1.7f  // 0.3-2.0 Hz
+        // ---- Dual-motor spatial contrast ----
+        val phaseOffsetHz = 0.3f + ramp * 1.7f
         motor2Phase = wrapPhase(motor2Phase + dt * phaseOffsetHz * tau)
-        val phaseMod = 0.5f + 0.5f * sin(motor2Phase) // 0 to 1
-        // Anti-phase depth scales with output level — more contrast when loud
+        val phaseMod = 0.5f + 0.5f * sin(motor2Phase)
         val antiPhaseDepth = rawOutput.coerceIn(0f, 1f) * 0.85f
-        // Blend between unison (both at rawOutput) and dramatic alternation
         val motor2Factor = lerp(1f, 0.15f + 0.85f * phaseMod, antiPhaseDepth)
         motor2Output = (rawOutput * motor2Factor).coerceIn(0f, 1f)
 
-        // Edge-and-deny: when output has been >0.75 for long enough, force
-        // a sharp dip then surge back HARDER. Psychophysiology: optimal
-        // denial window is 4-8s of high stimulation (after anticipation
-        // peaks but before adaptation sets in). Short deny (0.8-2s) —
-        // long enough for contrast, short enough to preserve momentum.
+        // ---- Edge-and-deny: escalating across cycles ----
+        // First deny is gentle and brief. Later denies are deeper and longer,
+        // building frustration and making each return more devastating.
         if (rawOutput > 0.75f) {
             highOutputMs += dt * 1000f
         } else {
             highOutputMs = (highOutputMs - dt * 400f).coerceAtLeast(0f)
         }
 
-        if (!denyActive && highOutputMs > 5000f) {
+        // Deny trigger: 6s initially, dropping to 3s as cycles mature
+        val denyTriggerMs = 6000f - 3000f * cycleMaturity
+        if (!denyActive && highOutputMs > denyTriggerMs) {
             denyActive = true
             denyStartMs = currentTimeMs
-            // Shorter deny window: 800-2000ms (was 1500-3500ms)
-            denyDurationMs = 800f + 1200f * (0.5f + 0.5f * sin(currentTimeMs * 0.00137f))
+            // Duration escalates: 600ms initially → up to 3000ms in later cycles
+            val baseDuration = 600f + 1800f * cycleMaturity
+            val jitter = 0.5f + 0.5f * sin(currentTimeMs * 0.00137f)
+            denyDurationMs = baseDuration + 400f * jitter
             highOutputMs = 0f
         }
 
@@ -289,29 +287,27 @@ class ClimaxEngine {
             val denyElapsed = currentTimeMs - denyStartMs
             if (denyElapsed >= denyDurationMs) {
                 denyActive = false
-                // Post-deny surge: overshoot to 120% of pre-deny level briefly.
-                // The cliff-to-peak contrast creates the "gasp" moment.
-                onsetBoost = (onsetBoost + 0.35f).coerceAtMost(0.55f)
+                // Post-deny surge: overshoot harder after deeper denies.
+                val postDenyBoost = 0.30f + 0.25f * cycleMaturity
+                onsetBoost = (onsetBoost + postDenyBoost).coerceAtMost(0.65f)
             } else {
                 val denyT = denyElapsed / denyDurationMs
-                // Asymmetric deny envelope: sharp cliff down, hold at floor,
-                // rapid ramp back. NOT a gradual V — the body wants a sudden
-                // drop followed by a delayed return.
-                val denyDepth = 0.85f
+                // Deny depth escalates: 60% initially → 90% at maturity
+                val denyDepthVal = 0.60f + 0.30f * cycleMaturity
+                // Asymmetric envelope: cliff → hold → slow sensual return.
                 val denyEnvelope = when {
-                    denyT < 0.12f -> {
-                        // Sharp exponential drop (50-100ms to floor)
-                        val dropProgress = denyT / 0.12f
-                        denyDepth * smoothStep(dropProgress)
+                    denyT < 0.10f -> {
+                        // Sharp cliff (50-100ms to floor)
+                        denyDepthVal * smoothStep(denyT / 0.10f)
                     }
-                    denyT < 0.82f -> {
-                        // Hold at floor — nerve endings reset
-                        denyDepth
+                    denyT < 0.75f -> {
+                        // Hold at floor -- nerve endings reset, ache builds
+                        denyDepthVal
                     }
                     else -> {
-                        // Rapid return (ramp back in ~18% of deny time)
-                        val returnProgress = (denyT - 0.82f) / 0.18f
-                        denyDepth * (1f - smoothStep(returnProgress))
+                        // Slow curved return (last 25%) -- deliberately agonizing
+                        val returnT = (denyT - 0.75f) / 0.25f
+                        denyDepthVal * (1f - smoothStep(returnT))
                     }
                 }
                 val denied = (rawOutput * (1f - denyEnvelope)).coerceIn(0f, 1f)

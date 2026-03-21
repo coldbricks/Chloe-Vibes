@@ -183,20 +183,20 @@ class EnvelopeProcessor {
             }
 
             EnvelopeState.Sustain -> {
-                // Stochastic micro-pauses: brief drops (1-3 frames, 16-48ms)
-                // that reset nerve endings without being consciously perceived
-                // as "stopping." Intermittent stimulation maintains sensitivity
-                // far longer than continuous vibration.
+                // Stochastic micro-pauses: drops to true zero for 3-6 frames
+                // (48-96ms). Long enough for the motor to actually stop,
+                // creating a real nerve reset. True zero ensures the motor
+                // fully decelerates — partial intensity keeps nerves adapted.
                 if (microPauseFrames > 0) {
                     microPauseFrames--
-                    value = sustainLevel * 0.05f
+                    value = 0f // True zero — motor must stop
                 } else if (nextMicroPauseMs > 0f && currentTimeMs >= nextMicroPauseMs) {
-                    // 1-3 frames at 60Hz = 16-48ms
-                    microPauseFrames = 1 + ((currentTimeMs * 7.13f).toInt() and 0x3).coerceAtMost(2)
+                    // 3-6 frames at 60Hz = 48-96ms (motor needs ~20ms to stop)
+                    microPauseFrames = 3 + ((currentTimeMs * 7.13f).toInt() and 0x3)
                     // Next pause in 2-8 seconds (deterministic pseudo-random)
                     val pseudoRand = ((currentTimeMs * 13.37f).toInt() and 0xFFFF).toFloat() / 65535f
                     nextMicroPauseMs = currentTimeMs + 2000f + pseudoRand * 6000f
-                    value = sustainLevel * 0.05f
+                    value = 0f
                 } else {
                     // Initialize micro-pause timer on first sustain frame
                     if (nextMicroPauseMs <= 0f) {
