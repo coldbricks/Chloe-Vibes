@@ -1359,6 +1359,9 @@ impl eframe::App for GuiApp {
 
                 // 3. Apply main volume and smooth for musical consistency
                 let energy = sanitize_unit(normalized_input * main_mul);
+                // Raw energy (pre-volume) for the gate so the threshold
+                // slider maps cleanly regardless of volume setting.
+                let raw_energy_for_gate = sanitize_unit(normalized_input);
                 let rise_alpha = smoothing_alpha(delta_time, self.settings.input_rise_ms);
                 let fall_alpha = smoothing_alpha(delta_time, self.settings.input_fall_ms);
                 if energy >= self.smoothed_energy {
@@ -1372,8 +1375,30 @@ impl eframe::App for GuiApp {
                 self.using_rms_fallback = using_rms_fallback;
 
                 // 4. Beat detection (for onset retrigger)
-                let (is_onset, onset_strength) =
+                let (detected_onset, onset_strength) =
                     self.beat_detector.process(spectral.spectral_flux, current_time_ms);
+
+                // Predictive onset: when tempo is locked, pre-trigger ~2 device
+                // write intervals early so the attack command arrives on-beat
+                // instead of late. False positives feel like syncopation;
+                // late delivery feels like lag.
+                let is_onset = if !detected_onset
+                    && self.beat_detector.tempo_confidence > 0.6
+                {
+                    let predicted = self.beat_detector.predicted_next_onset_ms;
+                    if predicted > 0.0 {
+                        let lead_time_ms = 76.0; // ~2 BLE/device write intervals
+                        let time_to_predicted = predicted - current_time_ms;
+                        time_to_predicted >= 0.0
+                            && time_to_predicted <= lead_time_ms
+                            && self.gate_is_open
+                    } else {
+                        false
+                    }
+                } else {
+                    detected_onset
+                };
+
                 let onset_ok = is_onset
                     && onset_strength > 1.02
                     && energy > self.settings.gate_threshold * 0.40;
@@ -1384,9 +1409,10 @@ impl eframe::App for GuiApp {
                     self.beat_sync_mode,
                 );
 
-                // 5. Gate
+                // 5. Gate (uses raw pre-volume energy so threshold is
+                // volume-independent, matching Android behavior)
                 self.gate_is_open = self.gate.process(
-                    stable_energy,
+                    raw_energy_for_gate,
                     self.settings.gate_threshold,
                     self.settings.auto_gate_amount,
                     self.settings.gate_smoothing,
@@ -1452,10 +1478,11 @@ impl eframe::App for GuiApp {
                     0.0
                 };
 
-                // 8. Apply output range (min_vibe / max_vibe)
-                let final_intensity = self.settings.min_vibe
+                // 8. Apply output range (min_vibe / max_vibe) + output gain
+                let mapped = self.settings.min_vibe
                     + shaped_output
                         * (self.settings.max_vibe - self.settings.min_vibe);
+                let final_intensity = (mapped * self.settings.output_gain).clamp(0.0, 1.0);
 
                 // 9. Safety: force to zero if energy is negligible.
                 // Only reset the envelope, NEVER the climax engine — a brief
@@ -1576,9 +1603,10 @@ impl eframe::App for GuiApp {
             } else {
                 self.vibration_level
             };
-            let motor2_final = self.settings.min_vibe
+            let motor2_mapped = self.settings.min_vibe
                 + motor2_raw * (self.settings.max_vibe - self.settings.min_vibe);
-            self.processed_output_2.store(motor2_final.clamp(0.0, 1.0));
+            let motor2_final = (motor2_mapped * self.settings.output_gain).clamp(0.0, 1.0);
+            self.processed_output_2.store(motor2_final);
 
             // Push to visualization history
             self.output_history.push_back(self.vibration_level);
@@ -2843,6 +2871,22 @@ impl eframe::App for GuiApp {
                     }
                     if slider.double_clicked() {
                         self.settings.max_vibe = defaults::MAX_VIBE;
+                    }
+
+                    let slider = ui.add(
+                        Slider::new(&mut self.settings.output_gain, 0.0..=2.0)
+                            .fixed_decimals(2)
+                            .text("Output Gain"),
+                    );
+                    let slider = slider.on_hover_text(
+                        "Final-stage multiplier applied after range mapping.\n\
+                         1.0 = unity. Turn up for more headroom, down for safety.",
+                    );
+                    if slider.changed() {
+                        mark_custom(&mut self.settings);
+                    }
+                    if slider.double_clicked() {
+                        self.settings.output_gain = defaults::OUTPUT_GAIN;
                     }
                 });
             } else {

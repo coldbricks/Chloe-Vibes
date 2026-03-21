@@ -142,6 +142,11 @@ pub struct Settings {
     pub hold_delay_ms: f32,
     pub decay_rate_per_sec: f32,
 
+    // -- Output Gain --
+    /// Final-stage output multiplier (0.0 - 2.0). Applied after min/max
+    /// range mapping, before device send.
+    pub output_gain: f32,
+
     // -- Use new processing pipeline --
     /// When true, uses the new spectral analysis + ADSR pipeline.
     /// When false, falls back to the original simple processing.
@@ -248,6 +253,9 @@ pub mod defaults {
     pub const CLIMAX_PULSE_DEPTH: f32 = 0.18;
     pub const CLIMAX_PATTERN: ClimaxPattern = ClimaxPattern::Wave;
 
+    // Output gain
+    pub const OUTPUT_GAIN: f32 = 1.0;
+
     // Legacy persistence
     pub const ENABLE_PERSISTENCE: bool = false;
     pub const HOLD_DELAY_MS: f32 = 0.0;
@@ -304,6 +312,7 @@ mod names {
     pub const CLIMAX_SURGE_BOOST: &str = "climax_surge_boost";
     pub const CLIMAX_PULSE_DEPTH: &str = "climax_pulse_depth";
     pub const CLIMAX_PATTERN: &str = "climax_pattern";
+    pub const OUTPUT_GAIN: &str = "output_gain";
     pub const ENABLE_PERSISTENCE: &str = "enable_persistence";
     pub const HOLD_DELAY_MS: &str = "hold_delay_ms";
     pub const DECAY_RATE_PER_SEC: &str = "decay_rate_per_sec";
@@ -363,6 +372,8 @@ impl Default for Settings {
             climax_surge_boost: defaults::CLIMAX_SURGE_BOOST,
             climax_pulse_depth: defaults::CLIMAX_PULSE_DEPTH,
             climax_pattern: defaults::CLIMAX_PATTERN,
+
+            output_gain: defaults::OUTPUT_GAIN,
 
             enable_persistence: defaults::ENABLE_PERSISTENCE,
             hold_delay_ms: defaults::HOLD_DELAY_MS,
@@ -453,6 +464,9 @@ impl Settings {
         let climax_pattern =
             get_value(storage, names::CLIMAX_PATTERN).unwrap_or(defaults::CLIMAX_PATTERN);
 
+        let output_gain =
+            get_value(storage, names::OUTPUT_GAIN).unwrap_or(defaults::OUTPUT_GAIN);
+
         let enable_persistence =
             get_value(storage, names::ENABLE_PERSISTENCE).unwrap_or(defaults::ENABLE_PERSISTENCE);
         let hold_delay_ms =
@@ -507,6 +521,7 @@ impl Settings {
             climax_surge_boost,
             climax_pulse_depth,
             climax_pattern,
+            output_gain,
             enable_persistence,
             hold_delay_ms,
             decay_rate_per_sec,
@@ -580,6 +595,7 @@ impl Settings {
         set_value(storage, names::CLIMAX_SURGE_BOOST, &self.climax_surge_boost);
         set_value(storage, names::CLIMAX_PULSE_DEPTH, &self.climax_pulse_depth);
         set_value(storage, names::CLIMAX_PATTERN, &self.climax_pattern);
+        set_value(storage, names::OUTPUT_GAIN, &self.output_gain);
         set_value(storage, names::ENABLE_PERSISTENCE, &self.enable_persistence);
         set_value(storage, names::HOLD_DELAY_MS, &self.hold_delay_ms);
         set_value(storage, names::DECAY_RATE_PER_SEC, &self.decay_rate_per_sec);

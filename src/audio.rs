@@ -522,12 +522,17 @@ impl Gate {
             energy > close_threshold
         };
 
-        // Smoothing: 0 = instant, 1 = very gradual.
-        // Use exponential moving average where higher smoothing = slower response.
+        // Asymmetric smoothing: instant open, smooth close.
+        // Opening speed is critical for transient response — every ms
+        // of gate delay eats the attack phase. Closing smoothness
+        // prevents chatter without impacting onset timing.
         let gate_signal = if is_above { 1.0 } else { 0.0 };
         if smoothing > 0.0 {
-            // alpha near 1 = instant (low smoothing), alpha near 0 = sluggish (high smoothing)
-            let alpha = 1.0 - smoothing.clamp(0.0, 0.98);
+            let alpha = if gate_signal > self.smoothed {
+                1.0 // Instant open — don't filter the rising edge
+            } else {
+                1.0 - smoothing.clamp(0.0, 0.98) // Smooth close
+            };
             self.smoothed = self.smoothed * (1.0 - alpha) + gate_signal * alpha;
         } else {
             self.smoothed = gate_signal;
@@ -574,7 +579,7 @@ pub struct EnvelopeProcessor {
     start_time_ms: f32,
     /// Was the gate open last frame?
     last_gate_open: bool,
-    /// Minimum time between retriggers (ms)
+    /// Minimum time between retriggers (ms). 20ms matches motor spin-up.
     min_retrigger_ms: f32,
     /// Time of last trigger (ms)
     last_trigger_time_ms: f32,
@@ -594,7 +599,7 @@ impl EnvelopeProcessor {
             attack_target: 1.0,
             start_time_ms: 0.0,
             last_gate_open: false,
-            min_retrigger_ms: 35.0,
+            min_retrigger_ms: 20.0,
             last_trigger_time_ms: 0.0,
             next_micro_pause_ms: 0.0,
             micro_pause_frames: 0,
@@ -911,9 +916,9 @@ impl EnvelopeProcessor {
 // BeatDetector — Onset detection via spectral flux
 // ---------------------------------------------------------------------------
 
-/// Simple onset/beat detector using adaptive thresholding on spectral flux.
-/// Not as sophisticated as ChloeVibes' tempo estimation, but catches
-/// transients reliably for retrigger purposes.
+/// Onset/beat detector using adaptive thresholding on spectral flux,
+/// with tempo tracking and predictive onset for latency compensation.
+/// Ported from Android BeatDetector.kt.
 pub struct BeatDetector {
     /// Rolling history of spectral flux values
     flux_history: Vec<f32>,
@@ -924,6 +929,18 @@ pub struct BeatDetector {
     last_onset_time_ms: f32,
     /// Minimum time between detected onsets (ms)
     cooldown_ms: f32,
+    /// Recent onset strength for velocity tracking
+    recent_onset_strength: f32,
+    // Tempo tracking for predictive onset
+    onset_timestamps: [f32; 16],
+    onset_ts_index: usize,
+    onset_ts_count: usize,
+    /// Estimated inter-onset interval in ms (0 = no estimate).
+    pub tempo_interval_ms: f32,
+    /// Confidence in tempo estimate (0.0 = none, 1.0 = locked).
+    pub tempo_confidence: f32,
+    /// Predicted time of next onset in ms (0 = no prediction).
+    pub predicted_next_onset_ms: f32,
 }
 
 impl BeatDetector {
@@ -934,6 +951,13 @@ impl BeatDetector {
             adaptive_threshold: 0.55,
             last_onset_time_ms: 0.0,
             cooldown_ms: 55.0, // 55ms ≈ 18 onsets/sec max (≈270 BPM 16th notes)
+            recent_onset_strength: 0.0,
+            onset_timestamps: [0.0; 16],
+            onset_ts_index: 0,
+            onset_ts_count: 0,
+            tempo_interval_ms: 0.0,
+            tempo_confidence: 0.0,
+            predicted_next_onset_ms: 0.0,
         }
     }
 
@@ -965,9 +989,31 @@ impl BeatDetector {
             self.last_onset_time_ms = current_time_ms;
             // Moderate growth after onset (prevents rapid double-triggering)
             self.adaptive_threshold = (self.adaptive_threshold * 1.06).min(1.8);
+
+            // Track onset velocity
+            let raw_strength = if threshold > 0.0 {
+                spectral_flux / threshold
+            } else {
+                0.0
+            };
+            self.recent_onset_strength =
+                self.recent_onset_strength * 0.3 + raw_strength * 0.7;
+
+            // Record timestamp for tempo tracking
+            self.onset_timestamps[self.onset_ts_index] = current_time_ms;
+            self.onset_ts_index = (self.onset_ts_index + 1) % self.onset_timestamps.len();
+            if self.onset_ts_count < self.onset_timestamps.len() {
+                self.onset_ts_count += 1;
+            }
+
+            // Update tempo prediction after accumulating enough onsets
+            if self.onset_ts_count >= 4 {
+                self.update_tempo_prediction(current_time_ms);
+            }
         } else {
             // Faster decay back to baseline — recover sensitivity between beats.
             self.adaptive_threshold = (self.adaptive_threshold * 0.985).max(0.12);
+            self.recent_onset_strength *= 0.98;
         }
 
         let strength = if threshold > 0.0 {
@@ -977,6 +1023,59 @@ impl BeatDetector {
         };
 
         (is_onset, strength)
+    }
+
+    fn update_tempo_prediction(&mut self, current_time_ms: f32) {
+        // Collect inter-onset intervals from recent timestamps
+        let mut intervals = [0.0f32; 15];
+        let mut count = 0usize;
+        for i in 1..self.onset_ts_count {
+            let len = self.onset_timestamps.len();
+            let curr =
+                self.onset_timestamps[(self.onset_ts_index + len - i) % len];
+            let prev =
+                self.onset_timestamps[(self.onset_ts_index + len - i - 1) % len];
+            let interval = curr - prev;
+            if (150.0..=2000.0).contains(&interval) {
+                // 30-400 BPM range
+                intervals[count] = interval;
+                count += 1;
+                if count >= intervals.len() {
+                    break;
+                }
+            }
+        }
+
+        if count < 3 {
+            self.tempo_confidence = 0.0;
+            self.predicted_next_onset_ms = 0.0;
+            return;
+        }
+
+        let mean: f32 = intervals[..count].iter().sum::<f32>() / count as f32;
+        let variance: f32 = intervals[..count]
+            .iter()
+            .map(|&v| (v - mean).powi(2))
+            .sum::<f32>()
+            / count as f32;
+        let std_dev = variance.sqrt();
+
+        // Confidence: low coefficient of variation = high confidence
+        let cv = if mean > 0.0 { std_dev / mean } else { 1.0 };
+        self.tempo_confidence = (1.0 - cv * 4.0).clamp(0.0, 1.0);
+        self.tempo_interval_ms = mean;
+
+        if self.tempo_confidence > 0.5 {
+            let len = self.onset_timestamps.len();
+            let last_onset =
+                self.onset_timestamps[(self.onset_ts_index + len - 1) % len];
+            let elapsed = current_time_ms - last_onset;
+            let intervals_elapsed = (elapsed / mean) as u32;
+            self.predicted_next_onset_ms =
+                last_onset + (intervals_elapsed + 1) as f32 * mean;
+        } else {
+            self.predicted_next_onset_ms = 0.0;
+        }
     }
 }
 
