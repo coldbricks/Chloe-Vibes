@@ -248,7 +248,8 @@ struct GuiApp {
     spectral_data: SharedSpectralData, // NEW: full spectral analysis
 
     // Processed output that devices read
-    processed_output: SharedF32, // NEW: final output after envelope/gate
+    processed_output: SharedF32,  // Final output after envelope/gate (primary motor)
+    processed_output_2: SharedF32, // Secondary motor output from ClimaxEngine
 
     _capture_thread: JoinHandle<()>,
     is_scanning: bool,
@@ -962,6 +963,7 @@ impl GuiApp {
         let spectral_data = SharedSpectralData::new();
         let spectral_data2 = spectral_data.clone();
         let processed_output = SharedF32::new(0.0);
+        let processed_output_2 = SharedF32::new(0.0);
         let capture_status = Arc::new(Mutex::new(String::from("audio: starting")));
         let capture_status2 = capture_status.clone();
 
@@ -1017,6 +1019,7 @@ impl GuiApp {
             sound_power,
             spectral_data,
             processed_output,
+            processed_output_2,
             _capture_thread,
             is_scanning: false,
             show_settings: false,
@@ -1413,6 +1416,7 @@ impl eframe::App for GuiApp {
                     self.settings.attack_curve,
                     self.settings.decay_curve,
                     self.settings.release_curve,
+                    spectral.spectral_centroid,
                 );
 
                 // 7. Optional climax modulation layer
@@ -1563,6 +1567,18 @@ impl eframe::App for GuiApp {
 
             // Store processed output for device tasks
             self.processed_output.store(self.vibration_level);
+
+            // Store secondary motor output (from ClimaxEngine dual-motor phasing).
+            // When climax is enabled: motor2 gets the phase-offset signal.
+            // When climax is disabled: motor2 tracks motor1.
+            let motor2_raw = if self.settings.climax_mode_enabled {
+                self.climax_engine.motor2_output
+            } else {
+                self.vibration_level
+            };
+            let motor2_final = self.settings.min_vibe
+                + motor2_raw * (self.settings.max_vibe - self.settings.min_vibe);
+            self.processed_output_2.store(motor2_final.clamp(0.0, 1.0));
 
             // Push to visualization history
             self.output_history.push_back(self.vibration_level);
@@ -2932,6 +2948,7 @@ impl eframe::App for GuiApp {
                             let bp_device = bp_device.clone();
                             let props = props.clone();
                             let processed = self.processed_output.clone();
+                            let processed2 = self.processed_output_2.clone();
                             async move {
                                 // Rate limiter state (from Gemini/ChloeVibes approach)
                                 let mut last_sent: f64 = -1.0;
@@ -2943,6 +2960,7 @@ impl eframe::App for GuiApp {
                                 loop {
                                     let now = tokio::time::Instant::now();
                                     let vibration_level = processed.load();
+                                    let vibration_level_2 = processed2.load();
                                     let mut should_send = false;
                                     let mut vibrate_cmd = None;
                                     let mut oscillate_cmd = None;
@@ -2956,7 +2974,7 @@ impl eframe::App for GuiApp {
 
                                         // === RATE LIMITER ===
                                         // Only send if:
-                                        //   a) intensity changed by more than 1%, OR
+                                        //   a) intensity changed by more than 0.5%, OR
                                         //   b) this is a hard stop (going to zero)
                                         let change = (speed_f64 - last_sent).abs();
                                         let is_hard_stop = speed_f64 < 0.005
@@ -2974,12 +2992,24 @@ impl eframe::App for GuiApp {
                                                         guard
                                                             .vibrators
                                                             .iter()
-                                                            .map(|v| {
+                                                            .enumerate()
+                                                            .map(|(idx, v)| {
                                                                 if v.is_enabled
                                                                     && guard
                                                                         .is_enabled
                                                                 {
-                                                                    (speed
+                                                                    // Motor 0 = primary signal.
+                                                                    // Motors 1+ = secondary motor
+                                                                    // signal from ClimaxEngine
+                                                                    // dual-motor phasing.
+                                                                    let src = if idx == 0 {
+                                                                        speed
+                                                                    } else {
+                                                                        guard.calculate_output(
+                                                                            vibration_level_2,
+                                                                        )
+                                                                    };
+                                                                    (src
                                                                         * v.multiplier)
                                                                         .clamp(
                                                                             0.0,

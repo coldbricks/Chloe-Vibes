@@ -180,7 +180,14 @@ impl Settings {
         self.release_curve = preset.release_curve;
         self.min_vibe = preset.min_vibe;
         self.max_vibe = preset.max_vibe;
-        self.climax_mode_enabled = defaults::CLIMAX_MODE_ENABLED;
+        self.climax_mode_enabled = preset.climax_enabled;
+        self.climax_intensity = preset.climax_intensity;
+        self.climax_build_up_ms = preset.climax_build_up_ms;
+        self.climax_tease_ratio = preset.climax_tease_ratio;
+        self.climax_tease_drop = preset.climax_tease_drop;
+        self.climax_surge_boost = preset.climax_surge_boost;
+        self.climax_pulse_depth = preset.climax_pulse_depth;
+        self.climax_pattern = preset.climax_pattern;
         self.current_preset_name = preset.name.to_string();
     }
 }

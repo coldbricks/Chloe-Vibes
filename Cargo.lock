@@ -879,6 +879,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "chloe-vibes"
+version = "0.4.0"
+dependencies = [
+ "audio-capture",
+ "buttplug",
+ "clap",
+ "eframe",
+ "flume",
+ "image 0.24.9",
+ "parking_lot",
+ "rustfft",
+ "serde",
+ "tokio",
+]
+
+[[package]]
 name = "chrono"
 version = "0.4.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2712,22 +2728,6 @@ name = "multimap"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
-
-[[package]]
-name = "music-vibes"
-version = "0.4.0"
-dependencies = [
- "audio-capture",
- "buttplug",
- "clap",
- "eframe",
- "flume",
- "image 0.24.9",
- "parking_lot",
- "rustfft",
- "serde",
- "tokio",
-]
 
 [[package]]
 name = "naga"
