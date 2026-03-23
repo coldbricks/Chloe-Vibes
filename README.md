@@ -19,7 +19,7 @@
 
 ---
 
-ChloeVibes captures system audio (or microphone input on Android), analyzes it in real time with FFT spectral processing, and drives Bluetooth haptic devices through every beat, note, and bass drop. It doesn't just follow volume — it understands the music.
+ChloeVibes captures system audio (on both Windows and Android), analyzes it in real time with FFT spectral processing, and drives Bluetooth haptic devices through every beat, note, and bass drop. It doesn't just follow volume — it understands the music.
 
 The signal chain is built like a synthesizer: spectral frequency analysis feeds a noise gate, trigger system, and full ADSR envelope processor. On top of that, the **Climax Engine** adds a slow-burn modulation layer with tease/deny psychology, chaos oscillators, sub-harmonic resonance, and dual-motor spatial phasing — all designed using psychophysiological principles to prevent neural adaptation and build intensity over time.
 
