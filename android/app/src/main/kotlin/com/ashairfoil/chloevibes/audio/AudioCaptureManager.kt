@@ -19,7 +19,9 @@ import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.media.audiofx.Visualizer
+import android.util.Log
 import androidx.core.content.ContextCompat
+import java.util.concurrent.atomic.AtomicReference
 
 // ---------------------------------------------------------------------------
 // Audio source mode
@@ -54,6 +56,47 @@ class ProcessingState {
     @Volatile var lastFinalOutput: Float = 0f
     @Volatile var lastEnvelopeState: EnvelopeState = EnvelopeState.Idle
 }
+
+// ---------------------------------------------------------------------------
+// ProcessingParams -- immutable snapshot of all signal processing parameters
+// ---------------------------------------------------------------------------
+
+/**
+ * Immutable snapshot of all processing parameters. Swapped atomically via
+ * AtomicReference so the processing loop reads a consistent set of values
+ * each frame, preventing partial-read tearing during preset changes.
+ */
+data class ProcessingParams(
+    val mainVolume: Float = 1.15f,
+    val frequencyMode: FrequencyMode = FrequencyMode.Full,
+    val targetFrequency: Float = 200f,
+    val gateThreshold: Float = 0.07f,
+    val autoGateAmount: Float = 0f,
+    val gateSmoothing: Float = 0.22f,
+    val thresholdKnee: Float = 0.22f,
+    val triggerMode: TriggerMode = TriggerMode.Dynamic,
+    val binaryLevel: Float = 0.8f,
+    val hybridBlend: Float = 0.5f,
+    val dynamicCurve: Float = 1f,
+    val attackMs: Float = 30f,
+    val decayMs: Float = 160f,
+    val sustainLevel: Float = 0.9f,
+    val releaseMs: Float = 320f,
+    val attackCurve: Float = 1f,
+    val decayCurve: Float = 1f,
+    val releaseCurve: Float = 1.15f,
+    val minVibe: Float = 0f,
+    val maxVibe: Float = 1f,
+    val outputGain: Float = 1f,
+    val climaxEnabled: Boolean = false,
+    val climaxIntensity: Float = 0.7f,
+    val climaxBuildUpMs: Float = 90_000f,
+    val climaxTeaseRatio: Float = 0.18f,
+    val climaxTeaseDrop: Float = 0.35f,
+    val climaxSurgeBoost: Float = 0.5f,
+    val climaxPulseDepth: Float = 0.18f,
+    val climaxPattern: ClimaxPattern = ClimaxPattern.Wave
+)
 
 // ---------------------------------------------------------------------------
 // AudioCaptureManager
@@ -97,38 +140,99 @@ class AudioCaptureManager(private val context: Context) {
         const val TARGET_FRAME_MS = 16L
     }
 
-    // Signal processing parameters (set from UI thread)
-    @Volatile var mainVolume: Float = 1.15f
-    @Volatile var frequencyMode: FrequencyMode = FrequencyMode.Full
-    @Volatile var targetFrequency: Float = 200f
-    @Volatile var gateThreshold: Float = 0.07f
-    @Volatile var autoGateAmount: Float = 0f
-    @Volatile var gateSmoothing: Float = 0.22f
-    @Volatile var thresholdKnee: Float = 0.22f
-    @Volatile var triggerMode: TriggerMode = TriggerMode.Dynamic
-    @Volatile var binaryLevel: Float = 0.8f
-    @Volatile var hybridBlend: Float = 0.5f
-    @Volatile var dynamicCurve: Float = 1f
-    @Volatile var attackMs: Float = 30f
-    @Volatile var decayMs: Float = 160f
-    @Volatile var sustainLevel: Float = 0.9f
-    @Volatile var releaseMs: Float = 320f
-    @Volatile var attackCurve: Float = 1f
-    @Volatile var decayCurve: Float = 1f
-    @Volatile var releaseCurve: Float = 1.15f
-    @Volatile var minVibe: Float = 0f
-    @Volatile var maxVibe: Float = 1f
-    @Volatile var outputGain: Float = 1f
+    // Signal processing parameters -- bundled into an immutable data class
+    // and swapped atomically so the processing loop reads a consistent snapshot.
+    private val paramsRef = AtomicReference(ProcessingParams())
 
-    // Climax engine params
-    @Volatile var climaxEnabled: Boolean = false
-    @Volatile var climaxIntensity: Float = 0.7f
-    @Volatile var climaxBuildUpMs: Float = 90_000f
-    @Volatile var climaxTeaseRatio: Float = 0.18f
-    @Volatile var climaxTeaseDrop: Float = 0.35f
-    @Volatile var climaxSurgeBoost: Float = 0.5f
-    @Volatile var climaxPulseDepth: Float = 0.18f
-    @Volatile var climaxPattern: ClimaxPattern = ClimaxPattern.Wave
+    // Public accessors for UI thread to read/write individual parameters.
+    // Each setter creates a new ProcessingParams snapshot via atomic swap.
+    var mainVolume: Float
+        get() = paramsRef.get().mainVolume
+        set(v) { paramsRef.updateAndGet { it.copy(mainVolume = v) } }
+    var frequencyMode: FrequencyMode
+        get() = paramsRef.get().frequencyMode
+        set(v) { paramsRef.updateAndGet { it.copy(frequencyMode = v) } }
+    var targetFrequency: Float
+        get() = paramsRef.get().targetFrequency
+        set(v) { paramsRef.updateAndGet { it.copy(targetFrequency = v) } }
+    var gateThreshold: Float
+        get() = paramsRef.get().gateThreshold
+        set(v) { paramsRef.updateAndGet { it.copy(gateThreshold = v) } }
+    var autoGateAmount: Float
+        get() = paramsRef.get().autoGateAmount
+        set(v) { paramsRef.updateAndGet { it.copy(autoGateAmount = v) } }
+    var gateSmoothing: Float
+        get() = paramsRef.get().gateSmoothing
+        set(v) { paramsRef.updateAndGet { it.copy(gateSmoothing = v) } }
+    var thresholdKnee: Float
+        get() = paramsRef.get().thresholdKnee
+        set(v) { paramsRef.updateAndGet { it.copy(thresholdKnee = v) } }
+    var triggerMode: TriggerMode
+        get() = paramsRef.get().triggerMode
+        set(v) { paramsRef.updateAndGet { it.copy(triggerMode = v) } }
+    var binaryLevel: Float
+        get() = paramsRef.get().binaryLevel
+        set(v) { paramsRef.updateAndGet { it.copy(binaryLevel = v) } }
+    var hybridBlend: Float
+        get() = paramsRef.get().hybridBlend
+        set(v) { paramsRef.updateAndGet { it.copy(hybridBlend = v) } }
+    var dynamicCurve: Float
+        get() = paramsRef.get().dynamicCurve
+        set(v) { paramsRef.updateAndGet { it.copy(dynamicCurve = v) } }
+    var attackMs: Float
+        get() = paramsRef.get().attackMs
+        set(v) { paramsRef.updateAndGet { it.copy(attackMs = v) } }
+    var decayMs: Float
+        get() = paramsRef.get().decayMs
+        set(v) { paramsRef.updateAndGet { it.copy(decayMs = v) } }
+    var sustainLevel: Float
+        get() = paramsRef.get().sustainLevel
+        set(v) { paramsRef.updateAndGet { it.copy(sustainLevel = v) } }
+    var releaseMs: Float
+        get() = paramsRef.get().releaseMs
+        set(v) { paramsRef.updateAndGet { it.copy(releaseMs = v) } }
+    var attackCurve: Float
+        get() = paramsRef.get().attackCurve
+        set(v) { paramsRef.updateAndGet { it.copy(attackCurve = v) } }
+    var decayCurve: Float
+        get() = paramsRef.get().decayCurve
+        set(v) { paramsRef.updateAndGet { it.copy(decayCurve = v) } }
+    var releaseCurve: Float
+        get() = paramsRef.get().releaseCurve
+        set(v) { paramsRef.updateAndGet { it.copy(releaseCurve = v) } }
+    var minVibe: Float
+        get() = paramsRef.get().minVibe
+        set(v) { paramsRef.updateAndGet { it.copy(minVibe = v) } }
+    var maxVibe: Float
+        get() = paramsRef.get().maxVibe
+        set(v) { paramsRef.updateAndGet { it.copy(maxVibe = v) } }
+    var outputGain: Float
+        get() = paramsRef.get().outputGain
+        set(v) { paramsRef.updateAndGet { it.copy(outputGain = v) } }
+    var climaxEnabled: Boolean
+        get() = paramsRef.get().climaxEnabled
+        set(v) { paramsRef.updateAndGet { it.copy(climaxEnabled = v) } }
+    var climaxIntensity: Float
+        get() = paramsRef.get().climaxIntensity
+        set(v) { paramsRef.updateAndGet { it.copy(climaxIntensity = v) } }
+    var climaxBuildUpMs: Float
+        get() = paramsRef.get().climaxBuildUpMs
+        set(v) { paramsRef.updateAndGet { it.copy(climaxBuildUpMs = v) } }
+    var climaxTeaseRatio: Float
+        get() = paramsRef.get().climaxTeaseRatio
+        set(v) { paramsRef.updateAndGet { it.copy(climaxTeaseRatio = v) } }
+    var climaxTeaseDrop: Float
+        get() = paramsRef.get().climaxTeaseDrop
+        set(v) { paramsRef.updateAndGet { it.copy(climaxTeaseDrop = v) } }
+    var climaxSurgeBoost: Float
+        get() = paramsRef.get().climaxSurgeBoost
+        set(v) { paramsRef.updateAndGet { it.copy(climaxSurgeBoost = v) } }
+    var climaxPulseDepth: Float
+        get() = paramsRef.get().climaxPulseDepth
+        set(v) { paramsRef.updateAndGet { it.copy(climaxPulseDepth = v) } }
+    var climaxPattern: ClimaxPattern
+        get() = paramsRef.get().climaxPattern
+        set(v) { paramsRef.updateAndGet { it.copy(climaxPattern = v) } }
 
     // Output callback -- single motor (legacy) and dual motor
     var onOutputUpdate: ((Float) -> Unit)? = null
@@ -139,34 +243,36 @@ class AudioCaptureManager(private val context: Context) {
     /** Called when Visualizer produces silence and we auto-fallback to mic. */
     var onFallbackToMic: (() -> Unit)? = null
 
-    /** Apply a preset to all signal processing parameters. */
+    /** Apply a preset to all signal processing parameters atomically. */
     fun applyPreset(preset: Preset) {
-        mainVolume = preset.mainVolume
-        frequencyMode = preset.frequencyMode
-        targetFrequency = preset.targetFrequency
-        gateThreshold = preset.gateThreshold
-        autoGateAmount = preset.autoGateAmount
-        gateSmoothing = preset.gateSmoothing
-        triggerMode = preset.triggerMode
-        binaryLevel = preset.binaryLevel
-        hybridBlend = preset.hybridBlend
-        attackMs = preset.attackMs
-        decayMs = preset.decayMs
-        sustainLevel = preset.sustainLevel
-        releaseMs = preset.releaseMs
-        attackCurve = preset.attackCurve
-        decayCurve = preset.decayCurve
-        releaseCurve = preset.releaseCurve
-        minVibe = preset.minVibe
-        maxVibe = preset.maxVibe
-        climaxEnabled = preset.climaxEnabled
-        climaxIntensity = preset.climaxIntensity
-        climaxBuildUpMs = preset.climaxBuildUpMs
-        climaxTeaseRatio = preset.climaxTeaseRatio
-        climaxTeaseDrop = preset.climaxTeaseDrop
-        climaxSurgeBoost = preset.climaxSurgeBoost
-        climaxPulseDepth = preset.climaxPulseDepth
-        climaxPattern = preset.climaxPattern
+        paramsRef.set(ProcessingParams(
+            mainVolume = preset.mainVolume,
+            frequencyMode = preset.frequencyMode,
+            targetFrequency = preset.targetFrequency,
+            gateThreshold = preset.gateThreshold,
+            autoGateAmount = preset.autoGateAmount,
+            gateSmoothing = preset.gateSmoothing,
+            triggerMode = preset.triggerMode,
+            binaryLevel = preset.binaryLevel,
+            hybridBlend = preset.hybridBlend,
+            attackMs = preset.attackMs,
+            decayMs = preset.decayMs,
+            sustainLevel = preset.sustainLevel,
+            releaseMs = preset.releaseMs,
+            attackCurve = preset.attackCurve,
+            decayCurve = preset.decayCurve,
+            releaseCurve = preset.releaseCurve,
+            minVibe = preset.minVibe,
+            maxVibe = preset.maxVibe,
+            climaxEnabled = preset.climaxEnabled,
+            climaxIntensity = preset.climaxIntensity,
+            climaxBuildUpMs = preset.climaxBuildUpMs,
+            climaxTeaseRatio = preset.climaxTeaseRatio,
+            climaxTeaseDrop = preset.climaxTeaseDrop,
+            climaxSurgeBoost = preset.climaxSurgeBoost,
+            climaxPulseDepth = preset.climaxPulseDepth,
+            climaxPattern = preset.climaxPattern
+        ))
     }
 
     /**
@@ -179,6 +285,7 @@ class AudioCaptureManager(private val context: Context) {
         if (running) return true
         sourceMode = mode
 
+        Log.i("ChloeVibes", "Starting audio capture in mode: $mode")
         val started = when (mode) {
             AudioSourceMode.SystemAudio -> startVisualizer()
             AudioSourceMode.Microphone -> startMicrophone()
@@ -191,12 +298,16 @@ class AudioCaptureManager(private val context: Context) {
                 isDaemon = true
                 start()
             }
+            Log.i("ChloeVibes", "Audio capture started successfully")
+        } else {
+            Log.w("ChloeVibes", "Audio capture failed to start in mode: $mode")
         }
         return started
     }
 
     /** Stop audio capture and processing. */
     fun stop() {
+        Log.i("ChloeVibes", "Stopping audio capture")
         running = false
         processingThread?.join(500)
         processingThread = null
@@ -281,6 +392,7 @@ class AudioCaptureManager(private val context: Context) {
             useVisualizerFft = true
             true
         } catch (e: Exception) {
+            Log.e("ChloeVibes", "Visualizer initialization failed", e)
             false
         }
     }
@@ -339,9 +451,13 @@ class AudioCaptureManager(private val context: Context) {
 
             true
         } catch (e: Exception) {
+            Log.w("ChloeVibes", "Microphone capture initialization failed", e)
             false
         }
     }
+
+    // Visualizer restart failure counter (Fix 13)
+    private var visualizerRestartFailures = 0
 
     // -----------------------------------------------------------------------
     // Processing loop (~60Hz)
@@ -350,11 +466,15 @@ class AudioCaptureManager(private val context: Context) {
     private fun processingLoop() {
         val startMs = System.nanoTime() / 1_000_000f
         lastSampleTimeMs = System.currentTimeMillis()
+        var consecutiveErrors = 0
 
         while (running) {
           try {
             val frameStartNs = System.nanoTime()
             val currentTimeMs = System.nanoTime() / 1_000_000f - startMs
+
+            // Read all parameters once per frame for a consistent snapshot
+            val params = paramsRef.get()
 
             val spectralData: SpectralData
             val energy: Float
@@ -384,7 +504,17 @@ class AudioCaptureManager(private val context: Context) {
                         try { visualizer?.apply { enabled = false; release() } } catch (_: Exception) {}
                         visualizer = null
                         useVisualizerFft = false
-                        startVisualizer()
+                        val restarted = startVisualizer()
+                        if (restarted) {
+                            visualizerRestartFailures = 0
+                        } else {
+                            visualizerRestartFailures++
+                            if (visualizerRestartFailures >= 3) {
+                                Log.w("ChloeVibes", "Visualizer restart failed 3 times, falling back to mic mode")
+                                visualizerRestartFailures = 0
+                                startMicrophone()
+                            }
+                        }
                         lastSampleTimeMs = System.currentTimeMillis()
                     }
                 }
@@ -437,11 +567,15 @@ class AudioCaptureManager(private val context: Context) {
                     )
 
                     // Extract raw energy (pre-volume) for gate, boosted for envelope
-                    val rawEnergy = SpectralAnalyzer.extractEnergy(spectralData, frequencyMode, targetFrequency)
-                    energy = rawEnergy * mainVolume
+                    val rawEnergy = SpectralAnalyzer.extractEnergy(spectralData, params.frequencyMode, params.targetFrequency)
+                    energy = rawEnergy * params.mainVolume
                 }
             } else {
                 // ---- Raw sample path (mic or fallback) ----
+                // Do NOT apply volume before FFT so the gate sees true
+                // pre-volume energy (matching the Visualizer path and
+                // Rust desktop behavior). Volume is applied to energy
+                // after extractEnergy() below.
                 val samples: FloatArray
                 synchronized(sampleLock) {
                     if (!hasFreshSamples) {
@@ -451,22 +585,22 @@ class AudioCaptureManager(private val context: Context) {
                         hasFreshSamples = false
                     }
                 }
-                val gained = FloatArray(samples.size) { i -> samples[i] * mainVolume }
-                spectralData = state.analyzer.analyze(gained, 1)
-                energy = SpectralAnalyzer.extractEnergy(spectralData, frequencyMode, targetFrequency)
+                spectralData = state.analyzer.analyze(samples, 1)
+                val rawEnergy = SpectralAnalyzer.extractEnergy(spectralData, params.frequencyMode, params.targetFrequency)
+                energy = rawEnergy * params.mainVolume
             }
 
             // Raw energy (0-1 normalized, no volume) for the gate so the
             // threshold slider maps cleanly: 0% = always open, 100% = closed.
             // Volume-boosted energy feeds the envelope for dynamics.
-            val rawEnergy = if (mainVolume > 0.001f) (energy / mainVolume).coerceIn(0f, 1f) else 0f
+            val rawEnergy = if (params.mainVolume > 0.001f) (energy / params.mainVolume).coerceIn(0f, 1f) else 0f
 
             state.lastSpectralData = spectralData
             state.lastEnergy = energy
 
             // Step 3: Gate (uses raw energy so threshold isn't defeated by volume)
             val gateOpen = state.gate.process(
-                rawEnergy, gateThreshold, autoGateAmount, gateSmoothing, thresholdKnee
+                rawEnergy, params.gateThreshold, params.autoGateAmount, params.gateSmoothing
             )
             state.lastGateOpen = gateOpen
 
@@ -498,19 +632,19 @@ class AudioCaptureManager(private val context: Context) {
                 isOnset = isOnset,
                 onsetStrength = onsetStrength,
                 currentTimeMs = currentTimeMs,
-                triggerMode = triggerMode,
-                threshold = gateThreshold,
-                thresholdKnee = thresholdKnee,
-                dynamicCurve = dynamicCurve,
-                binaryLevel = binaryLevel,
-                hybridBlend = hybridBlend,
-                attackMs = attackMs,
-                decayMs = decayMs,
-                sustainLevel = sustainLevel,
-                releaseMs = releaseMs,
-                attackCurve = attackCurve,
-                decayCurve = decayCurve,
-                releaseCurve = releaseCurve,
+                triggerMode = params.triggerMode,
+                threshold = params.gateThreshold,
+                thresholdKnee = params.thresholdKnee,
+                dynamicCurve = params.dynamicCurve,
+                binaryLevel = params.binaryLevel,
+                hybridBlend = params.hybridBlend,
+                attackMs = params.attackMs,
+                decayMs = params.decayMs,
+                sustainLevel = params.sustainLevel,
+                releaseMs = params.releaseMs,
+                attackCurve = params.attackCurve,
+                decayCurve = params.decayCurve,
+                releaseCurve = params.releaseCurve,
                 spectralCentroid = spectralData.spectralCentroid
             )
             state.lastEnvelopeOutput = envelopeOutput
@@ -524,46 +658,49 @@ class AudioCaptureManager(private val context: Context) {
                 isOnset = isOnset,
                 onsetStrength = onsetStrength,
                 currentTimeMs = currentTimeMs,
-                enabled = climaxEnabled,
-                intensity = climaxIntensity,
-                buildUpMs = climaxBuildUpMs,
-                teaseRatio = climaxTeaseRatio,
-                teaseDrop = climaxTeaseDrop,
-                surgeBoost = climaxSurgeBoost,
-                pulseDepth = climaxPulseDepth,
-                pattern = climaxPattern
+                enabled = params.climaxEnabled,
+                intensity = params.climaxIntensity,
+                buildUpMs = params.climaxBuildUpMs,
+                teaseRatio = params.climaxTeaseRatio,
+                teaseDrop = params.climaxTeaseDrop,
+                surgeBoost = params.climaxSurgeBoost,
+                pulseDepth = params.climaxPulseDepth,
+                pattern = params.climaxPattern
             )
 
             // Step 7: Apply output range mapping
             val mapped = if (climaxOutput > 0.001f) {
-                minVibe + (maxVibe - minVibe) * climaxOutput
+                params.minVibe + (params.maxVibe - params.minVibe) * climaxOutput
             } else {
                 0f
             }
-            val finalOutput = (mapped * outputGain).coerceIn(0f, 1f)
+            val finalOutput = (mapped * params.outputGain).coerceIn(0f, 1f)
             state.lastFinalOutput = finalOutput
 
-            // Notify listener — skip redundant Vibrate:0 commands so the BLE
+            // Notify listener -- skip redundant Vibrate:0 commands so the BLE
             // write gate is clear when a real trigger arrives.  Send the stop
             // command once when output drops to zero, then go silent.
             if (finalOutput > 0.001f || lastSentOutput > 0.001f) {
                 // Dual-motor output: climax engine generates phase-offset
                 // signal for motor 2, creating spatial movement
                 val dualCb = onDualOutputUpdate
-                if (dualCb != null && climaxEnabled) {
+                if (dualCb != null && params.climaxEnabled) {
                     val motor2Raw = state.climaxEngine.motor2Output
                     val motor2Mapped = if (motor2Raw > 0.001f) {
-                        minVibe + (maxVibe - minVibe) * motor2Raw
+                        params.minVibe + (params.maxVibe - params.minVibe) * motor2Raw
                     } else {
                         0f
                     }
-                    val motor2Final = (motor2Mapped * outputGain).coerceIn(0f, 1f)
+                    val motor2Final = (motor2Mapped * params.outputGain).coerceIn(0f, 1f)
                     dualCb.invoke(finalOutput, motor2Final)
                 } else {
                     onOutputUpdate?.invoke(finalOutput)
                 }
                 lastSentOutput = finalOutput
             }
+
+            // Frame completed successfully -- reset error counter
+            consecutiveErrors = 0
 
             // Maintain ~60Hz by sleeping only the remainder of this frame budget.
             val elapsedMs = (System.nanoTime() - frameStartNs) / 1_000_000L
@@ -577,8 +714,13 @@ class AudioCaptureManager(private val context: Context) {
             } else {
                 Thread.yield()
             }
-          } catch (_: Exception) {
-              // Don't let a single frame crash kill the processing thread
+          } catch (e: Exception) {
+              Log.e("ChloeVibes", "Processing frame error", e)
+              consecutiveErrors++
+              if (consecutiveErrors > 100) {
+                  Log.w("ChloeVibes", "Persistent processing errors ($consecutiveErrors consecutive), breaking out of processing loop")
+                  break
+              }
           }
         }
     }

@@ -15,7 +15,10 @@
 
 package com.ashairfoil.chloevibes.audio
 
-import kotlin.math.*
+import kotlin.math.PI
+import kotlin.math.floor
+import kotlin.math.pow
+import kotlin.math.sin
 
 /**
  * Climax engine -- slow modulation layer over audio-reactive output.
@@ -126,7 +129,7 @@ class ClimaxEngine {
         if (currentTimeMs - cycleAnchorMs >= cycleLen) {
             val cycles = floor((currentTimeMs - cycleAnchorMs) / cycleLen).coerceAtLeast(1f)
             cycleAnchorMs += cycles * cycleLen
-            cycleCount++
+            cycleCount = (cycleCount + 1).coerceAtMost(Int.MAX_VALUE)
             arousalMomentum = (arousalMomentum + 0.12f).coerceAtMost(0.75f)
         }
         // Slow momentum decay during silence

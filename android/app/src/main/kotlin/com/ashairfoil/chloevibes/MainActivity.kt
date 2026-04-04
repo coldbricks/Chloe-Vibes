@@ -16,9 +16,13 @@ import android.os.Looper
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.runtime.*
+import androidx.compose.runtime.mutableStateListOf
 import androidx.core.content.ContextCompat
-import com.ashairfoil.chloevibes.audio.*
+import com.ashairfoil.chloevibes.audio.AudioCaptureManager
+import com.ashairfoil.chloevibes.audio.AudioSourceMode
+import com.ashairfoil.chloevibes.audio.EnvelopeState
+import com.ashairfoil.chloevibes.audio.NUM_BANDS
+import com.ashairfoil.chloevibes.audio.findPreset
 import com.ashairfoil.chloevibes.device.BleDeviceManager
 import com.ashairfoil.chloevibes.device.ConnectionState
 import com.ashairfoil.chloevibes.ui.ChloeVibesTheme

@@ -71,9 +71,7 @@ pub fn gui(args: Gui) {
 // Connection State
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)]
 enum ConnectionState {
-    Disconnected,
     Connecting,
     Connected,
     Error(String),
@@ -98,7 +96,6 @@ struct DeviceProps {
     oscillators: Vec<OscillatorProps>,
 }
 
-#[allow(dead_code)]
 struct BatteryState {
     shared_level: SharedF32,
     _task: tokio::task::JoinHandle<()>,
@@ -129,13 +126,20 @@ impl BatteryState {
 
 async fn battery_check_bg_task(device: Arc<ButtplugClientDevice>, shared_level: SharedF32) {
     let mut interval = tokio::time::interval(Duration::from_secs(5));
+    let mut consecutive_errors: u32 = 0;
     loop {
         interval.tick().await;
         match device.battery_level().await {
-            Ok(level) => shared_level.store(level as f32),
+            Ok(level) => {
+                shared_level.store(level as f32);
+                consecutive_errors = 0;
+            }
             Err(_) => {
-                shared_level.store(f32::NAN);
-                break;
+                consecutive_errors += 1;
+                if consecutive_errors >= 5 {
+                    shared_level.store(f32::NAN);
+                    break;
+                }
             }
         }
     }
@@ -252,11 +256,13 @@ struct GuiApp {
     processed_output_2: SharedF32, // Secondary motor output from ClimaxEngine
 
     _capture_thread: JoinHandle<()>,
+    use_advanced_shared: Arc<AtomicBool>,
     is_scanning: bool,
     show_settings: bool,
 
     // Processing state
     vibration_level: f32,
+    motor2_level: f32,
     hold_start_time: Option<Instant>,
 
     // NEW: Signal processors (from ChloeVibes)
@@ -302,21 +308,15 @@ mod palette {
     pub const BG_PRIMARY: Color32 = Color32::from_rgb(15, 15, 20);
     pub const BG_SECONDARY: Color32 = Color32::from_rgb(22, 22, 32);
     pub const BG_TERTIARY: Color32 = Color32::from_rgb(30, 30, 42);
-    pub const BG_CARD: Color32 = Color32::from_rgb(26, 26, 38);
     pub const ACCENT_PURPLE: Color32 = Color32::from_rgb(124, 58, 237);
     pub const ACCENT_PURPLE_DIM: Color32 = Color32::from_rgb(88, 40, 168);
     pub const ACCENT_TEAL: Color32 = Color32::from_rgb(16, 185, 129);
-    pub const ACCENT_TEAL_DIM: Color32 = Color32::from_rgb(10, 120, 84);
-    pub const ACCENT_RED: Color32 = Color32::from_rgb(239, 68, 68);
     pub const ACCENT_PINK: Color32 = Color32::from_rgb(236, 72, 153);
-    pub const ACCENT_PINK_DIM: Color32 = Color32::from_rgb(160, 50, 110);
     pub const ACCENT_AMBER: Color32 = Color32::from_rgb(245, 158, 11);
     pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(243, 244, 246);
     pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(156, 163, 175);
     pub const TEXT_DIM: Color32 = Color32::from_rgb(107, 114, 128);
     pub const GRID_LINE: Color32 = Color32::from_rgb(40, 40, 55);
-    pub const NEON_BORDER: Color32 = Color32::from_rgba_premultiplied(124, 58, 237, 60);
-    pub const NEON_BORDER_ACTIVE: Color32 = Color32::from_rgba_premultiplied(236, 72, 153, 90);
 }
 
 // ---------------------------------------------------------------------------
@@ -326,7 +326,6 @@ mod palette {
 const HISTORY_LEN: usize = 256;
 const ADSR_PREVIEW_HEIGHT: f32 = 100.0;
 const OUTPUT_HISTORY_HEIGHT: f32 = 80.0;
-const SPECTRUM_HEIGHT: f32 = 70.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BeatDivision {
@@ -671,7 +670,7 @@ impl TapTempo {
         for &timestamp in timestamps_ms.iter().skip(1) {
             let delta_ms = timestamp - previous;
             previous = timestamp;
-            if delta_ms >= Self::MIN_INTERVAL_MS && delta_ms <= Self::MAX_INTERVAL_MS {
+            if (Self::MIN_INTERVAL_MS..=Self::MAX_INTERVAL_MS).contains(&delta_ms) {
                 intervals_ms.push(delta_ms);
             }
         }
@@ -777,6 +776,7 @@ fn capture_thread(
     low_pass_freq: SharedF32,
     polling_rate_ms: SharedF32,
     use_polling_rate: Arc<AtomicBool>,
+    use_advanced: Arc<AtomicBool>,
     capture_status: Arc<Mutex<String>>,
 ) -> ! {
     loop {
@@ -905,22 +905,24 @@ fn capture_thread(
                 continue;
             }
 
-            // Legacy: low-pass filter + RMS (kept for backward compat / fallback)
-            let rc = 1.0 / low_pass_freq.load().max(1.0);
-            let filtered = util::low_pass(samples, sample_dt, rc, channels);
-            let low_pass_rms = if filtered.is_empty() {
-                0.0
-            } else {
-                let speeds = util::calculate_power(&filtered, channels);
-                sanitize_unit(util::avg(&speeds))
-            };
-            let raw_rms = if samples.is_empty() {
-                0.0
-            } else {
-                let sum_sq: f32 = samples.iter().map(|s| s * s).sum();
-                sanitize_unit((sum_sq / samples.len() as f32).sqrt())
-            };
-            sound_power.store(low_pass_rms.max(raw_rms));
+            // Legacy: low-pass filter + RMS (only when advanced processing is off)
+            if !use_advanced.load(Ordering::Relaxed) {
+                let rc = 1.0 / low_pass_freq.load().max(1.0);
+                let filtered = util::low_pass(samples, sample_dt, rc, channels);
+                let low_pass_rms = if filtered.is_empty() {
+                    0.0
+                } else {
+                    let speeds = util::calculate_power(&filtered, channels);
+                    sanitize_unit(util::avg(&speeds))
+                };
+                let raw_rms = if samples.is_empty() {
+                    0.0
+                } else {
+                    let sum_sq: f32 = samples.iter().map(|s| s * s).sum();
+                    sanitize_unit((sum_sq / samples.len() as f32).sqrt())
+                };
+                sound_power.store(low_pass_rms.max(raw_rms));
+            }
 
             // NEW: Full spectral analysis via FFT
             let spectral = analyzer.analyze(samples, channels);
@@ -976,6 +978,8 @@ impl GuiApp {
         let low_pass_freq = settings.low_pass_freq.clone();
         let polling_rate_ms = settings.polling_rate_ms.clone();
         let use_polling_rate = settings.use_polling_rate.clone();
+        let use_advanced_shared = Arc::new(AtomicBool::new(settings.use_advanced_processing));
+        let use_advanced_capture = use_advanced_shared.clone();
 
         let _capture_thread = std::thread::spawn(move || {
             capture_thread(
@@ -984,6 +988,7 @@ impl GuiApp {
                 low_pass_freq,
                 polling_rate_ms,
                 use_polling_rate,
+                use_advanced_capture,
                 capture_status2,
             )
         });
@@ -1021,10 +1026,12 @@ impl GuiApp {
             processed_output,
             processed_output_2,
             _capture_thread,
+            use_advanced_shared,
             is_scanning: false,
             show_settings: false,
             settings,
             vibration_level: 0.0,
+            motor2_level: 0.0,
             hold_start_time: None,
 
             // New processors
@@ -1069,7 +1076,7 @@ impl eframe::App for GuiApp {
             for (device_name, device) in &self.devices {
                 let mut vibrators = Vec::new();
                 let mut oscillators = Vec::new();
-                let props = &device.props.lock().unwrap();
+                let props = &device.props.lock().unwrap_or_else(|e| e.into_inner());
                 for vibe in &props.vibrators {
                     vibrators.push(VibratorSettings {
                         is_enabled: vibe.is_enabled,
@@ -1104,6 +1111,9 @@ impl eframe::App for GuiApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Sync advanced processing flag with capture thread
+        self.use_advanced_shared.store(self.settings.use_advanced_processing, Ordering::Relaxed);
+
         // Apply custom dark theme
         let mut visuals = if self.settings.use_dark_mode {
             Visuals::dark()
@@ -1188,8 +1198,7 @@ impl eframe::App for GuiApp {
                 if !matches!(self.connection_state, ConnectionState::Connecting)
                 {
                     match self.connection_state {
-                        ConnectionState::Disconnected
-                        | ConnectionState::Error(_) => {
+                        ConnectionState::Error(_) => {
                             if ui.button("Connect to Server").clicked() {
                                 self.connection_state =
                                     ConnectionState::Connecting;
@@ -1259,9 +1268,6 @@ impl eframe::App for GuiApp {
                 }
 
                 match &self.connection_state {
-                    ConnectionState::Disconnected => {
-                        ui.label("Disconnected");
-                    }
                     ConnectionState::Connecting => {
                         ui.label("Connecting...");
                     }
@@ -1308,7 +1314,7 @@ impl eframe::App for GuiApp {
                     if let Some(client) = &self.client {
                         self.runtime.spawn(client.stop_all_devices());
                         for device in self.devices.values_mut() {
-                            device.props.lock().unwrap().is_enabled = false;
+                            device.props.lock().unwrap_or_else(|e| e.into_inner()).is_enabled = false;
                         }
                     }
                 }
@@ -1332,20 +1338,19 @@ impl eframe::App for GuiApp {
                 // ====== NEW PIPELINE (ChloeVibes-derived) ======
 
                 // 1. Read spectral data from capture thread
-                let spectral = self.spectral_data.load();
-                self.last_spectral = spectral.clone();
+                self.last_spectral = self.spectral_data.load();
 
                 // 2. Extract energy based on frequency mode
                 let spectral_energy = SpectralAnalyzer::extract_energy(
-                    &spectral,
+                    &self.last_spectral,
                     self.settings.frequency_mode,
                     self.settings.target_frequency,
                 );
                 let spectral_energy = sanitize_unit(spectral_energy);
                 let legacy_energy = sanitize_unit(self.sound_power.load());
-                let spectral_rms = sanitize_unit(spectral.rms_power);
+                let spectral_rms = sanitize_unit(self.last_spectral.rms_power);
                 let spectral_total = sanitize_unit(
-                    spectral.band_energies.iter().copied().sum::<f32>()
+                    self.last_spectral.band_energies.iter().copied().sum::<f32>()
                         / BAND_NAMES.len() as f32,
                 );
                 let using_rms_fallback =
@@ -1376,7 +1381,7 @@ impl eframe::App for GuiApp {
 
                 // 4. Beat detection (for onset retrigger)
                 let (detected_onset, onset_strength) =
-                    self.beat_detector.process(spectral.spectral_flux, current_time_ms);
+                    self.beat_detector.process(self.last_spectral.spectral_flux, current_time_ms);
 
                 // Predictive onset: when tempo is locked, pre-trigger ~2 device
                 // write intervals early so the attack command arrives on-beat
@@ -1416,7 +1421,6 @@ impl eframe::App for GuiApp {
                     self.settings.gate_threshold,
                     self.settings.auto_gate_amount,
                     self.settings.gate_smoothing,
-                    self.settings.threshold_knee,
                 );
 
                 // 6. Envelope ADSR (the big upgrade)
@@ -1442,7 +1446,7 @@ impl eframe::App for GuiApp {
                     self.settings.attack_curve,
                     self.settings.decay_curve,
                     self.settings.release_curve,
-                    spectral.spectral_centroid,
+                    self.last_spectral.spectral_centroid,
                 );
 
                 // 7. Optional climax modulation layer
@@ -1523,7 +1527,7 @@ impl eframe::App for GuiApp {
 
                 let output_up_ms = (self.settings.output_slew_ms * 0.35).max(1.0);
                 let output_down_ms = self.settings.output_slew_ms.max(1.0);
-                let output_alpha = if final_intensity >= self.vibration_level {
+                let output_alpha = if trimmed_intensity >= self.vibration_level {
                     smoothing_alpha(delta_time, output_up_ms)
                 } else {
                     smoothing_alpha(delta_time, output_down_ms)
@@ -1598,15 +1602,31 @@ impl eframe::App for GuiApp {
             // Store secondary motor output (from ClimaxEngine dual-motor phasing).
             // When climax is enabled: motor2 gets the phase-offset signal.
             // When climax is disabled: motor2 tracks motor1.
-            let motor2_raw = if self.settings.climax_mode_enabled {
+            // Safety zero-out for motor2 matching motor1 (don't buzz during silence)
+            let is_silent = self.raw_energy < 0.005
+                && !self.gate_is_open
+                && self.envelope.state == audio::EnvelopeState::Idle;
+            let motor2_raw = if is_silent {
+                0.0
+            } else if self.settings.climax_mode_enabled {
                 self.climax_engine.motor2_output
             } else {
                 self.vibration_level
             };
             let motor2_mapped = self.settings.min_vibe
                 + motor2_raw * (self.settings.max_vibe - self.settings.min_vibe);
-            let motor2_final = (motor2_mapped * self.settings.output_gain).clamp(0.0, 1.0);
-            self.processed_output_2.store(motor2_final);
+            let motor2_gained = (motor2_mapped * self.settings.output_gain).clamp(0.0, 1.0);
+            // Apply same slew smoothing as motor1 so both motors have matching latency
+            let m2_up_ms = (self.settings.output_slew_ms * 0.35).max(1.0);
+            let m2_down_ms = self.settings.output_slew_ms.max(1.0);
+            let motor2_alpha = if motor2_gained >= self.motor2_level {
+                smoothing_alpha(delta_time, m2_up_ms)
+            } else {
+                smoothing_alpha(delta_time, m2_down_ms)
+            };
+            self.motor2_level += (motor2_gained - self.motor2_level) * motor2_alpha;
+            self.motor2_level = self.motor2_level.clamp(0.0, 1.0);
+            self.processed_output_2.store(self.motor2_level);
 
             // Push to visualization history
             self.output_history.push_back(self.vibration_level);
@@ -2996,10 +3016,12 @@ impl eframe::App for GuiApp {
                             async move {
                                 // Rate limiter state (from Gemini/ChloeVibes approach)
                                 let mut last_sent: f64 = -1.0;
+                                let mut last_sent_m2: f64 = -1.0;
                                 // 0.5% dead-band: the Domi 2 has decent granularity.
                                 // Finer resolution captures subtle dynamics that
                                 // make the difference between "buzzing" and "alive".
                                 let resolution: f64 = 0.005;
+                                let mut consecutive_errors: u32 = 0;
 
                                 loop {
                                     let now = tokio::time::Instant::now();
@@ -3009,7 +3031,7 @@ impl eframe::App for GuiApp {
                                     let mut vibrate_cmd = None;
                                     let mut oscillate_cmd = None;
                                     {
-                                        let guard = props.lock().unwrap();
+                                        let guard = props.lock().unwrap_or_else(|e| e.into_inner());
                                         let speed =
                                             guard.calculate_output(
                                                 vibration_level,
@@ -3020,13 +3042,17 @@ impl eframe::App for GuiApp {
                                         // Only send if:
                                         //   a) intensity changed by more than 0.5%, OR
                                         //   b) this is a hard stop (going to zero)
+                                        let speed2 = guard.calculate_output(vibration_level_2);
+                                        let speed2_f64 = speed2 as f64;
                                         let change = (speed_f64 - last_sent).abs();
+                                        let change_m2 = (speed2_f64 - last_sent_m2).abs();
                                         let is_hard_stop = speed_f64 < 0.005
                                             && last_sent >= 0.005;
 
-                                        if change >= resolution || is_hard_stop {
+                                        if change >= resolution || change_m2 >= resolution || is_hard_stop {
                                             should_send = true;
                                             last_sent = speed_f64;
+                                            last_sent_m2 = speed2_f64;
                                         }
 
                                         if should_send {
@@ -3105,6 +3131,7 @@ impl eframe::App for GuiApp {
 
                                     // Only hit the BT stack when we have something new
                                     if should_send {
+                                        let mut had_error = false;
                                         if let Some(cmd) = vibrate_cmd {
                                             if let Err(e) =
                                                 bp_device.vibrate(&cmd).await
@@ -3112,6 +3139,7 @@ impl eframe::App for GuiApp {
                                                 eprintln!(
                                                     "Vibrate error: {e}"
                                                 );
+                                                had_error = true;
                                             }
                                         }
                                         if let Some(cmd) = oscillate_cmd {
@@ -3121,7 +3149,17 @@ impl eframe::App for GuiApp {
                                                 eprintln!(
                                                     "Oscillate error: {e}"
                                                 );
+                                                had_error = true;
                                             }
+                                        }
+                                        if had_error {
+                                            consecutive_errors += 1;
+                                            if consecutive_errors >= 10 {
+                                                eprintln!("Device task exiting after 10 consecutive BLE errors");
+                                                break;
+                                            }
+                                        } else {
+                                            consecutive_errors = 0;
                                         }
                                     }
 
@@ -3147,7 +3185,7 @@ impl eframe::App for GuiApp {
                     device_widget(
                         ui,
                         bp_device,
-                        &mut device.props.lock().unwrap(),
+                        &mut device.props.lock().unwrap_or_else(|e| e.into_inner()),
                         self.vibration_level,
                         &self.runtime,
                     );
@@ -3156,7 +3194,7 @@ impl eframe::App for GuiApp {
         });
 
         settings_window_widget(ctx, &mut self.show_settings, &mut self.settings);
-        ctx.request_repaint();
+        ctx.request_repaint_after(Duration::from_millis(16));
     }
 }
 
@@ -3285,9 +3323,9 @@ fn draw_adsr_envelope(
             points.clone(),
             Stroke::new(4.0, Color32::from_rgba_premultiplied(16, 185, 129, 40)),
         ));
-        // Main line
+        // Main line (reuse vec — no clone needed since this is the last use)
         painter.add(Shape::line(
-            points.clone(),
+            points,
             Stroke::new(2.0, palette::ACCENT_TEAL),
         ));
     }
@@ -3482,14 +3520,8 @@ fn draw_output_history(
         let y1 = rect.min.y + padding + draw_h * (1.0 - val1);
         let bottom = rect.min.y + padding + draw_h;
 
-        let quad = vec![
-            pos2(x0, bottom),
-            pos2(x0, y0),
-            pos2(x1, y1),
-            pos2(x1, bottom),
-        ];
         painter.add(Shape::convex_polygon(
-            quad,
+            vec![pos2(x0, bottom), pos2(x0, y0), pos2(x1, y1), pos2(x1, bottom)],
             Color32::from_rgba_premultiplied(124, 58, 237, 12),
             Stroke::NONE,
         ));

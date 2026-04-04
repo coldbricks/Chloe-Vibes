@@ -42,14 +42,12 @@ class Gate {
      * @param manualThreshold user-set threshold (0.0 - 1.0)
      * @param autoGateAmount blend between manual and auto (0.0 = manual, 1.0 = auto)
      * @param smoothing gate smoothing amount (0.0 = instant, 1.0 = very smooth)
-     * @param thresholdKnee width of soft threshold region (0.0 = hard edge)
      */
     fun process(
         energy: Float,
         manualThreshold: Float,
         autoGateAmount: Float,
-        smoothing: Float,
-        thresholdKnee: Float
+        smoothing: Float
     ): Boolean {
         // Auto-gate: maintain energy histogram and calculate optimal threshold
         if (autoGateAmount > 0f) {

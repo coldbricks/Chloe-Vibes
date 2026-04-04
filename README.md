@@ -165,7 +165,10 @@ For devices with two independent motors (e.g., Lovense Domi 2), the climax engin
 
 ### Windows Desktop
 
-**Requirements:** Windows 10+ with Rust toolchain installed.
+**Requirements:**
+- Windows 10+
+- [Rust stable toolchain](https://rustup.rs/)
+- [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with the "Desktop development with C++" workload (required for native BLE and audio dependencies)
 
 ```bash
 # Build

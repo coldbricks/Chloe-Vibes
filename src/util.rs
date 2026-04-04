@@ -117,7 +117,7 @@ async fn start_embedded_client(client_name: &str) -> Result<ButtplugClient, Stri
         use buttplug::server::device::hardware::communication::websocket_server::websocket_server_comm_manager::WebsocketServerDeviceCommunicationManagerBuilder;
         device_manager_builder.comm_manager(
             WebsocketServerDeviceCommunicationManagerBuilder::default()
-                .listen_on_all_interfaces(true),
+                .listen_on_all_interfaces(false),
         );
     }
 
@@ -250,16 +250,19 @@ pub fn calculate_power(samples: &[f32], channels: usize) -> Vec<f32> {
             *acc += sample.abs().powi(2);
         }
     }
+    let frame_count = samples.len() / channels;
     for sum in &mut sums {
-        *sum /= samples.len() as f32;
+        *sum /= frame_count.max(1) as f32;
         *sum = sum.sqrt().clamp(0.0, 1.0);
     }
     sums
 }
 
 pub fn avg(samples: &[f32]) -> f32 {
-    let len = samples.len();
-    samples.iter().sum::<f32>() / len as f32
+    if samples.is_empty() {
+        return 0.0;
+    }
+    samples.iter().sum::<f32>() / samples.len() as f32
 }
 
 pub trait MinCutoff {
@@ -273,5 +276,87 @@ impl MinCutoff for f32 {
         } else {
             self
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_shared_f32_round_trip() {
+        let s = SharedF32::new(3.14);
+        assert!((s.load() - 3.14).abs() < 1e-6);
+        s.store(0.0);
+        assert_eq!(s.load(), 0.0);
+        s.store(-1.5);
+        assert!((s.load() - (-1.5)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_shared_f32_special_values() {
+        let s = SharedF32::new(f32::INFINITY);
+        assert!(s.load().is_infinite());
+        s.store(f32::NEG_INFINITY);
+        assert!(s.load().is_infinite());
+    }
+
+    #[test]
+    fn test_avg_normal() {
+        assert!((avg(&[1.0, 2.0, 3.0]) - 2.0).abs() < 1e-6);
+        assert!((avg(&[10.0]) - 10.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_avg_empty() {
+        assert_eq!(avg(&[]), 0.0);
+    }
+
+    #[test]
+    fn test_calculate_power_mono() {
+        // All 1.0 samples, mono: RMS should be 1.0
+        let samples = vec![1.0f32; 100];
+        let result = calculate_power(&samples, 1);
+        assert_eq!(result.len(), 1);
+        assert!((result[0] - 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_calculate_power_stereo() {
+        // Stereo, both channels 1.0: each should be 1.0
+        let samples = vec![1.0f32; 200]; // 100 frames, 2 channels
+        let result = calculate_power(&samples, 2);
+        assert_eq!(result.len(), 2);
+        assert!((result[0] - 1.0).abs() < 1e-4, "left channel power should be 1.0, got {}", result[0]);
+        assert!((result[1] - 1.0).abs() < 1e-4, "right channel power should be 1.0, got {}", result[1]);
+    }
+
+    #[test]
+    fn test_calculate_power_silence() {
+        let samples = vec![0.0f32; 100];
+        let result = calculate_power(&samples, 1);
+        assert_eq!(result[0], 0.0);
+    }
+
+    #[test]
+    fn test_low_pass_basic() {
+        let samples = vec![1.0f32; 10];
+        let result = low_pass(&samples, Duration::from_millis(10), 0.01, 1);
+        assert_eq!(result.len(), 10);
+        // Output should converge toward input
+        assert!(result[9] > result[0]);
+    }
+
+    #[test]
+    fn test_low_pass_empty() {
+        let result = low_pass(&[], Duration::from_millis(10), 0.01, 1);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_min_cutoff() {
+        assert_eq!(0.5f32.min_cutoff(0.3), 0.5);
+        assert_eq!(0.2f32.min_cutoff(0.3), 0.0);
+        assert_eq!(0.3f32.min_cutoff(0.3), 0.3);
     }
 }

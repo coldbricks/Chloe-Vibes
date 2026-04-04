@@ -9,7 +9,12 @@
 
 package com.ashairfoil.chloevibes.audio
 
-import kotlin.math.*
+import kotlin.math.PI
+import kotlin.math.cos
+import kotlin.math.pow
+import kotlin.math.roundToInt
+import kotlin.math.sin
+import kotlin.math.sqrt
 
 // ---------------------------------------------------------------------------
 // Constants

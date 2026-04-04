@@ -1014,17 +1014,26 @@ pub fn factory_presets() -> Vec<Preset> {
     ]
 }
 
+/// Lazily-initialized static preset list (avoids per-frame allocation)
+fn cached_presets() -> &'static [Preset] {
+    use std::sync::OnceLock;
+    static PRESETS: OnceLock<Vec<Preset>> = OnceLock::new();
+    PRESETS.get_or_init(factory_presets)
+}
+
 /// Get a preset by name (case-insensitive)
 pub fn find_preset(name: &str) -> Option<Preset> {
-    factory_presets()
-        .into_iter()
+    cached_presets()
+        .iter()
         .find(|p| p.name.eq_ignore_ascii_case(name))
+        .cloned()
 }
 
 /// Get all presets in a given category
 pub fn presets_in_category(category: PresetCategory) -> Vec<Preset> {
-    factory_presets()
-        .into_iter()
+    cached_presets()
+        .iter()
         .filter(|p| p.category == category)
+        .cloned()
         .collect()
 }

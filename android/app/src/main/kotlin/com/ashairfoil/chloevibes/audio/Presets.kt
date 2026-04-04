@@ -1,6 +1,6 @@
 // ==========================================================================
 // Presets.kt -- Named Preset Configurations
-// Ported from presets.rs -- all 20 factory presets
+// Ported from presets.rs -- all 29 factory presets
 //
 // Presets snap all signal-processing parameters to known-good values.
 // Think of these like synth patches -- each one is tuned for a specific
@@ -85,7 +85,7 @@ enum class PresetCategory(val label: String) {
 }
 
 // ---------------------------------------------------------------------------
-// Factory Presets -- all 20 from the Rust version
+// Factory Presets -- all 29 from the Rust version
 // ---------------------------------------------------------------------------
 
 fun factoryPresets(): List<Preset> = listOf(

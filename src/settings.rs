@@ -193,6 +193,7 @@ impl Settings {
         self.climax_surge_boost = preset.climax_surge_boost;
         self.climax_pulse_depth = preset.climax_pulse_depth;
         self.climax_pattern = preset.climax_pattern;
+        self.output_gain = defaults::OUTPUT_GAIN;
         self.current_preset_name = preset.name.to_string();
     }
 }

@@ -9,13 +9,22 @@
 package com.ashairfoil.chloevibes.device
 
 import android.annotation.SuppressLint
-import android.bluetooth.*
-import android.bluetooth.le.*
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothGatt
+import android.bluetooth.BluetoothGattCallback
+import android.bluetooth.BluetoothGattCharacteristic
+import android.bluetooth.BluetoothGattDescriptor
+import android.bluetooth.BluetoothManager
+import android.bluetooth.le.BluetoothLeScanner
+import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanResult
+import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
-import android.os.ParcelUuid
-import java.util.*
+import android.util.Log
+import java.util.UUID
 import kotlin.math.roundToInt
 
 // ---------------------------------------------------------------------------
@@ -187,6 +196,7 @@ class BleDeviceManager(private val context: Context) {
         }
 
         override fun onScanFailed(errorCode: Int) {
+            Log.w("ChloeVibes", "BLE scan failed with error code: $errorCode")
             isScanning = false
         }
     }
@@ -199,6 +209,7 @@ class BleDeviceManager(private val context: Context) {
     fun connect(address: String): Boolean {
         resetWriteState()
         val device = bluetoothAdapter?.getRemoteDevice(address) ?: return false
+        Log.d("ChloeVibes", "BLE connecting to device: $address")
         connectionState = ConnectionState.Connecting
         onConnectionStateChanged?.invoke(connectionState)
 
@@ -208,6 +219,7 @@ class BleDeviceManager(private val context: Context) {
 
     /** Disconnect from the current device. */
     fun disconnect() {
+        Log.d("ChloeVibes", "BLE disconnecting from device: ${connectedDeviceName ?: "unknown"}")
         gatt?.disconnect()
         gatt?.close()
         gatt = null
@@ -223,8 +235,12 @@ class BleDeviceManager(private val context: Context) {
 
     private val gattCallback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                Log.e("ChloeVibes", "GATT error: status=$status, newState=$newState")
+            }
             when (newState) {
                 BluetoothGatt.STATE_CONNECTED -> {
+                    Log.d("ChloeVibes", "BLE connected to: ${gatt.device.name ?: gatt.device.address}")
                     connectionState = ConnectionState.Connected
                     connectedDeviceName = gatt.device.name
                     // Detect dual-motor devices from name at connection time
@@ -241,6 +257,7 @@ class BleDeviceManager(private val context: Context) {
                     gatt.discoverServices()
                 }
                 BluetoothGatt.STATE_DISCONNECTED -> {
+                    Log.d("ChloeVibes", "BLE disconnected (status=$status)")
                     connectionState = ConnectionState.Disconnected
                     connectedDeviceName = null
                     writeCharacteristic = null
@@ -288,6 +305,12 @@ class BleDeviceManager(private val context: Context) {
                     return
                 }
             }
+
+            // No compatible service/characteristic found
+            Log.w("ChloeVibes", "No compatible GATT characteristics found for device")
+            handler.post { onConnectionStateChanged?.invoke(ConnectionState.Disconnected) }
+            gatt.disconnect()
+            gatt.close()
         }
 
         private fun enableNotificationsAndFinish(gatt: BluetoothGatt, rxChar: BluetoothGattCharacteristic) {

@@ -14,7 +14,7 @@
 use std::f32::consts::{PI, TAU};
 use std::sync::{Arc, Mutex};
 
-use rustfft::{num_complex::Complex, FftPlanner};
+use rustfft::{num_complex::Complex, Fft, FftPlanner};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -45,9 +45,11 @@ pub const BAND_NAMES: [&str; NUM_BANDS] = [
 /// How the trigger magnitude is calculated from audio energy.
 /// Mirrors ChloeVibes' trigger mode system.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Default)]
 pub enum TriggerMode {
     /// Intensity scales continuously with audio energy above threshold.
     /// The "normal" mode — louder = stronger vibration.
+    #[default]
     Dynamic,
     /// Fixed output level when energy exceeds threshold, zero otherwise.
     /// Great for rhythmic on/off pulsing.
@@ -56,17 +58,14 @@ pub enum TriggerMode {
     Hybrid,
 }
 
-impl Default for TriggerMode {
-    fn default() -> Self {
-        Self::Dynamic
-    }
-}
 
 /// Which part of the frequency spectrum to analyze.
 /// Lets you isolate bass hits, vocal range, etc.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Default)]
 pub enum FrequencyMode {
     /// Analyze the full audible spectrum (weighted toward lower freqs).
+    #[default]
     Full,
     /// Only frequencies below target_frequency.
     LowPass,
@@ -76,16 +75,13 @@ pub enum FrequencyMode {
     BandPass,
 }
 
-impl Default for FrequencyMode {
-    fn default() -> Self {
-        Self::Full
-    }
-}
 
 /// High-level modulation pattern for the climax engine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Default)]
 pub enum ClimaxPattern {
     /// Smooth continuous rise toward the end of the cycle.
+    #[default]
     Wave,
     /// Step-like intensity increases (plateaus then jumps).
     Stairs,
@@ -93,11 +89,6 @@ pub enum ClimaxPattern {
     Surge,
 }
 
-impl Default for ClimaxPattern {
-    fn default() -> Self {
-        Self::Wave
-    }
-}
 
 /// ADSR envelope state machine states.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -119,17 +110,14 @@ pub enum EnvelopeState {
 pub struct SpectralData {
     /// Energy in each of our 8 frequency bands (0.0 - 1.0 ish)
     pub band_energies: [f32; NUM_BANDS],
-    /// Overall RMS power of the audio signal
-    #[allow(dead_code)]
+    /// Overall RMS power of the audio signal (reserved, currently unused)
     pub rms_power: f32,
     /// Spectral centroid in Hz — higher = brighter sound
-    #[allow(dead_code)]
     pub spectral_centroid: f32,
     /// Spectral flux — how much the spectrum changed since last frame.
     /// Spikes on transients (drum hits, note onsets).
     pub spectral_flux: f32,
-    /// Frequency of the loudest bin
-    #[allow(dead_code)]
+    /// Frequency of the loudest bin (reserved, currently unused)
     pub dominant_frequency: f32,
 }
 
@@ -175,13 +163,11 @@ impl SharedSpectralData {
 ///
 /// Runs in the capture thread. Produces SpectralData each frame.
 pub struct SpectralAnalyzer {
-    planner: FftPlanner<f32>,
+    fft_plan: std::sync::Arc<dyn Fft<f32>>,
     /// Hann window function — reduces spectral leakage
     window: Vec<f32>,
     /// Previous frame's magnitude spectrum (for flux calculation)
     prev_magnitude: Vec<f32>,
-    #[allow(dead_code)]
-    sample_rate: f32,
     /// Hz per FFT bin
     bin_resolution: f32,
     /// Pre-calculated bin index ranges for each frequency band
@@ -217,13 +203,13 @@ impl SpectralAnalyzer {
         }
 
         let mut planner = FftPlanner::new();
-        let scratch_len = planner.plan_fft_forward(FFT_SIZE).get_inplace_scratch_len();
+        let fft_plan = planner.plan_fft_forward(FFT_SIZE);
+        let scratch_len = fft_plan.get_inplace_scratch_len();
 
         Self {
-            planner,
+            fft_plan,
             window,
             prev_magnitude: vec![0.0; FFT_SIZE / 2],
-            sample_rate,
             bin_resolution,
             band_bin_ranges,
             fft_buffer: vec![Complex::new(0.0, 0.0); FFT_SIZE],
@@ -245,11 +231,7 @@ impl SpectralAnalyzer {
 
         // Step 2: Take the last FFT_SIZE samples (or zero-pad if not enough)
         let mono_len = self.mono_buffer.len();
-        let start = if mono_len > FFT_SIZE {
-            mono_len - FFT_SIZE
-        } else {
-            0
-        };
+        let start = mono_len.saturating_sub(FFT_SIZE);
         let available = &self.mono_buffer[start..];
 
         // Step 3: Apply Hann window and fill FFT buffer
@@ -263,8 +245,7 @@ impl SpectralAnalyzer {
         }
 
         // Step 4: Run FFT (in-place with pre-allocated scratch)
-        self.planner
-            .plan_fft_forward(FFT_SIZE)
+        self.fft_plan
             .process_with_scratch(&mut self.fft_buffer, &mut self.scratch_buffer);
 
         // Step 5: Compute magnitude spectrum into pre-allocated buffer
@@ -289,14 +270,6 @@ impl SpectralAnalyzer {
             }
         }
 
-        // Step 7: RMS power (time domain — independent of FFT)
-        let rms_power = if !available.is_empty() {
-            let sum: f32 = available.iter().map(|s| s * s).sum();
-            (sum / available.len() as f32).sqrt()
-        } else {
-            0.0
-        };
-
         // Step 8: Spectral centroid (brightness)
         // Weighted average frequency, where weights are magnitudes.
         let (mut weighted_sum, mut total_mag) = (0.0f32, 0.0f32);
@@ -319,24 +292,15 @@ impl SpectralAnalyzer {
             .map(|(&curr, &prev)| (curr - prev).max(0.0))
             .sum();
 
-        // Step 10: Dominant frequency (loudest bin)
-        let dominant_bin = magnitudes
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        let dominant_frequency = dominant_bin as f32 * self.bin_resolution;
-
         // Save magnitude spectrum for next frame's flux calculation
         self.prev_magnitude.copy_from_slice(magnitudes);
 
         SpectralData {
             band_energies,
-            rms_power,
+            rms_power: 0.0,
             spectral_centroid,
             spectral_flux,
-            dominant_frequency,
+            dominant_frequency: 0.0,
         }
     }
 
@@ -462,7 +426,6 @@ impl Gate {
         manual_threshold: f32,
         auto_gate_amount: f32,
         smoothing: f32,
-        threshold_knee: f32,
     ) -> bool {
         // Auto-gate: maintain energy histogram and calculate optimal threshold
         if auto_gate_amount > 0.0 {
@@ -515,7 +478,6 @@ impl Gate {
         // threshold to prevent chattering. Gap scales with the threshold itself
         // so low thresholds get a tight band, high thresholds a wider one.
         // Matches Android Gate.kt behavior.
-        let _knee = threshold_knee; // knee used in dynamic component, not gate
         let hysteresis = (effective_threshold * 0.25).clamp(0.005, 0.08);
         let open_threshold = effective_threshold;
         let close_threshold = (effective_threshold - hysteresis).max(0.0);
@@ -546,7 +508,6 @@ impl Gate {
         open
     }
 
-    #[allow(dead_code)]
     pub fn was_open(&self) -> bool {
         self.was_open
     }
@@ -765,7 +726,7 @@ impl EnvelopeProcessor {
                         + (current_time_ms * 0.00491).sin() * 0.10
                     );
                     let modulation = 1.0 + primary + secondary + tertiary + cross_freq + noise;
-                    self.value = sustain_level * modulation;
+                    self.value = (sustain_level * modulation).clamp(0.0, 1.0);
                 }
             }
             EnvelopeState::Release => {
@@ -802,6 +763,7 @@ impl EnvelopeProcessor {
     /// This is the main entry point called each frame from the GUI update.
     ///
     /// Returns the envelope output (0.0 - 1.0).
+    #[allow(clippy::too_many_arguments)]
     pub fn drive(
         &mut self,
         gate_open: bool,
@@ -1189,7 +1151,6 @@ impl ClimaxEngine {
             .max(0.0)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn process(
         &mut self,
         input: f32,
@@ -1457,4 +1418,227 @@ fn apply_curve(value: f32, exponent: f32) -> f32 {
 fn smooth_step(value: f32) -> f32 {
     let t = value.clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
+}
+
+// ==========================================================================
+// Tests
+// ==========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- Helper functions ---
+
+    #[test]
+    fn test_lerp() {
+        assert_eq!(lerp(0.0, 10.0, 0.0), 0.0);
+        assert_eq!(lerp(0.0, 10.0, 1.0), 10.0);
+        assert_eq!(lerp(0.0, 10.0, 0.5), 5.0);
+        assert_eq!(lerp(2.0, 8.0, 0.25), 3.5);
+    }
+
+    #[test]
+    fn test_apply_curve() {
+        // Linear (exponent 1.0) should return input
+        assert!((apply_curve(0.5, 1.0) - 0.5).abs() < 1e-6);
+        // Quadratic (exponent 2.0) should square input
+        assert!((apply_curve(0.5, 2.0) - 0.25).abs() < 1e-6);
+        // Zero input should always be zero
+        assert_eq!(apply_curve(0.0, 2.0), 0.0);
+        // One input should always be one
+        assert!((apply_curve(1.0, 3.0) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_smooth_step() {
+        assert_eq!(smooth_step(0.0), 0.0);
+        assert!((smooth_step(1.0) - 1.0).abs() < 1e-6);
+        assert!((smooth_step(0.5) - 0.5).abs() < 1e-6);
+        // Should clamp out-of-range values
+        assert_eq!(smooth_step(-1.0), 0.0);
+        assert!((smooth_step(2.0) - 1.0).abs() < 1e-6);
+    }
+
+    // --- SpectralAnalyzer ---
+
+    #[test]
+    fn smoke_spectral_analyzer() {
+        let mut sa = SpectralAnalyzer::new(48000.0);
+        let silence = vec![0.0f32; FFT_SIZE * 2]; // stereo silence
+        let data = sa.analyze(&silence, 2);
+        for &e in &data.band_energies {
+            assert!(e >= 0.0, "band energy should be non-negative");
+            assert!(e < 0.01, "silence should produce near-zero energy");
+        }
+        assert!(data.spectral_flux >= 0.0);
+    }
+
+    #[test]
+    fn spectral_analyzer_detects_sine() {
+        let mut sa = SpectralAnalyzer::new(48000.0);
+        // Generate a 440 Hz sine wave (mono)
+        let samples: Vec<f32> = (0..FFT_SIZE)
+            .map(|i| (TAU * 440.0 * i as f32 / 48000.0).sin() * 0.5)
+            .collect();
+        let data = sa.analyze(&samples, 1);
+        // 440 Hz falls in the "Lo-Mid" band (250-500 Hz) or "Mid" band
+        // At least some bands should have significant energy
+        let total: f32 = data.band_energies.iter().sum();
+        assert!(total > 0.01, "sine wave should produce measurable energy");
+    }
+
+    #[test]
+    fn spectral_flux_spikes_on_change() {
+        let mut sa = SpectralAnalyzer::new(48000.0);
+        // First frame: silence
+        let silence = vec![0.0f32; FFT_SIZE];
+        let _ = sa.analyze(&silence, 1);
+        // Second frame: loud sine
+        let loud: Vec<f32> = (0..FFT_SIZE)
+            .map(|i| (TAU * 1000.0 * i as f32 / 48000.0).sin())
+            .collect();
+        let data = sa.analyze(&loud, 1);
+        assert!(data.spectral_flux > 0.0, "flux should spike on onset");
+    }
+
+    // --- Gate ---
+
+    #[test]
+    fn gate_closed_below_threshold() {
+        let mut gate = Gate::new();
+        let open = gate.process(0.1, 0.5, 0.0, 0.0);
+        assert!(!open, "gate should be closed when energy < threshold");
+    }
+
+    #[test]
+    fn gate_open_above_threshold() {
+        let mut gate = Gate::new();
+        let open = gate.process(0.8, 0.5, 0.0, 0.0);
+        assert!(open, "gate should be open when energy > threshold");
+    }
+
+    #[test]
+    fn gate_hysteresis_prevents_chatter() {
+        let mut gate = Gate::new();
+        // Open the gate
+        gate.process(0.6, 0.5, 0.0, 0.0);
+        // Energy drops slightly below threshold — should stay open due to hysteresis
+        let open = gate.process(0.48, 0.5, 0.0, 0.0);
+        assert!(open, "hysteresis should keep gate open just below threshold");
+        // Energy drops well below — should close
+        let open = gate.process(0.2, 0.5, 0.0, 0.0);
+        assert!(!open, "gate should close when energy drops significantly");
+    }
+
+    // --- EnvelopeProcessor ---
+
+    #[test]
+    fn smoke_envelope_processor() {
+        let mut env = EnvelopeProcessor::new();
+        assert_eq!(env.state, EnvelopeState::Idle);
+        // Trigger should transition to Attack (attack_ms >= 50 -> Attack state)
+        env.trigger(1.0, 100.0, 0.0, 100.0);
+        assert_eq!(env.state, EnvelopeState::Attack);
+    }
+
+    #[test]
+    fn envelope_short_attack_skips_to_decay() {
+        let mut env = EnvelopeProcessor::new();
+        // Short attack (< 50ms) should skip directly to Decay
+        env.trigger(1.0, 100.0, 0.0, 30.0);
+        assert_eq!(env.state, EnvelopeState::Decay);
+    }
+
+    // --- BeatDetector ---
+
+    #[test]
+    fn smoke_beat_detector() {
+        let mut bd = BeatDetector::new();
+        let (is_onset, strength) = bd.process(0.0, 0.0);
+        assert!(!is_onset);
+        assert_eq!(strength, 0.0);
+    }
+
+    #[test]
+    fn beat_detector_detects_spike() {
+        let mut bd = BeatDetector::new();
+        // Feed low flux for a while to establish baseline (with advancing time)
+        for i in 0..200 {
+            bd.process(0.01, i as f32 * 16.0); // ~16ms per frame
+        }
+        // Large spike well above adaptive threshold, with time past cooldown
+        let time = 200.0 * 16.0 + 100.0; // well past cooldown
+        let (is_onset, _) = bd.process(5.0, time);
+        assert!(is_onset, "beat detector should detect a large flux spike");
+    }
+
+    // --- ClimaxEngine ---
+
+    #[test]
+    fn climax_engine_passthrough_when_disabled() {
+        let mut ce = ClimaxEngine::new();
+        // process(input, energy, gate_open, is_onset, onset_strength, current_time_ms,
+        //         enabled, intensity, build_up_ms, tease_ratio, tease_drop, surge_boost,
+        //         pulse_depth, pattern)
+        let output = ce.process(
+            0.75, 0.5, true, false, 0.0, 0.0,
+            false, 0.5, 60000.0, 0.18, 0.3, 0.2, 0.15, ClimaxPattern::Wave,
+        );
+        assert!(
+            (output - 0.75).abs() < 0.01,
+            "disabled climax should pass through input, got {output}"
+        );
+    }
+
+    #[test]
+    fn climax_engine_bounded_output() {
+        let mut ce = ClimaxEngine::new();
+        for i in 0..1000 {
+            let time = i as f32 * 100.0;
+            let output = ce.process(
+                0.5, 0.5, true, false, 0.0, time,
+                true, 0.8, 60000.0, 0.18, 0.3, 0.2, 0.15, ClimaxPattern::Wave,
+            );
+            assert!(
+                output >= 0.0 && output <= 1.5,
+                "climax output should stay bounded, got {output}"
+            );
+        }
+    }
+
+    // --- SharedSpectralData ---
+
+    #[test]
+    fn shared_spectral_data_round_trip() {
+        let shared = SharedSpectralData::new();
+        let data = SpectralData {
+            band_energies: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
+            rms_power: 0.0,
+            spectral_centroid: 1500.0,
+            spectral_flux: 0.42,
+            dominant_frequency: 0.0,
+        };
+        shared.store(data.clone());
+        let loaded = shared.load();
+        assert_eq!(loaded.band_energies, data.band_energies);
+        assert_eq!(loaded.spectral_centroid, 1500.0);
+        assert_eq!(loaded.spectral_flux, 0.42);
+    }
+
+    // --- extract_energy modes ---
+
+    #[test]
+    fn extract_energy_full_mode() {
+        let data = SpectralData {
+            band_energies: [1.0; NUM_BANDS],
+            rms_power: 0.0,
+            spectral_centroid: 0.0,
+            spectral_flux: 0.0,
+            dominant_frequency: 0.0,
+        };
+        let energy = SpectralAnalyzer::extract_energy(&data, FrequencyMode::Full, 0.0);
+        assert!(energy > 0.0, "full mode should produce positive energy");
+        assert!((energy - 1.0).abs() < 0.01, "uniform bands should give ~1.0");
+    }
 }

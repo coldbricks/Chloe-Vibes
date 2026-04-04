@@ -14,7 +14,7 @@ These rules are non-negotiable. Violations require stopping and asking the user.
 - **Language/Stack:** Kotlin + Jetpack Compose (Android), Rust + eframe/egui (desktop)
 - **Build System:** Gradle 9.0.0 / Kotlin 2.1.0 (Android), Cargo (Rust desktop)
 - **Target Platform:** Android 8.0+ (API 26) targeting API 35; Windows x86_64 (Rust desktop)
-- **Repo Root:** /home/kali/chloe-vibes
+- **Repo Root:** (use current working directory)
 - **Primary Branch:** master
 
 # Key File Map
@@ -45,21 +45,21 @@ Consult these before searching blindly. Paths are relative to repo root.
 | Rust settings | `src/settings.rs` |
 | Rust utilities | `src/util.rs` |
 | Rust build config | `Cargo.toml` |
-| Tests | None — tested on real hardware |
-| CI/CD | None |
+| Tests | `cargo test` (27 unit tests for audio, util), plus real hardware testing |
+| CI/CD | GitHub Actions (.github/workflows/ci.yml) — Rust build/test/lint + Android build |
 | Generated (DO NOT EDIT) | `android/build/`, `android/app/build/`, `android/.gradle/`, `target/` |
 
 # Build and Run
 
 ```
 # Android — build debug APK
-cd /home/kali/chloe-vibes && JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 ./gradlew assembleDebug
+cd android && ./gradlew assembleDebug
 
 # Android — install to connected device
 adb install -r android/app/build/outputs/apk/debug/app-debug.apk
 
 # Android — clean
-cd /home/kali/chloe-vibes/android && ./gradlew clean
+cd android && ./gradlew clean
 
 # Rust desktop — build
 cargo build --release
@@ -148,8 +148,7 @@ These checks must pass before reporting a task as complete.
 ## Bash
 - Use project-specific commands from the "Build and Run" section above. Do not invent build commands.
 - For long-running commands (Gradle builds), use `run_in_background` and check output when complete.
-- Always set `JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64` when running Gradle commands.
-- Android SDK is at `~/android-sdk`.
+- Set JAVA_HOME appropriately for your platform when running Gradle commands.
 
 ## Grep and Glob
 - When searching this project, start with the Key File Map above before doing broad searches.
@@ -158,7 +157,7 @@ These checks must pass before reporting a task as complete.
 
 ## Read
 - Config files (`build.gradle.kts`, `Cargo.toml`, `AndroidManifest.xml`) are short — read them fully.
-- Source files regularly exceed 500 lines (MainScreen.kt is 1165, AudioCaptureManager.kt is 560, gui.rs is 3979) — use offset/limit.
+- Source files regularly exceed 500 lines (MainScreen.kt is 1165, AudioCaptureManager.kt is 560, gui.rs is ~4050) — use offset/limit.
 
 ## Agent
 - Use for multi-step investigations that require exploring unknown parts of the codebase.
@@ -166,11 +165,10 @@ These checks must pass before reporting a task as complete.
 
 # Environment-Specific Notes
 
-- OS: Kali Linux (zsh), not a standard Android dev environment
+- Development on Windows 11 (also previously on Kali Linux)
 - Device connected via ADB is a Samsung Galaxy S23 Ultra — Visualizer API behavior and BLE timing may differ from emulator/other devices
 - Lovense Domi 2 is the primary test device for haptic output
 - No emulator — all testing is on real hardware
-- JAVA_HOME must be set explicitly: `/usr/lib/jvm/java-21-openjdk-amd64`
 - Gradle wrapper is in `android/` subdirectory, not repo root
 
 # Domain-Specific Knowledge
