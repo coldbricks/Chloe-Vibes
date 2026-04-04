@@ -94,7 +94,7 @@ fn build_device_config_manager_builder(
 }
 
 async fn start_embedded_client(client_name: &str) -> Result<ButtplugClient, String> {
-    let mut dcm_builder = build_device_config_manager_builder(true);
+    let mut dcm_builder = build_device_config_manager_builder(false);
     let dcm = dcm_builder
         .finish()
         .map_err(|e| format!("DCM build failed: {e}"))?;
@@ -171,6 +171,18 @@ pub async fn start_bp_server(
     server_addr: Option<String>,
 ) -> Result<ButtplugClient, ButtplugClientError> {
     let name = "chloe-vibes";
+    // Validate server address scheme
+    let server_addr = server_addr.filter(|addr| {
+        if addr.starts_with("ws://") || addr.starts_with("wss://") {
+            if !addr.contains("127.0.0.1") && !addr.contains("localhost") && addr.starts_with("ws://") {
+                eprintln!("Warning: connecting to non-localhost server without TLS. Consider using wss://");
+            }
+            true
+        } else {
+            eprintln!("Invalid server address: must start with ws:// or wss://. Falling back to embedded server.");
+            false
+        }
+    });
     let client = if let Some(addr) = server_addr.as_deref() {
         match connect_remote(name, addr).await {
             Ok(client) => client,

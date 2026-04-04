@@ -970,6 +970,7 @@ impl GuiApp {
         let capture_status2 = capture_status.clone();
 
         let mut settings = ctx.storage.map(Settings::load).unwrap_or_default();
+        settings.sanitize();
         if settings.current_preset_name.eq_ignore_ascii_case("Default") {
             if let Some(preset) = presets::find_preset("Ride Intensity") {
                 settings.apply_preset(&preset);

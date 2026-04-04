@@ -196,6 +196,39 @@ impl Settings {
         self.output_gain = defaults::OUTPUT_GAIN;
         self.current_preset_name = preset.name.to_string();
     }
+
+    /// Clamp all numeric settings to valid ranges (guards against corrupted storage)
+    pub fn sanitize(&mut self) {
+        self.main_volume = self.main_volume.clamp(0.0, 5.0);
+        self.gate_threshold = self.gate_threshold.clamp(0.0, 1.0);
+        self.auto_gate_amount = self.auto_gate_amount.clamp(0.0, 1.0);
+        self.gate_smoothing = self.gate_smoothing.clamp(0.0, 1.0);
+        self.binary_level = self.binary_level.clamp(0.0, 1.0);
+        self.hybrid_blend = self.hybrid_blend.clamp(0.0, 1.0);
+        self.threshold_knee = self.threshold_knee.clamp(0.0, 1.0);
+        self.dynamic_curve = self.dynamic_curve.clamp(0.1, 5.0);
+        self.attack_ms = self.attack_ms.clamp(0.5, 5000.0);
+        self.decay_ms = self.decay_ms.clamp(0.5, 5000.0);
+        self.sustain_level = self.sustain_level.clamp(0.0, 1.0);
+        self.release_ms = self.release_ms.clamp(0.5, 5000.0);
+        self.attack_curve = self.attack_curve.clamp(0.1, 5.0);
+        self.decay_curve = self.decay_curve.clamp(0.1, 5.0);
+        self.release_curve = self.release_curve.clamp(0.1, 5.0);
+        self.min_vibe = self.min_vibe.clamp(0.0, 1.0);
+        self.max_vibe = self.max_vibe.clamp(0.0, 1.0);
+        self.output_gain = self.output_gain.clamp(0.0, 5.0);
+        self.input_rise_ms = self.input_rise_ms.clamp(1.0, 1000.0);
+        self.input_fall_ms = self.input_fall_ms.clamp(1.0, 1000.0);
+        self.output_slew_ms = self.output_slew_ms.clamp(0.0, 500.0);
+        self.trim_ms = self.trim_ms.clamp(-500.0, 500.0);
+        self.target_frequency = self.target_frequency.clamp(20.0, 20000.0);
+        self.climax_intensity = self.climax_intensity.clamp(0.0, 1.0);
+        self.climax_build_up_ms = self.climax_build_up_ms.clamp(10000.0, 600000.0);
+        self.climax_tease_ratio = self.climax_tease_ratio.clamp(0.0, 1.0);
+        self.climax_tease_drop = self.climax_tease_drop.clamp(0.0, 1.0);
+        self.climax_surge_boost = self.climax_surge_boost.clamp(0.0, 1.0);
+        self.climax_pulse_depth = self.climax_pulse_depth.clamp(0.0, 1.0);
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -23,6 +23,12 @@ fn main() {
         let log_dir = crash_log_path();
         let _ = std::fs::create_dir_all(&log_dir);
         let log_file = log_dir.join("crash.log");
+        // Rotate if crash log exceeds 1MB
+        if let Ok(meta) = std::fs::metadata(&log_file) {
+            if meta.len() > 1_000_000 {
+                let _ = std::fs::rename(&log_file, log_dir.join("crash.log.old"));
+            }
+        }
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())

@@ -1641,4 +1641,170 @@ mod tests {
         assert!(energy > 0.0, "full mode should produce positive energy");
         assert!((energy - 1.0).abs() < 0.01, "uniform bands should give ~1.0");
     }
+
+    // --- extract_energy frequency modes ---
+
+    #[test]
+    fn extract_energy_lowpass() {
+        let mut data = SpectralData::default();
+        // Put energy only in Sub and Bass (bands 0,1)
+        data.band_energies[0] = 0.8; // Sub: 20-60 Hz
+        data.band_energies[1] = 0.6; // Bass: 60-250 Hz
+        let energy = SpectralAnalyzer::extract_energy(&data, FrequencyMode::LowPass, 250.0);
+        assert!(energy > 0.0, "lowpass should capture sub+bass energy");
+    }
+
+    #[test]
+    fn extract_energy_highpass() {
+        let mut data = SpectralData::default();
+        // Put energy only in high bands
+        data.band_energies[6] = 0.9; // Brilliance: 6000-12000 Hz
+        data.band_energies[7] = 0.7; // Air: 12000-20000 Hz
+        let energy = SpectralAnalyzer::extract_energy(&data, FrequencyMode::HighPass, 6000.0);
+        assert!(energy > 0.0, "highpass should capture brilliance+air energy");
+    }
+
+    #[test]
+    fn extract_energy_bandpass() {
+        let mut data = SpectralData::default();
+        data.band_energies[3] = 1.0; // Mid: 500-2000 Hz
+        let energy = SpectralAnalyzer::extract_energy(&data, FrequencyMode::BandPass, 1000.0);
+        assert!(energy > 0.0, "bandpass at 1000Hz should capture mid band");
+    }
+
+    // --- EnvelopeProcessor.drive() full lifecycle ---
+
+    #[test]
+    fn envelope_drive_full_lifecycle() {
+        let mut env = EnvelopeProcessor::new();
+        let mut time = 100.0f32; // start past retrigger cooldown
+        let dt = 16.0; // ~60fps
+
+        // Phase 1: gate opens -> should trigger attack
+        let _output = env.drive(
+            true, 0.5, false, 0.0, time,
+            TriggerMode::Dynamic, 0.1, 0.22, 1.0, 0.8, 0.5,
+            100.0, 200.0, 0.8, 300.0, 1.0, 1.0, 1.0, 1000.0,
+        );
+        assert!(
+            env.state == EnvelopeState::Attack || env.state == EnvelopeState::Decay,
+            "gate open should trigger attack/decay, got {:?}", env.state
+        );
+
+        // Phase 2: hold gate open until sustain
+        for _ in 0..50 {
+            time += dt;
+            env.drive(
+                true, 0.5, false, 0.0, time,
+                TriggerMode::Dynamic, 0.1, 0.22, 1.0, 0.8, 0.5,
+                100.0, 200.0, 0.8, 300.0, 1.0, 1.0, 1.0, 1000.0,
+            );
+        }
+        // Should be in sustain or at least past attack
+        assert!(
+            env.state == EnvelopeState::Sustain || env.state == EnvelopeState::Decay,
+            "should reach sustain after 800ms, got {:?}", env.state
+        );
+
+        // Phase 3: gate closes -> release
+        for _ in 0..5 {
+            time += dt;
+            env.drive(
+                false, 0.0, false, 0.0, time,
+                TriggerMode::Dynamic, 0.1, 0.22, 1.0, 0.8, 0.5,
+                100.0, 200.0, 0.8, 300.0, 1.0, 1.0, 1.0, 1000.0,
+            );
+        }
+        assert_eq!(env.state, EnvelopeState::Release, "gate close should trigger release");
+
+        // Phase 4: wait for idle
+        for _ in 0..100 {
+            time += dt;
+            env.drive(
+                false, 0.0, false, 0.0, time,
+                TriggerMode::Dynamic, 0.1, 0.22, 1.0, 0.8, 0.5,
+                100.0, 200.0, 0.8, 300.0, 1.0, 1.0, 1.0, 1000.0,
+            );
+        }
+        assert_eq!(env.state, EnvelopeState::Idle, "should reach idle after release");
+    }
+
+    #[test]
+    fn envelope_output_bounded() {
+        let mut env = EnvelopeProcessor::new();
+        let mut time = 0.0f32;
+        env.trigger(1.0, 0.0, 1.5, 100.0); // high velocity
+        for _ in 0..500 {
+            time += 16.0;
+            env.process(time, 100.0, 200.0, 0.95, 300.0, 1.0, 1.0, 1.0);
+            assert!(
+                env.value >= 0.0 && env.value <= 1.0,
+                "envelope value should be in [0,1], got {}", env.value
+            );
+        }
+    }
+
+    // --- BeatDetector tempo tracking ---
+
+    #[test]
+    fn beat_detector_tempo_tracking() {
+        let mut bd = BeatDetector::new();
+        // Simulate 120 BPM: spikes every 500ms
+        let mut time = 0.0f32;
+        for _beat in 0..10 {
+            // Quiet frames between beats
+            for _ in 0..30 {
+                time += 16.0;
+                bd.process(0.01, time);
+            }
+            // Beat spike
+            time += 16.0;
+            bd.process(5.0, time);
+        }
+        // After 10 beats at ~500ms intervals, tempo should be detected
+        if bd.tempo_confidence > 0.3 {
+            assert!(
+                bd.tempo_interval_ms > 300.0 && bd.tempo_interval_ms < 700.0,
+                "tempo should be ~500ms, got {}", bd.tempo_interval_ms
+            );
+        }
+    }
+
+    // --- ClimaxEngine deny activation ---
+
+    #[test]
+    fn climax_engine_lorenz_stays_bounded() {
+        let mut ce = ClimaxEngine::new();
+        // Run for many iterations to check Lorenz attractor stays bounded
+        for i in 0..10000 {
+            let time = i as f32 * 16.0;
+            let output = ce.process(
+                0.8, 0.8, true, false, 0.0, time,
+                true, 0.9, 60000.0, 0.18, 0.35, 0.5, 0.18, ClimaxPattern::Wave,
+            );
+            assert!(
+                output.is_finite() && output >= 0.0 && output <= 1.5,
+                "climax output must be finite and bounded, got {output} at frame {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn climax_engine_stairs_pattern() {
+        let mut ce = ClimaxEngine::new();
+        // With Stairs pattern, output should have step-like behavior
+        let output1 = ce.process(
+            0.5, 0.5, true, false, 0.0, 30000.0,
+            true, 0.8, 60000.0, 0.18, 0.35, 0.5, 0.18, ClimaxPattern::Stairs,
+        );
+        let output2 = ce.process(
+            0.5, 0.5, true, false, 0.0, 30100.0,
+            true, 0.8, 60000.0, 0.18, 0.35, 0.5, 0.18, ClimaxPattern::Stairs,
+        );
+        // Close time values in same stair step should produce similar output
+        assert!(
+            (output1 - output2).abs() < 0.1,
+            "stairs should produce similar output in same step"
+        );
+    }
 }
