@@ -126,7 +126,7 @@ class AudioCaptureManager(private val context: Context) {
     private var hasFreshSamples = false
     @Volatile private var lastSampleTimeMs = 0L
 
-    // Visualizer FFT magnitude data (0.0-1.0 per bin, already dB-normalized)
+    // Visualizer FFT magnitude data (linear, 0.0-1.0 per bin, Rust-parity)
     private var capturedMagnitudes = FloatArray(0)
     private var hasFreshMagnitudes = false
     @Volatile private var useVisualizerFft = false
@@ -252,9 +252,11 @@ class AudioCaptureManager(private val context: Context) {
             gateThreshold = preset.gateThreshold,
             autoGateAmount = preset.autoGateAmount,
             gateSmoothing = preset.gateSmoothing,
+            thresholdKnee = preset.thresholdKnee,
             triggerMode = preset.triggerMode,
             binaryLevel = preset.binaryLevel,
             hybridBlend = preset.hybridBlend,
+            dynamicCurve = preset.dynamicCurve,
             attackMs = preset.attackMs,
             decayMs = preset.decayMs,
             sustainLevel = preset.sustainLevel,
@@ -362,18 +364,18 @@ class AudioCaptureManager(private val context: Context) {
                         // the original HTML ChloeVibes used.
                         val numBins = fft.size / 2
                         val mags = FloatArray(numBins)
-                        // minDb/maxDb matching the HTML version's AnalyserNode
-                        val minDb = -80f
-                        val maxDb = -10f
-                        val dbRange = maxDb - minDb
-
+                        // Linear magnitudes (no dB conversion). Matches Rust
+                        // SpectralAnalyzer's linear FFT output so band energies
+                        // have the same tonal balance on both platforms.
+                        // Raw Visualizer bytes are in ~[-128,127], so sqrt(re^2+im^2)
+                        // peaks around 181; normalize by captureSize/2 (matches
+                        // Rust's 2.0/FFT_SIZE convention) and clamp.
+                        val linearScale = 2f / numBins.toFloat()
                         for (i in 0 until numBins) {
                             val re = fft[2 * i].toFloat()
                             val im = fft[2 * i + 1].toFloat()
-                            val mag = kotlin.math.sqrt(re * re + im * im)
-                            // Convert to dB, then normalize to 0-1 like Web Audio
-                            val db = if (mag > 0f) 20f * kotlin.math.log10(mag / 128f) else minDb
-                            mags[i] = ((db - minDb) / dbRange).coerceIn(0f, 1f)
+                            val mag = kotlin.math.sqrt(re * re + im * im) * linearScale
+                            mags[i] = mag.coerceIn(0f, 1f)
                         }
                         synchronized(sampleLock) {
                             capturedMagnitudes = mags
@@ -623,6 +625,13 @@ class AudioCaptureManager(private val context: Context) {
                         isOnset = true
                     }
                 }
+            }
+
+            // Rust-parity onset pre-gate (gui.rs:1408-1410): reject weak
+            // or low-energy "onsets" before they reach the envelope, so
+            // rhythm rider presets don't retrigger on background texture.
+            if (isOnset && (onsetStrength <= 1.02f || energy <= params.gateThreshold * 0.40f)) {
+                isOnset = false
             }
 
             // Step 5: Envelope

@@ -185,9 +185,11 @@ class MainActivity : ComponentActivity() {
             gateThreshold = uiState.gateThreshold
             autoGateAmount = uiState.autoGateAmount
             gateSmoothing = uiState.gateSmoothing
+            thresholdKnee = uiState.thresholdKnee
             triggerMode = uiState.triggerMode
             binaryLevel = uiState.binaryLevel
             hybridBlend = uiState.hybridBlend
+            dynamicCurve = uiState.dynamicCurve
             attackMs = uiState.attackMs
             decayMs = uiState.decayMs
             sustainLevel = uiState.sustainLevel

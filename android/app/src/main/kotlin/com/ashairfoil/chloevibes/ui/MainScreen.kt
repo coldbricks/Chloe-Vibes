@@ -109,11 +109,13 @@ class MainScreenState {
     var gateThreshold by mutableFloatStateOf(0.07f)
     var autoGateAmount by mutableFloatStateOf(0f)
     var gateSmoothing by mutableFloatStateOf(0.22f)
+    var thresholdKnee by mutableFloatStateOf(0.22f)
 
     // Trigger
     var triggerMode by mutableStateOf(TriggerMode.Dynamic)
     var binaryLevel by mutableFloatStateOf(0.8f)
     var hybridBlend by mutableFloatStateOf(0.5f)
+    var dynamicCurve by mutableFloatStateOf(1f)
 
     // ADSR
     var attackMs by mutableFloatStateOf(30f)
@@ -159,9 +161,11 @@ class MainScreenState {
         gateThreshold = preset.gateThreshold
         autoGateAmount = preset.autoGateAmount
         gateSmoothing = preset.gateSmoothing
+        thresholdKnee = preset.thresholdKnee
         triggerMode = preset.triggerMode
         binaryLevel = preset.binaryLevel
         hybridBlend = preset.hybridBlend
+        dynamicCurve = preset.dynamicCurve
         attackMs = preset.attackMs
         decayMs = preset.decayMs
         sustainLevel = preset.sustainLevel
@@ -298,6 +302,9 @@ fun MainScreen(
         LabeledSlider("Smooth", state.gateSmoothing, 0f, 1f, "%.2f") {
             state.gateSmoothing = it; state.selectedPresetName = "Custom"; onParameterChanged()
         }
+        LabeledSlider("Knee", state.thresholdKnee, 0f, 0.35f, "%.2f") {
+            state.thresholdKnee = it; state.selectedPresetName = "Custom"; onParameterChanged()
+        }
 
         Spacer(modifier = Modifier.height(16.dp))
 
@@ -305,6 +312,9 @@ fun MainScreen(
         SectionHeader("TRIGGER")
         TriggerModeSelector(state.triggerMode) {
             state.triggerMode = it; state.selectedPresetName = "Custom"; onParameterChanged()
+        }
+        LabeledSlider("Dynamic Curve", state.dynamicCurve, 0.4f, 2.4f, "%.2f") {
+            state.dynamicCurve = it; state.selectedPresetName = "Custom"; onParameterChanged()
         }
         if (state.triggerMode == TriggerMode.Binary || state.triggerMode == TriggerMode.Hybrid) {
             LabeledSlider("Binary Level", state.binaryLevel, 0f, 1f, "%.2f") {
