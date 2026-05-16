@@ -4,8 +4,8 @@
 
     <!-- Bluetooth LE for device control -->
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
-    <uses-permission android:name="android.permission.BLUETOOTH_SCAN"
-        android:usesPermissionFlags="neverForLocation"
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_SCAN"
         tools:targetApi="s" />
 
     <!-- Pre-Android 12: BLE scanning requires location permission -->
