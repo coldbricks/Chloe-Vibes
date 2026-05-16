@@ -5,6 +5,9 @@ on:
     branches: [ master ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build-android-debug-apk:
     runs-on: ubuntu-latest
@@ -41,9 +44,6 @@ jobs:
 '''
 
           new = '''            val device = result.device
-            // Some Lovense models advertise without a local name in early or
-            // filtered scan packets. Keep them visible instead of silently
-            // discarding them so Hush 2 can still be selected and connected.
             val advertisedName = result.scanRecord?.deviceName
                 ?: device.name
                 ?: discoveredDevices[device.address]?.name
@@ -59,7 +59,7 @@ jobs:
 '''
 
           if old not in text:
-              raise SystemExit('Expected BLE scan block not found. Source changed; refusing to build unpatched APK.')
+              raise SystemExit('Expected BLE scan block not found')
 
           path.write_text(text.replace(old, new))
 
@@ -69,9 +69,27 @@ jobs:
           chmod +x ./gradlew
           ./gradlew assembleDebug
 
+      - name: Prepare APK file
+        run: |
+          mkdir -p dist
+          cp android/app/build/outputs/apk/debug/app-debug.apk dist/ChloeVibes-latest-debug.apk
+
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ChloeVibes-debug-apk-hush2-scan-fix
-          path: android/app/build/outputs/apk/debug/app-debug.apk
+          name: ChloeVibes-latest-debug-apk
+          path: dist/ChloeVibes-latest-debug.apk
           if-no-files-found: error
+
+      - name: Publish release asset
+        uses: ncipollo/release-action@v1
+        with:
+          tag: android-latest
+          name: ChloeVibes Android Latest
+          body: Latest Android debug APK built from master.
+          artifacts: dist/ChloeVibes-latest-debug.apk
+          artifactErrorsFailBuild: true
+          allowUpdates: true
+          removeArtifacts: true
+          replacesArtifacts: true
+          makeLatest: true
