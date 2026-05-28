@@ -22,6 +22,8 @@ import android.media.audiofx.Visualizer
 import android.util.Log
 import androidx.core.content.ContextCompat
 import java.util.concurrent.atomic.AtomicReference
+import kotlin.math.exp
+import kotlin.math.pow
 
 // ---------------------------------------------------------------------------
 // Audio source mode
@@ -33,6 +35,9 @@ enum class AudioSourceMode {
     /** Microphone input via AudioRecord. */
     Microphone
 }
+
+private const val OUTPUT_RISE_MS = 4f
+private const val OUTPUT_FALL_MS = 18f
 
 // ---------------------------------------------------------------------------
 // Processing state -- holds all live signal chain state
@@ -135,8 +140,9 @@ class AudioCaptureManager(private val context: Context) {
     // Silence / stall detection for Visualizer fallback
     @Volatile private var silentFrameCount = 0
     private companion object {
-        const val SILENT_FRAMES_BEFORE_FALLBACK = 90
+        const val SILENT_FRAMES_BEFORE_FALLBACK = 240
         const val STALL_TIMEOUT_MS = 3000L
+        const val VISUALIZER_FRAME_HOLD_MS = 120L
         const val TARGET_FRAME_MS = 16L
     }
 
@@ -239,6 +245,8 @@ class AudioCaptureManager(private val context: Context) {
     /** Dual-motor callback: (motor1, motor2) for devices with independent motors. */
     var onDualOutputUpdate: ((Float, Float) -> Unit)? = null
     @Volatile private var lastSentOutput: Float = 0f
+    private var outputLevel: Float = 0f
+    private var outputLevel2: Float = 0f
 
     /** Called when Visualizer produces silence and we auto-fallback to mic. */
     var onFallbackToMic: (() -> Unit)? = null
@@ -469,10 +477,14 @@ class AudioCaptureManager(private val context: Context) {
         val startMs = System.nanoTime() / 1_000_000f
         lastSampleTimeMs = System.currentTimeMillis()
         var consecutiveErrors = 0
+        var lastFrameNs = System.nanoTime()
 
         while (running) {
           try {
             val frameStartNs = System.nanoTime()
+            val deltaTimeS = ((frameStartNs - lastFrameNs).toFloat() / 1_000_000_000f)
+                .coerceIn(0.001f, 0.1f)
+            lastFrameNs = frameStartNs
             val currentTimeMs = System.nanoTime() / 1_000_000f - startMs
 
             // Read all parameters once per frame for a consistent snapshot
@@ -485,27 +497,45 @@ class AudioCaptureManager(private val context: Context) {
                 // ---- Visualizer FFT path ----
                 // Use pre-computed magnitude data (dB-normalized to 0-1),
                 // matching the Web Audio AnalyserNode used by the HTML version.
-                val mags: FloatArray
+                var mags = FloatArray(0)
+                var hadFreshMagnitudeFrame = false
+                val nowWallMs = System.currentTimeMillis()
                 synchronized(sampleLock) {
-                    if (!hasFreshMagnitudes) {
-                        mags = FloatArray(0)
-                    } else {
+                    if (hasFreshMagnitudes) {
                         mags = capturedMagnitudes.copyOf()
                         hasFreshMagnitudes = false
+                        hadFreshMagnitudeFrame = true
+                    } else if (capturedMagnitudes.isNotEmpty() &&
+                        nowWallMs - lastSampleTimeMs <= VISUALIZER_FRAME_HOLD_MS
+                    ) {
+                        // Visualizer callbacks are often slower than the 60Hz
+                        // haptic loop. Re-use the most recent FFT briefly
+                        // instead of injecting zero frames between callbacks.
+                        mags = capturedMagnitudes.copyOf()
                     }
                 }
 
                 // Stall detection for Visualizer
                 if (sourceMode == AudioSourceMode.SystemAudio) {
                     val stalled = visualizer != null &&
-                        (System.currentTimeMillis() - lastSampleTimeMs) > STALL_TIMEOUT_MS
-                    val isSilent = mags.isEmpty() || mags.all { it < 0.001f }
-                    if (isSilent) silentFrameCount++ else silentFrameCount = 0
+                        (nowWallMs - lastSampleTimeMs) > STALL_TIMEOUT_MS
+                    val isSilent = hadFreshMagnitudeFrame &&
+                            mags.isNotEmpty() &&
+                            mags.all { it < 0.001f }
+                    if (isSilent) {
+                        silentFrameCount++
+                    } else if (hadFreshMagnitudeFrame) {
+                        silentFrameCount = 0
+                    }
                     if (stalled || silentFrameCount >= SILENT_FRAMES_BEFORE_FALLBACK) {
                         silentFrameCount = 0
                         try { visualizer?.apply { enabled = false; release() } } catch (_: Exception) {}
                         visualizer = null
                         useVisualizerFft = false
+                        synchronized(sampleLock) {
+                            capturedMagnitudes = FloatArray(0)
+                            hasFreshMagnitudes = false
+                        }
                         val restarted = startVisualizer()
                         if (restarted) {
                             visualizerRestartFailures = 0
@@ -568,9 +598,10 @@ class AudioCaptureManager(private val context: Context) {
                         dominantFrequency = 0f
                     )
 
-                    // Extract raw energy (pre-volume) for gate, boosted for envelope
-                    val rawEnergy = SpectralAnalyzer.extractEnergy(spectralData, params.frequencyMode, params.targetFrequency)
-                    energy = rawEnergy * params.mainVolume
+                    // Match the Rust desktop GUI path: normalize capture energy
+                    // before volume so the gate slider has a wider useful range.
+                    val captureEnergy = SpectralAnalyzer.extractEnergy(spectralData, params.frequencyMode, params.targetFrequency)
+                    energy = normalizeCaptureEnergy(captureEnergy) * params.mainVolume
                 }
             } else {
                 // ---- Raw sample path (mic or fallback) ----
@@ -588,8 +619,8 @@ class AudioCaptureManager(private val context: Context) {
                     }
                 }
                 spectralData = state.analyzer.analyze(samples, 1)
-                val rawEnergy = SpectralAnalyzer.extractEnergy(spectralData, params.frequencyMode, params.targetFrequency)
-                energy = rawEnergy * params.mainVolume
+                val captureEnergy = SpectralAnalyzer.extractEnergy(spectralData, params.frequencyMode, params.targetFrequency)
+                energy = normalizeCaptureEnergy(captureEnergy) * params.mainVolume
             }
 
             // Raw energy (0-1 normalized, no volume) for the gate so the
@@ -603,6 +634,9 @@ class AudioCaptureManager(private val context: Context) {
             // Step 3: Gate (uses raw energy so threshold isn't defeated by volume)
             val gateOpen = state.gate.process(
                 rawEnergy, params.gateThreshold, params.autoGateAmount, params.gateSmoothing
+            )
+            val effectiveThreshold = state.gate.effectiveThreshold(
+                params.gateThreshold, params.autoGateAmount
             )
             state.lastGateOpen = gateOpen
 
@@ -642,7 +676,7 @@ class AudioCaptureManager(private val context: Context) {
                 onsetStrength = onsetStrength,
                 currentTimeMs = currentTimeMs,
                 triggerMode = params.triggerMode,
-                threshold = params.gateThreshold,
+                threshold = effectiveThreshold,
                 thresholdKnee = params.thresholdKnee,
                 dynamicCurve = params.dynamicCurve,
                 binaryLevel = params.binaryLevel,
@@ -683,7 +717,16 @@ class AudioCaptureManager(private val context: Context) {
             } else {
                 0f
             }
-            val finalOutput = (mapped * params.outputGain).coerceIn(0f, 1f)
+            val targetOutput = (mapped * params.outputGain).coerceIn(0f, 1f)
+            val isSilent = energy < 0.005f &&
+                    !gateOpen &&
+                    state.envelope.state == EnvelopeState.Idle
+            outputLevel = if (isSilent || targetOutput <= 0.001f) {
+                0f
+            } else {
+                smoothOutput(outputLevel, targetOutput, deltaTimeS)
+            }
+            val finalOutput = outputLevel.coerceIn(0f, 1f)
             state.lastFinalOutput = finalOutput
 
             // Notify listener -- skip redundant Vibrate:0 commands so the BLE
@@ -695,14 +738,21 @@ class AudioCaptureManager(private val context: Context) {
                 val dualCb = onDualOutputUpdate
                 if (dualCb != null && params.climaxEnabled) {
                     val motor2Raw = state.climaxEngine.motor2Output
-                    val motor2Mapped = if (motor2Raw > 0.001f) {
+                    val motor2Mapped = if (!isSilent && motor2Raw > 0.001f) {
                         params.minVibe + (params.maxVibe - params.minVibe) * motor2Raw
                     } else {
                         0f
                     }
-                    val motor2Final = (motor2Mapped * params.outputGain).coerceIn(0f, 1f)
+                    val motor2Target = (motor2Mapped * params.outputGain).coerceIn(0f, 1f)
+                    outputLevel2 = if (isSilent || motor2Target <= 0.001f) {
+                        0f
+                    } else {
+                        smoothOutput(outputLevel2, motor2Target, deltaTimeS)
+                    }
+                    val motor2Final = outputLevel2.coerceIn(0f, 1f)
                     dualCb.invoke(finalOutput, motor2Final)
                 } else {
+                    outputLevel2 = finalOutput
                     onOutputUpdate?.invoke(finalOutput)
                 }
                 lastSentOutput = finalOutput
@@ -733,4 +783,24 @@ class AudioCaptureManager(private val context: Context) {
           }
         }
     }
+}
+
+private fun sanitizeUnit(value: Float): Float =
+    if (value.isFinite()) value.coerceIn(0f, 1f) else 0f
+
+private fun normalizeCaptureEnergy(value: Float): Float {
+    val boosted = sanitizeUnit(value * 6f)
+    return sanitizeUnit(boosted.toDouble().pow(0.65).toFloat())
+}
+
+private fun smoothingAlpha(deltaTimeS: Float, timeMs: Float): Float {
+    if (timeMs <= 1f) return 1f
+    val tau = (timeMs / 1000f).coerceAtLeast(0.001f)
+    return (1f - exp(-deltaTimeS / tau)).coerceIn(0f, 1f)
+}
+
+private fun smoothOutput(current: Float, target: Float, deltaTimeS: Float): Float {
+    val timeMs = if (target >= current) OUTPUT_RISE_MS else OUTPUT_FALL_MS
+    val alpha = smoothingAlpha(deltaTimeS, timeMs)
+    return (current + (target - current) * alpha).coerceIn(0f, 1f)
 }

@@ -1,10 +1,10 @@
 <p align="center">
-  <img src="assets/logo.png" alt="ChloeVibes" width="420" />
+  <img src="assets/readme-hero.svg" alt="ChloeVibes neon Memphis audio-reactive haptics banner" width="920" />
 </p>
 
 <p align="center">
   <strong>A synthesizer for your body.</strong><br>
-  Audio-reactive haptic engine that turns music into physical sensation.
+  Audio-reactive haptics with bass-lock pulses, ADSR shaping, and Bluetooth device output.
 </p>
 
 <p align="center">
@@ -14,7 +14,12 @@
 </p>
 
 <p align="center">
-  <em>FFT spectral analysis &rarr; ADSR envelope shaping &rarr; psychophysiologically-tuned modulation &rarr; Bluetooth haptic output</em>
+  <em>FFT spectral analysis -> ADSR envelope shaping -> climax modulation -> Bluetooth haptic output</em>
+</p>
+
+<p align="center">
+  <strong>Brand mood:</strong>
+  neon Memphis revival, sticker-bomb chaos, bubble lettering, candy colors, bass-house heat.
 </p>
 
 ---

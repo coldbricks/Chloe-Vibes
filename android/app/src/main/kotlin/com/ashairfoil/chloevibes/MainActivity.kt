@@ -134,6 +134,7 @@ class MainActivity : ComponentActivity() {
         super.onDestroy()
         handler.removeCallbacks(uiUpdateRunnable)
         audioCaptureManager.stop()
+        bleDeviceManager.stopMotors()
         bleDeviceManager.disconnect()
     }
 
@@ -169,6 +170,7 @@ class MainActivity : ComponentActivity() {
 
     private fun stopCapture() {
         audioCaptureManager.stop()
+        bleDeviceManager.stopMotors()
         uiState.isCapturing = false
         uiState.currentOutput = 0f
         uiState.gateOpen = false

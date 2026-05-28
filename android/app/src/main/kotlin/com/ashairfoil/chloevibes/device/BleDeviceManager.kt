@@ -75,10 +75,11 @@ class BleDeviceManager(private val context: Context) {
     private var pendingCommand: String? = null
     private val writeLock = Object()
     private var lastWriteMs: Long = 0
-    private val minWriteIntervalMs = 38L  // ~26Hz command rate
-    private val writeTimeoutMs = 160L
+    private val minWriteIntervalMs = 30L  // ~33Hz command rate
+    private val writeTimeoutMs = 120L
     private var pendingDrainScheduled = false
     private var writeWatchdogScheduled = false
+    private val peakHoldMs = 55L
 
     // Output dithering -- temporal sub-step resolution.
     // Lovense has 21 intensity levels (0-20). By dithering between adjacent
@@ -89,6 +90,15 @@ class BleDeviceManager(private val context: Context) {
     @Volatile private var ditherErrorMain: Float = 0f
     @Volatile private var ditherErrorMotor1: Float = 0f
     @Volatile private var ditherErrorMotor2: Float = 0f
+    @Volatile private var heldMainLevel: Int = 0
+    @Volatile private var heldMotor1Level: Int = 0
+    @Volatile private var heldMotor2Level: Int = 0
+    @Volatile private var heldMainUntilMs: Long = 0L
+    @Volatile private var heldMotor1UntilMs: Long = 0L
+    @Volatile private var heldMotor2UntilMs: Long = 0L
+    @Volatile private var lastRequestedMainLevel: Int = -1
+    @Volatile private var lastRequestedMotor1Level: Int = -1
+    @Volatile private var lastRequestedMotor2Level: Int = -1
 
     // Scan results
     private val discoveredDevices = mutableMapOf<String, BleDeviceInfo>()
@@ -254,6 +264,7 @@ class BleDeviceManager(private val context: Context) {
                     }
                     handler.post { onConnectionStateChanged?.invoke(connectionState) }
                     try { gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH) } catch (_: Exception) { }
+                    try { gatt.requestMtu(185) } catch (_: Exception) { }
                     gatt.discoverServices()
                 }
                 BluetoothGatt.STATE_DISCONNECTED -> {
@@ -484,6 +495,15 @@ class BleDeviceManager(private val context: Context) {
         ditherErrorMain = 0f
         ditherErrorMotor1 = 0f
         ditherErrorMotor2 = 0f
+        heldMainLevel = 0
+        heldMotor1Level = 0
+        heldMotor2Level = 0
+        heldMainUntilMs = 0L
+        heldMotor1UntilMs = 0L
+        heldMotor2UntilMs = 0L
+        lastRequestedMainLevel = -1
+        lastRequestedMotor1Level = -1
+        lastRequestedMotor2Level = -1
     }
 
     /** Whether connected device supports dual motors (Domi 2, Nora, etc). */
@@ -497,11 +517,14 @@ class BleDeviceManager(private val context: Context) {
      */
     fun setIntensity(level: Float) {
         if (connectionState != ConnectionState.Ready) return
-        val continuous = level * 20f
+        val continuous = level.coerceIn(0f, 1f) * 20f
         val withError = continuous + ditherErrorMain
         val quantized = withError.roundToInt().coerceIn(0, 20)
         ditherErrorMain = withError - quantized.toFloat()
-        sendCommand(LovenseProtocol.vibrate(quantized))
+        val held = holdMainPeak(quantized)
+        if (held == lastRequestedMainLevel) return
+        lastRequestedMainLevel = held
+        sendCommand(LovenseProtocol.vibrate(held))
     }
 
     /**
@@ -516,20 +539,77 @@ class BleDeviceManager(private val context: Context) {
     fun setDualIntensity(motor1: Float, motor2: Float) {
         if (connectionState != ConnectionState.Ready) return
         if (isDualMotor) {
-            val cont1 = motor1 * 20f
+            val cont1 = motor1.coerceIn(0f, 1f) * 20f
             val with1 = cont1 + ditherErrorMotor1
             val q1 = with1.roundToInt().coerceIn(0, 20)
             ditherErrorMotor1 = with1 - q1.toFloat()
 
-            val cont2 = motor2 * 20f
+            val cont2 = motor2.coerceIn(0f, 1f) * 20f
             val with2 = cont2 + ditherErrorMotor2
             val q2 = with2.roundToInt().coerceIn(0, 20)
             ditherErrorMotor2 = with2 - q2.toFloat()
 
-            sendCommand(LovenseProtocol.vibrate2(q1, q2))
+            val held1 = holdMotor1Peak(q1)
+            val held2 = holdMotor2Peak(q2)
+            if (held1 == lastRequestedMotor1Level && held2 == lastRequestedMotor2Level) return
+            lastRequestedMotor1Level = held1
+            lastRequestedMotor2Level = held2
+            sendCommand(LovenseProtocol.vibrate2(held1, held2))
         } else {
             setIntensity(motor1)
         }
+    }
+
+    /** Stop all motors immediately, bypassing peak hold and duplicate suppression. */
+    fun stopMotors() {
+        ditherErrorMain = 0f
+        ditherErrorMotor1 = 0f
+        ditherErrorMotor2 = 0f
+        heldMainLevel = 0
+        heldMotor1Level = 0
+        heldMotor2Level = 0
+        heldMainUntilMs = 0L
+        heldMotor1UntilMs = 0L
+        heldMotor2UntilMs = 0L
+        lastRequestedMainLevel = -1
+        lastRequestedMotor1Level = -1
+        lastRequestedMotor2Level = -1
+        if (connectionState == ConnectionState.Ready) {
+            sendCommand(LovenseProtocol.stop())
+        }
+    }
+
+    private fun holdMainPeak(level: Int): Int {
+        val now = System.currentTimeMillis()
+        if (level > heldMainLevel) {
+            heldMainLevel = level
+            heldMainUntilMs = now + peakHoldMs
+        } else if (now > heldMainUntilMs) {
+            heldMainLevel = level
+        }
+        return if (now <= heldMainUntilMs) heldMainLevel.coerceAtLeast(level) else level
+    }
+
+    private fun holdMotor1Peak(level: Int): Int {
+        val now = System.currentTimeMillis()
+        if (level > heldMotor1Level) {
+            heldMotor1Level = level
+            heldMotor1UntilMs = now + peakHoldMs
+        } else if (now > heldMotor1UntilMs) {
+            heldMotor1Level = level
+        }
+        return if (now <= heldMotor1UntilMs) heldMotor1Level.coerceAtLeast(level) else level
+    }
+
+    private fun holdMotor2Peak(level: Int): Int {
+        val now = System.currentTimeMillis()
+        if (level > heldMotor2Level) {
+            heldMotor2Level = level
+            heldMotor2UntilMs = now + peakHoldMs
+        } else if (now > heldMotor2UntilMs) {
+            heldMotor2Level = level
+        }
+        return if (now <= heldMotor2UntilMs) heldMotor2Level.coerceAtLeast(level) else level
     }
 
     /** Request battery level update. */

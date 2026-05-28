@@ -1,0 +1,93 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="420" viewBox="0 0 1200 420" role="img" aria-labelledby="title desc">
+  <title id="title">ChloeVibes neon Memphis hero banner</title>
+  <desc id="desc">A bright sticker-collage style banner for ChloeVibes with bubble lettering, bass-wave graphics, stars, zigzags, and neon shapes.</desc>
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f8f2ff"/>
+      <stop offset="0.34" stop-color="#cffff7"/>
+      <stop offset="0.68" stop-color="#fff06a"/>
+      <stop offset="1" stop-color="#ff9ed9"/>
+    </linearGradient>
+    <linearGradient id="logoFill" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ff2ea6"/>
+      <stop offset="0.45" stop-color="#ff6a00"/>
+      <stop offset="0.74" stop-color="#f8ff26"/>
+      <stop offset="1" stop-color="#20f6ff"/>
+    </linearGradient>
+    <linearGradient id="tealPink" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#00f0ff"/>
+      <stop offset="0.5" stop-color="#72ff00"/>
+      <stop offset="1" stop-color="#ff3cbf"/>
+    </linearGradient>
+    <pattern id="zebra" width="34" height="34" patternUnits="userSpaceOnUse" patternTransform="rotate(-18)">
+      <rect width="34" height="34" fill="#ffffff"/>
+      <path d="M-6 8 C8 0 20 0 40 8 M-8 23 C8 16 22 16 42 23 M-8 36 C8 31 22 31 42 36" fill="none" stroke="#1c1b22" stroke-width="8" stroke-linecap="round"/>
+    </pattern>
+    <pattern id="dots" width="28" height="28" patternUnits="userSpaceOnUse">
+      <rect width="28" height="28" fill="#24f0ff"/>
+      <circle cx="7" cy="7" r="4" fill="#ff39b8"/>
+      <circle cx="21" cy="21" r="4" fill="#fff240"/>
+    </pattern>
+    <filter id="popShadow" x="-10%" y="-20%" width="120%" height="150%">
+      <feDropShadow dx="8" dy="8" stdDeviation="0" flood-color="#1c1b22" flood-opacity="1"/>
+      <feDropShadow dx="0" dy="0" stdDeviation="7" flood-color="#ffffff" flood-opacity="0.8"/>
+    </filter>
+  </defs>
+
+  <rect width="1200" height="420" rx="34" fill="#15151d"/>
+  <rect x="18" y="18" width="1164" height="384" rx="28" fill="url(#sky)"/>
+
+  <g opacity="0.95">
+    <path d="M0 313 C120 265 207 330 322 283 C455 229 535 330 658 281 C786 230 876 318 1012 270 C1082 246 1145 252 1200 274 L1200 420 L0 420 Z" fill="#ff3cbf"/>
+    <path d="M0 342 C118 305 216 358 331 323 C466 282 536 360 669 318 C805 274 876 351 1014 307 C1096 281 1158 292 1200 310 L1200 420 L0 420 Z" fill="#20f6ff"/>
+    <path d="M0 374 C126 348 225 389 346 358 C489 321 565 391 694 357 C822 324 901 382 1029 350 C1108 329 1162 335 1200 356 L1200 420 L0 420 Z" fill="#fff240"/>
+  </g>
+
+  <g opacity="0.95">
+    <rect x="44" y="48" width="154" height="112" rx="22" fill="url(#zebra)" stroke="#1c1b22" stroke-width="8"/>
+    <rect x="980" y="44" width="156" height="112" rx="20" fill="url(#dots)" stroke="#1c1b22" stroke-width="8"/>
+    <path d="M225 53 L268 92 L319 72 L294 123 L340 155 L282 153 L262 207 L241 151 L181 152 L229 121 Z" fill="#72ff00" stroke="#1c1b22" stroke-width="8"/>
+    <path d="M919 202 L951 221 L987 207 L977 246 L1008 273 L967 276 L951 314 L935 276 L894 273 L925 246 Z" fill="#ff6a00" stroke="#1c1b22" stroke-width="7"/>
+    <circle cx="145" cy="258" r="57" fill="#ff3cbf" stroke="#1c1b22" stroke-width="8"/>
+    <circle cx="1048" cy="260" r="62" fill="#72ff00" stroke="#1c1b22" stroke-width="8"/>
+    <circle cx="1048" cy="260" r="34" fill="#fff240" stroke="#1c1b22" stroke-width="7"/>
+  </g>
+
+  <g fill="none" stroke="#1c1b22" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M67 195 L97 176 L129 195 L160 176 L191 195" stroke-width="12"/>
+    <path d="M993 174 L1026 149 L1060 174 L1092 149 L1126 174" stroke-width="12"/>
+    <path d="M356 64 C398 31 436 103 475 70 C516 36 554 108 594 72" stroke-width="10"/>
+    <path d="M631 346 C690 310 735 382 792 346 C848 310 897 381 953 345" stroke-width="10"/>
+  </g>
+  <g fill="#1c1b22">
+    <circle cx="64" cy="223" r="7"/><circle cx="92" cy="238" r="5"/><circle cx="184" cy="224" r="6"/>
+    <circle cx="963" cy="134" r="7"/><circle cx="1012" cy="129" r="5"/><circle cx="1129" cy="202" r="6"/>
+    <circle cx="430" cy="341" r="6"/><circle cx="462" cy="361" r="5"/><circle cx="508" cy="337" r="7"/>
+  </g>
+
+  <g transform="translate(105 56)" filter="url(#popShadow)">
+    <text x="0" y="133" font-family="Cooper Black, Baloo 2, Fredoka One, Arial Rounded MT Bold, system-ui, sans-serif" font-size="116" font-weight="900" letter-spacing="0" fill="none" stroke="#1c1b22" stroke-width="24" stroke-linejoin="round">ChloeVibes</text>
+    <text x="0" y="133" font-family="Cooper Black, Baloo 2, Fredoka One, Arial Rounded MT Bold, system-ui, sans-serif" font-size="116" font-weight="900" letter-spacing="0" fill="none" stroke="#ffffff" stroke-width="15" stroke-linejoin="round">ChloeVibes</text>
+    <text x="0" y="133" font-family="Cooper Black, Baloo 2, Fredoka One, Arial Rounded MT Bold, system-ui, sans-serif" font-size="116" font-weight="900" letter-spacing="0" fill="url(#logoFill)" stroke="#1c1b22" stroke-width="3" stroke-linejoin="round">ChloeVibes</text>
+  </g>
+
+  <g font-family="Arial Black, Impact, system-ui, sans-serif" font-weight="900" text-anchor="middle" stroke="#1c1b22" stroke-linejoin="round">
+    <g transform="translate(246 232) rotate(-5)">
+      <path d="M-104 -34 L95 -34 L121 0 L95 35 L-104 35 L-126 0 Z" fill="#fff240" stroke="#1c1b22" stroke-width="7"/>
+      <text y="10" font-size="28" fill="#ff2ea6" stroke-width="1">BASS LOCK</text>
+    </g>
+    <g transform="translate(574 252) rotate(3)">
+      <path d="M-162 -39 L162 -39 L162 39 L-162 39 Z" fill="#20f6ff" stroke="#1c1b22" stroke-width="7"/>
+      <text y="11" font-size="26" fill="#15151d" stroke-width="0">FFT -> ADSR -> BLUETOOTH</text>
+    </g>
+    <g transform="translate(893 235) rotate(6)">
+      <path d="M-116 -35 L-77 -56 L-56 -35 L0 -58 L33 -31 L91 -47 L112 -13 L98 38 L34 34 L5 58 L-38 35 L-101 49 L-123 9 Z" fill="#ff3cbf" stroke="#1c1b22" stroke-width="7"/>
+      <text y="10" font-size="25" fill="#ffffff" stroke-width="1">DUAL MOTOR</text>
+    </g>
+  </g>
+
+  <g transform="translate(78 321)">
+    <rect x="0" y="0" width="1044" height="50" rx="25" fill="#15151d" opacity="0.92"/>
+    <text x="522" y="34" text-anchor="middle" font-family="Arial Black, Impact, system-ui, sans-serif" font-size="21" font-weight="900" fill="url(#tealPink)" letter-spacing="1">AUDIO-REACTIVE HAPTICS FOR TECHNO, BASS, AND BODY-SYNCED CHAOS</text>
+  </g>
+</svg>
