@@ -4,13 +4,14 @@
 
     <!-- Bluetooth LE for device control -->
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
-    <uses-permission android:name="android.permission.BLUETOOTH_SCAN"
-        android:usesPermissionFlags="neverForLocation"
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_SCAN"
         tools:targetApi="s" />
 
-    <!-- Pre-Android 12: BLE scanning requires location permission -->
-    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"
-        android:maxSdkVersion="30" />
+    <!-- BLE scan visibility. Android 12+ uses Nearby Devices for BLE, but
+         uncensored scan results can still require Location permission when
+         we do not assert neverForLocation. -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.BLUETOOTH"
         android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN"
