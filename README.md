@@ -3,10 +3,11 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/BASS%20HOUSE-ff2ea6?style=for-the-badge&labelColor=1b1724" alt="Bass house" />
-  <img src="https://img.shields.io/badge/MEMPHIS%20NEON-20f6ff?style=for-the-badge&labelColor=1b1724" alt="Memphis neon" />
-  <img src="https://img.shields.io/badge/STICKER%20CHAOS-fff240?style=for-the-badge&labelColor=1b1724" alt="Sticker chaos" />
-  <img src="https://img.shields.io/badge/DOMI%202%20%2F%20LUSH-72ff00?style=for-the-badge&labelColor=1b1724" alt="Domi 2 and Lush" />
+  <img src="https://img.shields.io/badge/Windows-111118?style=for-the-badge&logo=windows&logoColor=20f6ff&labelColor=ff2ea6" alt="Windows" />
+  <img src="https://img.shields.io/badge/Android-111118?style=for-the-badge&logo=android&logoColor=72ff00&labelColor=23f6ff" alt="Android" />
+  <img src="https://img.shields.io/badge/Lovense%20BLE-111118?style=for-the-badge&labelColor=fff240" alt="Lovense BLE" />
+  <img src="https://img.shields.io/badge/Buttplug.io-111118?style=for-the-badge&labelColor=ff6a00" alt="Buttplug.io" />
+  <a href="LICENSE"><img src="https://img.shields.io/badge/MIT-111118?style=for-the-badge&labelColor=7f5cff" alt="MIT License" /></a>
 </p>
 
 <p align="center">
@@ -15,22 +16,7 @@
 </p>
 
 <p align="center">
-  <a href="#windows-desktop"><img src="https://img.shields.io/badge/Windows-0078D6?style=for-the-badge&logo=windows&logoColor=white" alt="Windows" /></a>
-  <a href="#android"><img src="https://img.shields.io/badge/Android-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Android" /></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge" alt="MIT License" /></a>
-</p>
-
-<p align="center">
   <em>FFT spectral analysis -> ADSR envelope shaping -> climax modulation -> Bluetooth haptic output</em>
-</p>
-
-<p align="center">
-  <strong>Brand mood:</strong>
-  neon Memphis revival, sticker-bomb chaos, bubble lettering, candy colors, off-beat hats, bass-house heat.
-</p>
-
-<p align="center">
-  <img src="assets/brand-board.svg" alt="ChloeVibes neon Memphis visual identity board" width="920" />
 </p>
 
 ---
