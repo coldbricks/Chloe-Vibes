@@ -1,22 +1,30 @@
 <p align="center">
-  <img src="assets/readme-hero.svg" alt="ChloeVibes neon Memphis audio-reactive haptics banner" width="920" />
+  <img src="assets/logo.png" alt="ChloeVibes Ms. Kikimora Audio neon logo" width="920" />
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Windows-111118?style=for-the-badge&logo=windows&logoColor=20f6ff&labelColor=ff2ea6" alt="Windows" />
-  <img src="https://img.shields.io/badge/Android-111118?style=for-the-badge&logo=android&logoColor=72ff00&labelColor=23f6ff" alt="Android" />
-  <img src="https://img.shields.io/badge/Lovense%20BLE-111118?style=for-the-badge&labelColor=fff240" alt="Lovense BLE" />
-  <img src="https://img.shields.io/badge/Buttplug.io-111118?style=for-the-badge&labelColor=ff6a00" alt="Buttplug.io" />
-  <a href="LICENSE"><img src="https://img.shields.io/badge/MIT-111118?style=for-the-badge&labelColor=7f5cff" alt="MIT License" /></a>
+  <img src="https://img.shields.io/badge/BASS-LOCK-ff2ea6?style=for-the-badge&labelColor=111118" alt="Bass Lock" />
+  <img src="https://img.shields.io/badge/ADSR-ENGINE-23f6ff?style=for-the-badge&labelColor=111118" alt="ADSR Engine" />
+  <img src="https://img.shields.io/badge/CLIMAX-MOD-fff240?style=for-the-badge&labelColor=111118" alt="Climax Modulation" />
+  <img src="https://img.shields.io/badge/DUAL-MOTOR-72ff00?style=for-the-badge&labelColor=111118" alt="Dual Motor" />
+  <img src="https://img.shields.io/badge/BLE-OUTPUT-ff6a00?style=for-the-badge&labelColor=111118" alt="BLE Output" />
 </p>
 
 <p align="center">
-  <strong>A synthesizer for your body.</strong><br>
-  Audio-reactive haptics with bass-lock pulses, ADSR shaping, and Bluetooth device output.
+  <img src="https://img.shields.io/badge/Windows-EXE-23f6ff?style=for-the-badge&logo=windows&logoColor=23f6ff&labelColor=08060d" alt="Windows EXE" />
+  <img src="https://img.shields.io/badge/Android-APK-72ff00?style=for-the-badge&logo=android&logoColor=72ff00&labelColor=08060d" alt="Android APK" />
+  <img src="https://img.shields.io/badge/Lovense-BLE-ff2ea6?style=for-the-badge&labelColor=08060d" alt="Lovense BLE" />
+  <img src="https://img.shields.io/badge/Buttplug.io-Bridge-fff240?style=for-the-badge&labelColor=08060d" alt="Buttplug.io Bridge" />
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-7f5cff?style=for-the-badge&labelColor=08060d" alt="MIT License" /></a>
 </p>
 
 <p align="center">
-  <em>FFT spectral analysis -> ADSR envelope shaping -> climax modulation -> Bluetooth haptic output</em>
+  <strong>Neon haptics for bass music.</strong><br>
+  Audio-reactive vibration with bass-lock pulses, ADSR shaping, climax modulation, and Bluetooth device output.
+</p>
+
+<p align="center">
+  <em>system audio -> FFT -> gate -> trigger -> ADSR -> climax engine -> haptic output</em>
 </p>
 
 ---
