@@ -498,8 +498,7 @@ impl Settings {
         let climax_pattern =
             get_value(storage, names::CLIMAX_PATTERN).unwrap_or(defaults::CLIMAX_PATTERN);
 
-        let output_gain =
-            get_value(storage, names::OUTPUT_GAIN).unwrap_or(defaults::OUTPUT_GAIN);
+        let output_gain = get_value(storage, names::OUTPUT_GAIN).unwrap_or(defaults::OUTPUT_GAIN);
 
         let enable_persistence =
             get_value(storage, names::ENABLE_PERSISTENCE).unwrap_or(defaults::ENABLE_PERSISTENCE);

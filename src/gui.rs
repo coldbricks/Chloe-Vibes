@@ -252,7 +252,7 @@ struct GuiApp {
     spectral_data: SharedSpectralData, // NEW: full spectral analysis
 
     // Processed output that devices read
-    processed_output: SharedF32,  // Final output after envelope/gate (primary motor)
+    processed_output: SharedF32, // Final output after envelope/gate (primary motor)
     processed_output_2: SharedF32, // Secondary motor output from ClimaxEngine
 
     _capture_thread: JoinHandle<()>,
@@ -1113,7 +1113,8 @@ impl eframe::App for GuiApp {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Sync advanced processing flag with capture thread
-        self.use_advanced_shared.store(self.settings.use_advanced_processing, Ordering::Relaxed);
+        self.use_advanced_shared
+            .store(self.settings.use_advanced_processing, Ordering::Relaxed);
 
         // Apply custom dark theme
         let mut visuals = if self.settings.use_dark_mode {
@@ -3325,10 +3326,7 @@ fn draw_adsr_envelope(
             Stroke::new(4.0, Color32::from_rgba_premultiplied(16, 185, 129, 40)),
         ));
         // Main line (reuse vec — no clone needed since this is the last use)
-        painter.add(Shape::line(
-            points,
-            Stroke::new(2.0, palette::ACCENT_TEAL),
-        ));
+        painter.add(Shape::line(points, Stroke::new(2.0, palette::ACCENT_TEAL)));
     }
 
     // Phase separator lines
@@ -3522,7 +3520,12 @@ fn draw_output_history(
         let bottom = rect.min.y + padding + draw_h;
 
         painter.add(Shape::convex_polygon(
-            vec![pos2(x0, bottom), pos2(x0, y0), pos2(x1, y1), pos2(x1, bottom)],
+            vec![
+                pos2(x0, bottom),
+                pos2(x0, y0),
+                pos2(x1, y1),
+                pos2(x1, bottom),
+            ],
             Color32::from_rgba_premultiplied(124, 58, 237, 12),
             Stroke::NONE,
         ));

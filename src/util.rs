@@ -339,8 +339,16 @@ mod tests {
         let samples = vec![1.0f32; 200]; // 100 frames, 2 channels
         let result = calculate_power(&samples, 2);
         assert_eq!(result.len(), 2);
-        assert!((result[0] - 1.0).abs() < 1e-4, "left channel power should be 1.0, got {}", result[0]);
-        assert!((result[1] - 1.0).abs() < 1e-4, "right channel power should be 1.0, got {}", result[1]);
+        assert!(
+            (result[0] - 1.0).abs() < 1e-4,
+            "left channel power should be 1.0, got {}",
+            result[0]
+        );
+        assert!(
+            (result[1] - 1.0).abs() < 1e-4,
+            "right channel power should be 1.0, got {}",
+            result[1]
+        );
     }
 
     #[test]

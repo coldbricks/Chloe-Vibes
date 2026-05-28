@@ -44,8 +44,7 @@ pub const BAND_NAMES: [&str; NUM_BANDS] = [
 
 /// How the trigger magnitude is calculated from audio energy.
 /// Mirrors ChloeVibes' trigger mode system.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub enum TriggerMode {
     /// Intensity scales continuously with audio energy above threshold.
     /// The "normal" mode — louder = stronger vibration.
@@ -58,11 +57,9 @@ pub enum TriggerMode {
     Hybrid,
 }
 
-
 /// Which part of the frequency spectrum to analyze.
 /// Lets you isolate bass hits, vocal range, etc.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub enum FrequencyMode {
     /// Analyze the full audible spectrum (weighted toward lower freqs).
     #[default]
@@ -75,10 +72,8 @@ pub enum FrequencyMode {
     BandPass,
 }
 
-
 /// High-level modulation pattern for the climax engine.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub enum ClimaxPattern {
     /// Smooth continuous rise toward the end of the cycle.
     #[default]
@@ -88,7 +83,6 @@ pub enum ClimaxPattern {
     /// Aggressive exponential ramp in the final third.
     Surge,
 }
-
 
 /// ADSR envelope state machine states.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,6 +112,7 @@ pub struct SpectralData {
     /// Spikes on transients (drum hits, note onsets).
     pub spectral_flux: f32,
     /// Frequency of the loudest bin (reserved, currently unused)
+    #[allow(dead_code)]
     pub dominant_frequency: f32,
 }
 
@@ -508,10 +503,6 @@ impl Gate {
         open
     }
 
-    pub fn was_open(&self) -> bool {
-        self.was_open
-    }
-
     pub fn effective_threshold(&self, manual: f32, auto_amount: f32) -> f32 {
         lerp(manual, self.optimal_threshold, auto_amount)
     }
@@ -662,7 +653,8 @@ impl EnvelopeProcessor {
                 } else {
                     let progress = (elapsed / attack_ms).clamp(0.0, 1.0);
                     let curved = apply_curve(progress, attack_curve);
-                    self.value = self.phase_start_value + (self.attack_target - self.phase_start_value) * curved;
+                    self.value = self.phase_start_value
+                        + (self.attack_target - self.phase_start_value) * curved;
 
                     if progress >= 1.0 {
                         self.value = self.attack_target;
@@ -697,7 +689,9 @@ impl EnvelopeProcessor {
                 if self.micro_pause_frames > 0 {
                     self.micro_pause_frames -= 1;
                     self.value = 0.0; // True zero — motor must stop
-                } else if self.next_micro_pause_ms > 0.0 && current_time_ms >= self.next_micro_pause_ms {
+                } else if self.next_micro_pause_ms > 0.0
+                    && current_time_ms >= self.next_micro_pause_ms
+                {
                     // 3-6 frames at 60Hz = 48-96ms (motor needs ~20ms to stop)
                     self.micro_pause_frames = 3 + ((current_time_ms * 7.13) as i32 & 0x3);
                     // Next pause in 2-8 seconds (deterministic pseudo-random)
@@ -707,24 +701,24 @@ impl EnvelopeProcessor {
                 } else {
                     // Initialize micro-pause timer on first sustain frame
                     if self.next_micro_pause_ms <= 0.0 {
-                        let pseudo_rand = ((current_time_ms * 13.37) as u32 & 0xFFFF) as f32 / 65535.0;
+                        let pseudo_rand =
+                            ((current_time_ms * 13.37) as u32 & 0xFFFF) as f32 / 65535.0;
                         self.next_micro_pause_ms = current_time_ms + 2000.0 + pseudo_rand * 6000.0;
                     }
 
                     // 5-layer modulation to prevent neural adaptation.
                     // Irrational-ratio frequencies ensure the combined waveform never
                     // exactly repeats, keeping nerve endings from filtering the stimulus.
-                    let primary    = 0.22 * (current_time_ms * 0.0075).sin();    // ~1.2Hz
-                    let secondary  = 0.14 * (current_time_ms * 0.0019).sin();    // ~0.3Hz
-                    let tertiary   = 0.10 * (current_time_ms * 0.01696).sin();   // ~2.7Hz
-                    let cross_freq = 0.08 * (current_time_ms * 0.001068).sin();  // ~0.17Hz
-                    let noise      = 0.10 * (
-                        (current_time_ms * 0.00317).sin() * 0.30
-                        + (current_time_ms * 0.00713).sin() * 0.25
-                        + (current_time_ms * 0.01137).sin() * 0.20
-                        + (current_time_ms * 0.02173).sin() * 0.15
-                        + (current_time_ms * 0.00491).sin() * 0.10
-                    );
+                    let primary = 0.22 * (current_time_ms * 0.0075).sin(); // ~1.2Hz
+                    let secondary = 0.14 * (current_time_ms * 0.0019).sin(); // ~0.3Hz
+                    let tertiary = 0.10 * (current_time_ms * 0.01696).sin(); // ~2.7Hz
+                    let cross_freq = 0.08 * (current_time_ms * 0.001068).sin(); // ~0.17Hz
+                    let noise = 0.10
+                        * ((current_time_ms * 0.00317).sin() * 0.30
+                            + (current_time_ms * 0.00713).sin() * 0.25
+                            + (current_time_ms * 0.01137).sin() * 0.20
+                            + (current_time_ms * 0.02173).sin() * 0.15
+                            + (current_time_ms * 0.00491).sin() * 0.10);
                     let modulation = 1.0 + primary + secondary + tertiary + cross_freq + noise;
                     self.value = (sustain_level * modulation).clamp(0.0, 1.0);
                 }
@@ -963,8 +957,7 @@ impl BeatDetector {
             } else {
                 0.0
             };
-            self.recent_onset_strength =
-                self.recent_onset_strength * 0.3 + raw_strength * 0.7;
+            self.recent_onset_strength = self.recent_onset_strength * 0.3 + raw_strength * 0.7;
 
             // Record timestamp for tempo tracking
             self.onset_timestamps[self.onset_ts_index] = current_time_ms;
@@ -998,10 +991,8 @@ impl BeatDetector {
         let mut count = 0usize;
         for i in 1..self.onset_ts_count {
             let len = self.onset_timestamps.len();
-            let curr =
-                self.onset_timestamps[(self.onset_ts_index + len - i) % len];
-            let prev =
-                self.onset_timestamps[(self.onset_ts_index + len - i - 1) % len];
+            let curr = self.onset_timestamps[(self.onset_ts_index + len - i) % len];
+            let prev = self.onset_timestamps[(self.onset_ts_index + len - i - 1) % len];
             let interval = curr - prev;
             if (150.0..=2000.0).contains(&interval) {
                 // 30-400 BPM range
@@ -1034,12 +1025,10 @@ impl BeatDetector {
 
         if self.tempo_confidence > 0.5 {
             let len = self.onset_timestamps.len();
-            let last_onset =
-                self.onset_timestamps[(self.onset_ts_index + len - 1) % len];
+            let last_onset = self.onset_timestamps[(self.onset_ts_index + len - 1) % len];
             let elapsed = current_time_ms - last_onset;
             let intervals_elapsed = (elapsed / mean) as u32;
-            self.predicted_next_onset_ms =
-                last_onset + (intervals_elapsed + 1) as f32 * mean;
+            self.predicted_next_onset_ms = last_onset + (intervals_elapsed + 1) as f32 * mean;
         } else {
             self.predicted_next_onset_ms = 0.0;
         }
@@ -1263,8 +1252,7 @@ impl ClimaxEngine {
         // ---- 5-oscillator detuned micro-pulse ----
         let pulse_depth = pulse_depth.clamp(0.0, 0.55);
         let max_pulse_hz = if progress >= surge_start { 10.0 } else { 7.0 };
-        let pulse_rate_hz =
-            (2.0 + intensity * 3.0 + energy * 2.0 + ramp * 1.0).min(max_pulse_hz);
+        let pulse_rate_hz = (2.0 + intensity * 3.0 + energy * 2.0 + ramp * 1.0).min(max_pulse_hz);
         let detune1 = 0.07;
         let detune2 = 0.13;
         self.micro_phase = (self.micro_phase + dt * pulse_rate_hz * TAU).rem_euclid(TAU);
@@ -1316,8 +1304,7 @@ impl ClimaxEngine {
         // amplifying the physiological feedback loop between body and device.
         // Depth increases with progression — subtle at start, consuming at peak.
         let breathing_hz = 0.18;
-        self.breathing_phase =
-            (self.breathing_phase + dt * breathing_hz * TAU).rem_euclid(TAU);
+        self.breathing_phase = (self.breathing_phase + dt * breathing_hz * TAU).rem_euclid(TAU);
         let breathing_depth = 0.06 + 0.10 * ramp; // 6% → 16%
         let breathing_mod = 1.0 + breathing_depth * self.breathing_phase.sin();
 
@@ -1326,19 +1313,23 @@ impl ClimaxEngine {
         // At ramp=1 with max momentum: up to 3.8x — overwhelming crescendo
         // that compensates for desensitization over long sessions.
         let momentum_bonus = self.arousal_momentum * 0.7;
-        let arousal_gain =
-            (1.0 + (1.2 + momentum_bonus) * ramp) * (1.0 + intensity * 0.40);
+        let arousal_gain = (1.0 + (1.2 + momentum_bonus) * ramp) * (1.0 + intensity * 0.40);
         let gated_boost = if gate_open { self.onset_boost } else { 0.0 };
 
-        let raw_output = (dry * arousal_gain * tease_factor * surge_factor
-            * pulse * sub_resonance * chaos_mod * breathing_mod
+        let raw_output = (dry
+            * arousal_gain
+            * tease_factor
+            * surge_factor
+            * pulse
+            * sub_resonance
+            * chaos_mod
+            * breathing_mod
             + gated_boost)
             .clamp(0.0, 1.0);
 
         // ---- Dual-motor spatial contrast ----
         let phase_offset_hz = 0.3 + ramp * 1.7;
-        self.motor2_phase =
-            (self.motor2_phase + dt * phase_offset_hz * TAU).rem_euclid(TAU);
+        self.motor2_phase = (self.motor2_phase + dt * phase_offset_hz * TAU).rem_euclid(TAU);
         let phase_mod = 0.5 + 0.5 * self.motor2_phase.sin();
         let anti_phase_depth = raw_output.clamp(0.0, 1.0) * 0.85;
         let motor2_factor = lerp(1.0, 0.15 + 0.85 * phase_mod, anti_phase_depth);
@@ -1525,7 +1516,10 @@ mod tests {
         gate.process(0.6, 0.5, 0.0, 0.0);
         // Energy drops slightly below threshold — should stay open due to hysteresis
         let open = gate.process(0.48, 0.5, 0.0, 0.0);
-        assert!(open, "hysteresis should keep gate open just below threshold");
+        assert!(
+            open,
+            "hysteresis should keep gate open just below threshold"
+        );
         // Energy drops well below — should close
         let open = gate.process(0.2, 0.5, 0.0, 0.0);
         assert!(!open, "gate should close when energy drops significantly");
@@ -1582,8 +1576,20 @@ mod tests {
         //         enabled, intensity, build_up_ms, tease_ratio, tease_drop, surge_boost,
         //         pulse_depth, pattern)
         let output = ce.process(
-            0.75, 0.5, true, false, 0.0, 0.0,
-            false, 0.5, 60000.0, 0.18, 0.3, 0.2, 0.15, ClimaxPattern::Wave,
+            0.75,
+            0.5,
+            true,
+            false,
+            0.0,
+            0.0,
+            false,
+            0.5,
+            60000.0,
+            0.18,
+            0.3,
+            0.2,
+            0.15,
+            ClimaxPattern::Wave,
         );
         assert!(
             (output - 0.75).abs() < 0.01,
@@ -1597,8 +1603,20 @@ mod tests {
         for i in 0..1000 {
             let time = i as f32 * 100.0;
             let output = ce.process(
-                0.5, 0.5, true, false, 0.0, time,
-                true, 0.8, 60000.0, 0.18, 0.3, 0.2, 0.15, ClimaxPattern::Wave,
+                0.5,
+                0.5,
+                true,
+                false,
+                0.0,
+                time,
+                true,
+                0.8,
+                60000.0,
+                0.18,
+                0.3,
+                0.2,
+                0.15,
+                ClimaxPattern::Wave,
             );
             assert!(
                 output >= 0.0 && output <= 1.5,
@@ -1639,7 +1657,10 @@ mod tests {
         };
         let energy = SpectralAnalyzer::extract_energy(&data, FrequencyMode::Full, 0.0);
         assert!(energy > 0.0, "full mode should produce positive energy");
-        assert!((energy - 1.0).abs() < 0.01, "uniform bands should give ~1.0");
+        assert!(
+            (energy - 1.0).abs() < 0.01,
+            "uniform bands should give ~1.0"
+        );
     }
 
     // --- extract_energy frequency modes ---
@@ -1661,7 +1682,10 @@ mod tests {
         data.band_energies[6] = 0.9; // Brilliance: 6000-12000 Hz
         data.band_energies[7] = 0.7; // Air: 12000-20000 Hz
         let energy = SpectralAnalyzer::extract_energy(&data, FrequencyMode::HighPass, 6000.0);
-        assert!(energy > 0.0, "highpass should capture brilliance+air energy");
+        assert!(
+            energy > 0.0,
+            "highpass should capture brilliance+air energy"
+        );
     }
 
     #[test]
@@ -1682,51 +1706,125 @@ mod tests {
 
         // Phase 1: gate opens -> should trigger attack
         let _output = env.drive(
-            true, 0.5, false, 0.0, time,
-            TriggerMode::Dynamic, 0.1, 0.22, 1.0, 0.8, 0.5,
-            100.0, 200.0, 0.8, 300.0, 1.0, 1.0, 1.0, 1000.0,
+            true,
+            0.5,
+            false,
+            0.0,
+            time,
+            TriggerMode::Dynamic,
+            0.1,
+            0.22,
+            1.0,
+            0.8,
+            0.5,
+            100.0,
+            200.0,
+            0.8,
+            300.0,
+            1.0,
+            1.0,
+            1.0,
+            1000.0,
         );
         assert!(
             env.state == EnvelopeState::Attack || env.state == EnvelopeState::Decay,
-            "gate open should trigger attack/decay, got {:?}", env.state
+            "gate open should trigger attack/decay, got {:?}",
+            env.state
         );
 
         // Phase 2: hold gate open until sustain
         for _ in 0..50 {
             time += dt;
             env.drive(
-                true, 0.5, false, 0.0, time,
-                TriggerMode::Dynamic, 0.1, 0.22, 1.0, 0.8, 0.5,
-                100.0, 200.0, 0.8, 300.0, 1.0, 1.0, 1.0, 1000.0,
+                true,
+                0.5,
+                false,
+                0.0,
+                time,
+                TriggerMode::Dynamic,
+                0.1,
+                0.22,
+                1.0,
+                0.8,
+                0.5,
+                100.0,
+                200.0,
+                0.8,
+                300.0,
+                1.0,
+                1.0,
+                1.0,
+                1000.0,
             );
         }
         // Should be in sustain or at least past attack
         assert!(
             env.state == EnvelopeState::Sustain || env.state == EnvelopeState::Decay,
-            "should reach sustain after 800ms, got {:?}", env.state
+            "should reach sustain after 800ms, got {:?}",
+            env.state
         );
 
         // Phase 3: gate closes -> release
         for _ in 0..5 {
             time += dt;
             env.drive(
-                false, 0.0, false, 0.0, time,
-                TriggerMode::Dynamic, 0.1, 0.22, 1.0, 0.8, 0.5,
-                100.0, 200.0, 0.8, 300.0, 1.0, 1.0, 1.0, 1000.0,
+                false,
+                0.0,
+                false,
+                0.0,
+                time,
+                TriggerMode::Dynamic,
+                0.1,
+                0.22,
+                1.0,
+                0.8,
+                0.5,
+                100.0,
+                200.0,
+                0.8,
+                300.0,
+                1.0,
+                1.0,
+                1.0,
+                1000.0,
             );
         }
-        assert_eq!(env.state, EnvelopeState::Release, "gate close should trigger release");
+        assert_eq!(
+            env.state,
+            EnvelopeState::Release,
+            "gate close should trigger release"
+        );
 
         // Phase 4: wait for idle
         for _ in 0..100 {
             time += dt;
             env.drive(
-                false, 0.0, false, 0.0, time,
-                TriggerMode::Dynamic, 0.1, 0.22, 1.0, 0.8, 0.5,
-                100.0, 200.0, 0.8, 300.0, 1.0, 1.0, 1.0, 1000.0,
+                false,
+                0.0,
+                false,
+                0.0,
+                time,
+                TriggerMode::Dynamic,
+                0.1,
+                0.22,
+                1.0,
+                0.8,
+                0.5,
+                100.0,
+                200.0,
+                0.8,
+                300.0,
+                1.0,
+                1.0,
+                1.0,
+                1000.0,
             );
         }
-        assert_eq!(env.state, EnvelopeState::Idle, "should reach idle after release");
+        assert_eq!(
+            env.state,
+            EnvelopeState::Idle,
+            "should reach idle after release"
+        );
     }
 
     #[test]
@@ -1739,7 +1837,8 @@ mod tests {
             env.process(time, 100.0, 200.0, 0.95, 300.0, 1.0, 1.0, 1.0);
             assert!(
                 env.value >= 0.0 && env.value <= 1.0,
-                "envelope value should be in [0,1], got {}", env.value
+                "envelope value should be in [0,1], got {}",
+                env.value
             );
         }
     }
@@ -1765,7 +1864,8 @@ mod tests {
         if bd.tempo_confidence > 0.3 {
             assert!(
                 bd.tempo_interval_ms > 300.0 && bd.tempo_interval_ms < 700.0,
-                "tempo should be ~500ms, got {}", bd.tempo_interval_ms
+                "tempo should be ~500ms, got {}",
+                bd.tempo_interval_ms
             );
         }
     }
@@ -1779,8 +1879,20 @@ mod tests {
         for i in 0..10000 {
             let time = i as f32 * 16.0;
             let output = ce.process(
-                0.8, 0.8, true, false, 0.0, time,
-                true, 0.9, 60000.0, 0.18, 0.35, 0.5, 0.18, ClimaxPattern::Wave,
+                0.8,
+                0.8,
+                true,
+                false,
+                0.0,
+                time,
+                true,
+                0.9,
+                60000.0,
+                0.18,
+                0.35,
+                0.5,
+                0.18,
+                ClimaxPattern::Wave,
             );
             assert!(
                 output.is_finite() && output >= 0.0 && output <= 1.5,
@@ -1794,12 +1906,36 @@ mod tests {
         let mut ce = ClimaxEngine::new();
         // With Stairs pattern, output should have step-like behavior
         let output1 = ce.process(
-            0.5, 0.5, true, false, 0.0, 30000.0,
-            true, 0.8, 60000.0, 0.18, 0.35, 0.5, 0.18, ClimaxPattern::Stairs,
+            0.5,
+            0.5,
+            true,
+            false,
+            0.0,
+            30000.0,
+            true,
+            0.8,
+            60000.0,
+            0.18,
+            0.35,
+            0.5,
+            0.18,
+            ClimaxPattern::Stairs,
         );
         let output2 = ce.process(
-            0.5, 0.5, true, false, 0.0, 30100.0,
-            true, 0.8, 60000.0, 0.18, 0.35, 0.5, 0.18, ClimaxPattern::Stairs,
+            0.5,
+            0.5,
+            true,
+            false,
+            0.0,
+            30100.0,
+            true,
+            0.8,
+            60000.0,
+            0.18,
+            0.35,
+            0.5,
+            0.18,
+            ClimaxPattern::Stairs,
         );
         // Close time values in same stair step should produce similar output
         assert!(
