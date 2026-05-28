@@ -3,6 +3,13 @@
 </p>
 
 <p align="center">
+  <img src="https://img.shields.io/badge/BASS%20HOUSE-ff2ea6?style=for-the-badge&labelColor=1b1724" alt="Bass house" />
+  <img src="https://img.shields.io/badge/MEMPHIS%20NEON-20f6ff?style=for-the-badge&labelColor=1b1724" alt="Memphis neon" />
+  <img src="https://img.shields.io/badge/STICKER%20CHAOS-fff240?style=for-the-badge&labelColor=1b1724" alt="Sticker chaos" />
+  <img src="https://img.shields.io/badge/DOMI%202%20%2F%20LUSH-72ff00?style=for-the-badge&labelColor=1b1724" alt="Domi 2 and Lush" />
+</p>
+
+<p align="center">
   <strong>A synthesizer for your body.</strong><br>
   Audio-reactive haptics with bass-lock pulses, ADSR shaping, and Bluetooth device output.
 </p>
@@ -19,7 +26,11 @@
 
 <p align="center">
   <strong>Brand mood:</strong>
-  neon Memphis revival, sticker-bomb chaos, bubble lettering, candy colors, bass-house heat.
+  neon Memphis revival, sticker-bomb chaos, bubble lettering, candy colors, off-beat hats, bass-house heat.
+</p>
+
+<p align="center">
+  <img src="assets/brand-board.svg" alt="ChloeVibes neon Memphis visual identity board" width="920" />
 </p>
 
 ---
