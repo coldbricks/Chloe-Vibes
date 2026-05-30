@@ -2,10 +2,19 @@
 // parity.rs -- Golden-file parity test harness
 //
 // Runs the complete Rust signal chain over a deterministic synthetic PCM
-// buffer and emits per-frame envelope + climax outputs to a CSV.  The
-// Kotlin side (android/app/src/test/.../ParityTest.kt) generates the same
-// PCM with the same formula and runs the same signal chain, then asserts
-// that the numbers it produces match this CSV within a small epsilon.
+// buffer and emits, per frame, the envelope + climax + raw motor2 outputs
+// AND the mapped device outputs (after the shared output stage). The Kotlin
+// side (android/app/src/test/.../ParityTest.kt) generates the same PCM with
+// the same formula, runs the same chain + the same shared map, and asserts
+// every column matches this CSV within a small epsilon.
+//
+// The chain is run once per SCENARIO (see SCENARIOS below). Each scenario
+// varies a few parameters (trigger mode, sustain level, climax pattern) so
+// the golden exercises Dynamic/Binary/Hybrid triggers, Wave/Stairs/Surge
+// climax patterns, and a high sustain level that pushes the sustain
+// modulation into its clamp region. The mapped columns exercise the shared
+// `map_output` (range mapping + gain + silence-zero), which is the output
+// stage that previously diverged between platforms.
 //
 // If the two sides drift (someone edits one and forgets the other),
 // the CI parity test will fail and surface the regression immediately.
@@ -33,13 +42,14 @@
 //     return ((state_i >> 8) / 2^24 - 0.5) * 0.04       // ±0.02 RMS-ish
 //     seed = 0x51ED_5EED
 //
-// Preset parameters are committed in this file (see TestPreset) so the
-// output is fully deterministic given the input.
+// Fixed preset parameters are committed in this file (see TestPreset); the
+// per-scenario overrides are in SCENARIOS. The output is fully
+// deterministic given the input.
 // ==========================================================================
 
 use chloe_vibes::audio::{
-    BeatDetector, ClimaxEngine, ClimaxPattern, EnvelopeProcessor, FrequencyMode, Gate,
-    SpectralAnalyzer, TriggerMode,
+    map_output, BeatDetector, ClimaxEngine, ClimaxPattern, EnvelopeProcessor, EnvelopeState,
+    FrequencyMode, Gate, SpectralAnalyzer, TriggerMode,
 };
 use std::f32::consts::TAU;
 use std::fs;
@@ -96,7 +106,7 @@ fn hann_envelope(t: f32, duration: f32) -> f32 {
 fn generate_pcm() -> Vec<f32> {
     let mut pcm = vec![0.0f32; TOTAL_SAMPLES];
     let mut state: u32 = LCG_SEED;
-    for i in 0..TOTAL_SAMPLES {
+    for (i, sample) in pcm.iter_mut().enumerate() {
         let (next, noise) = lcg_step(state);
         state = next;
         let t = i as f32 / SAMPLE_RATE;
@@ -105,14 +115,16 @@ fn generate_pcm() -> Vec<f32> {
             + 0.30 * (TAU * 1000.0 * t).sin()
             + drum_hit(t)
             + noise;
-        pcm[i] = sig * hann_envelope(t, DURATION_SEC);
+        *sample = sig * hann_envelope(t, DURATION_SEC);
     }
     pcm
 }
 
 // ---------------------------------------------------------------------------
-// Test preset parameters.  Changing these invalidates the golden file.
+// Fixed test preset parameters.  Changing these invalidates the golden file.
 // Matches the values committed in the Kotlin ParityTest.
+// Per-scenario overrides (trigger mode, sustain level, climax pattern) live
+// in SCENARIOS below.
 // ---------------------------------------------------------------------------
 
 struct TestPreset;
@@ -124,7 +136,6 @@ impl TestPreset {
     const GATE_SMOOTHING: f32 = 0.0;
 
     // Envelope (drive)
-    const TRIGGER_MODE: TriggerMode = TriggerMode::Dynamic;
     const THRESHOLD: f32 = 0.02;
     const THRESHOLD_KNEE: f32 = 0.0;
     const DYNAMIC_CURVE: f32 = 1.0;
@@ -132,7 +143,6 @@ impl TestPreset {
     const HYBRID_BLEND: f32 = 0.5;
     const ATTACK_MS: f32 = 20.0; // <50 → fast-path (Attack skipped)
     const DECAY_MS: f32 = 120.0;
-    const SUSTAIN_LEVEL: f32 = 0.5;
     const RELEASE_MS: f32 = 180.0;
     const ATTACK_CURVE: f32 = 1.0;
     const DECAY_CURVE: f32 = 1.0;
@@ -146,18 +156,90 @@ impl TestPreset {
     const CLIMAX_TEASE_DROP: f32 = 0.4;
     const CLIMAX_SURGE_BOOST: f32 = 0.6;
     const CLIMAX_PULSE_DEPTH: f32 = 0.2;
-    const CLIMAX_PATTERN: ClimaxPattern = ClimaxPattern::Wave;
 
     // Frequency extraction
     const FREQ_MODE: FrequencyMode = FrequencyMode::Full;
     const FREQ_TARGET: f32 = 1000.0;
+
+    // Output stage (shared map_output). Non-trivial range + gain so the
+    // mapped columns actually exercise the mapping, not an identity.
+    const MIN_VIBE: f32 = 0.1;
+    const MAX_VIBE: f32 = 0.9;
+    const OUTPUT_GAIN: f32 = 1.2;
+}
+
+/// A scenario varies the handful of parameters that select distinct code
+/// paths in the engine. Everything else comes from TestPreset.
+struct Scenario {
+    label: &'static str,
+    trigger_mode: TriggerMode,
+    sustain_level: f32,
+    climax_pattern: ClimaxPattern,
+}
+
+/// Coverage matrix. Order is significant — the golden stores rows in this
+/// order. The Kotlin side iterates the identical list.
+const SCENARIOS: &[Scenario] = &[
+    // Baseline: Dynamic trigger, Wave climax, mid sustain.
+    Scenario {
+        label: "dynamic_wave",
+        trigger_mode: TriggerMode::Dynamic,
+        sustain_level: 0.5,
+        climax_pattern: ClimaxPattern::Wave,
+    },
+    // Binary trigger path (fixed on/off level).
+    Scenario {
+        label: "binary_wave",
+        trigger_mode: TriggerMode::Binary,
+        sustain_level: 0.5,
+        climax_pattern: ClimaxPattern::Wave,
+    },
+    // Hybrid trigger path (blend of dynamic and binary).
+    Scenario {
+        label: "hybrid_wave",
+        trigger_mode: TriggerMode::Hybrid,
+        sustain_level: 0.5,
+        climax_pattern: ClimaxPattern::Wave,
+    },
+    // High sustain pushes sustain_level * modulation past 1.0, exercising the
+    // Sustain-stage clamp where Rust and Kotlin previously diverged.
+    Scenario {
+        label: "dynamic_highsustain",
+        trigger_mode: TriggerMode::Dynamic,
+        sustain_level: 0.9,
+        climax_pattern: ClimaxPattern::Wave,
+    },
+    // Stairs climax pattern (stepped escalation).
+    Scenario {
+        label: "dynamic_stairs",
+        trigger_mode: TriggerMode::Dynamic,
+        sustain_level: 0.5,
+        climax_pattern: ClimaxPattern::Stairs,
+    },
+    // Surge climax pattern (aggressive final-third ramp).
+    Scenario {
+        label: "dynamic_surge",
+        trigger_mode: TriggerMode::Dynamic,
+        sustain_level: 0.5,
+        climax_pattern: ClimaxPattern::Surge,
+    },
+];
+
+/// Per-frame outputs recorded to the golden.
+struct FrameOut {
+    envelope: f32,
+    climax: f32,
+    motor2_shaped: f32,
+    motor1_out: f32,
+    motor2_out: f32,
 }
 
 // ---------------------------------------------------------------------------
-// Run the signal chain; return per-frame (envelope_out, climax_out) pairs.
+// Run the signal chain for one scenario; return per-frame outputs including
+// the shared output-stage mapping for both motors.
 // ---------------------------------------------------------------------------
 
-fn run_chain(pcm: &[f32]) -> Vec<(f32, f32)> {
+fn run_chain(pcm: &[f32], scenario: &Scenario) -> Vec<FrameOut> {
     let mut analyzer = SpectralAnalyzer::new(SAMPLE_RATE);
     let mut gate = Gate::new();
     let mut beat = BeatDetector::new();
@@ -203,7 +285,7 @@ fn run_chain(pcm: &[f32]) -> Vec<(f32, f32)> {
             is_onset,
             onset_strength,
             current_time_ms,
-            TestPreset::TRIGGER_MODE,
+            scenario.trigger_mode,
             TestPreset::THRESHOLD,
             TestPreset::THRESHOLD_KNEE,
             TestPreset::DYNAMIC_CURVE,
@@ -211,7 +293,7 @@ fn run_chain(pcm: &[f32]) -> Vec<(f32, f32)> {
             TestPreset::HYBRID_BLEND,
             TestPreset::ATTACK_MS,
             TestPreset::DECAY_MS,
-            TestPreset::SUSTAIN_LEVEL,
+            scenario.sustain_level,
             TestPreset::RELEASE_MS,
             TestPreset::ATTACK_CURVE,
             TestPreset::DECAY_CURVE,
@@ -234,30 +316,80 @@ fn run_chain(pcm: &[f32]) -> Vec<(f32, f32)> {
             TestPreset::CLIMAX_TEASE_DROP,
             TestPreset::CLIMAX_SURGE_BOOST,
             TestPreset::CLIMAX_PULSE_DEPTH,
-            TestPreset::CLIMAX_PATTERN,
+            scenario.climax_pattern,
         );
 
-        out.push((env_out, climax_out));
+        // 7) Shared output stage (range map + gain + silence-zero). Mirrors the
+        // desktop/Android output path so map_output cannot drift across ports.
+        let is_silent = energy < 0.005 && !gate_open && env.state == EnvelopeState::Idle;
+        let motor2_shaped = climax.motor2_output;
+        let motor1_out = map_output(
+            climax_out,
+            TestPreset::MIN_VIBE,
+            TestPreset::MAX_VIBE,
+            TestPreset::OUTPUT_GAIN,
+            is_silent,
+        );
+        let motor2_out = map_output(
+            motor2_shaped,
+            TestPreset::MIN_VIBE,
+            TestPreset::MAX_VIBE,
+            TestPreset::OUTPUT_GAIN,
+            is_silent,
+        );
+
+        out.push(FrameOut {
+            envelope: env_out,
+            climax: climax_out,
+            motor2_shaped,
+            motor1_out,
+            motor2_out,
+        });
     }
 
     out
+}
+
+/// Run every scenario and flatten into labelled rows.
+fn run_all_scenarios(pcm: &[f32]) -> Vec<(&'static str, usize, FrameOut)> {
+    let mut rows = Vec::new();
+    for scenario in SCENARIOS {
+        let frames = run_chain(pcm, scenario);
+        for (i, f) in frames.into_iter().enumerate() {
+            rows.push((scenario.label, i, f));
+        }
+    }
+    rows
 }
 
 // ---------------------------------------------------------------------------
 // CSV I/O
 // ---------------------------------------------------------------------------
 
-fn format_csv(frames: &[(f32, f32)]) -> String {
-    let mut s = String::with_capacity(frames.len() * 40);
-    s.push_str("frame,envelope_out,climax_out\n");
-    for (i, (env_out, climax_out)) in frames.iter().enumerate() {
+fn format_csv(rows: &[(&'static str, usize, FrameOut)]) -> String {
+    let mut s = String::with_capacity(rows.len() * 72);
+    s.push_str("scenario,frame,envelope_out,climax_out,motor2_shaped,motor1_out,motor2_out\n");
+    for (label, i, f) in rows {
         // Fixed 7-decimal precision keeps files stable and readable.
-        s.push_str(&format!("{},{:.7},{:.7}\n", i, env_out, climax_out));
+        s.push_str(&format!(
+            "{},{},{:.7},{:.7},{:.7},{:.7},{:.7}\n",
+            label, i, f.envelope, f.climax, f.motor2_shaped, f.motor1_out, f.motor2_out
+        ));
     }
     s
 }
 
-fn parse_csv(raw: &str) -> Vec<(u32, f32, f32)> {
+struct GoldenRow {
+    scenario: String,
+    frame: u32,
+    envelope: f32,
+    climax: f32,
+    motor2_shaped: f32,
+    motor1_out: f32,
+    motor2_out: f32,
+}
+
+fn parse_csv(raw: &str) -> Vec<GoldenRow> {
     let mut rows = Vec::new();
     for (li, line) in raw.lines().enumerate() {
         if li == 0 {
@@ -267,10 +399,22 @@ fn parse_csv(raw: &str) -> Vec<(u32, f32, f32)> {
             continue;
         }
         let mut it = line.split(',');
+        let scenario = it.next().unwrap().trim().to_string();
         let frame: u32 = it.next().unwrap().trim().parse().unwrap();
-        let env: f32 = it.next().unwrap().trim().parse().unwrap();
+        let envelope: f32 = it.next().unwrap().trim().parse().unwrap();
         let climax: f32 = it.next().unwrap().trim().parse().unwrap();
-        rows.push((frame, env, climax));
+        let motor2_shaped: f32 = it.next().unwrap().trim().parse().unwrap();
+        let motor1_out: f32 = it.next().unwrap().trim().parse().unwrap();
+        let motor2_out: f32 = it.next().unwrap().trim().parse().unwrap();
+        rows.push(GoldenRow {
+            scenario,
+            frame,
+            envelope,
+            climax,
+            motor2_shaped,
+            motor1_out,
+            motor2_out,
+        });
     }
     rows
 }
@@ -292,8 +436,8 @@ fn parity_rust_golden() {
     let pcm = generate_pcm();
     assert_eq!(pcm.len(), TOTAL_SAMPLES, "PCM length mismatch");
 
-    let frames = run_chain(&pcm);
-    let csv = format_csv(&frames);
+    let rows = run_all_scenarios(&pcm);
+    let csv = format_csv(&rows);
 
     let path = golden_path();
     let epsilon: f32 = 1e-4;
@@ -303,39 +447,39 @@ fn parity_rust_golden() {
             let golden = parse_csv(&existing);
             assert_eq!(
                 golden.len(),
-                frames.len(),
-                "frame count differs: golden={} new={}",
+                rows.len(),
+                "row count differs: golden={} new={}",
                 golden.len(),
-                frames.len()
+                rows.len()
             );
 
-            let mut max_env_diff = 0.0_f32;
-            let mut max_climax_diff = 0.0_f32;
-            let mut worst_frame = 0usize;
+            let mut max_diff = 0.0_f32;
+            let mut worst = String::new();
             let mut mismatches: Vec<String> = Vec::new();
 
-            for (i, ((env_new, climax_new), (fidx, env_gold, climax_gold))) in
-                frames.iter().zip(golden.iter()).enumerate()
-            {
-                assert_eq!(*fidx as usize, i, "frame index mismatch at row {}", i);
-                let de = (env_new - env_gold).abs();
-                let dc = (climax_new - climax_gold).abs();
-                if de > max_env_diff || dc > max_climax_diff {
-                    if de > max_env_diff {
-                        max_env_diff = de;
-                    }
-                    if dc > max_climax_diff {
-                        max_climax_diff = dc;
-                    }
-                    if de > epsilon || dc > epsilon {
-                        worst_frame = i;
-                    }
+            for ((label, i, f), g) in rows.iter().zip(golden.iter()) {
+                assert_eq!(g.scenario, *label, "scenario mismatch at row {}", i);
+                assert_eq!(g.frame as usize, *i, "frame index mismatch at row {}", i);
+                let diffs = [
+                    (f.envelope - g.envelope).abs(),
+                    (f.climax - g.climax).abs(),
+                    (f.motor2_shaped - g.motor2_shaped).abs(),
+                    (f.motor1_out - g.motor1_out).abs(),
+                    (f.motor2_out - g.motor2_out).abs(),
+                ];
+                let row_max = diffs.iter().cloned().fold(0.0_f32, f32::max);
+                if row_max > max_diff {
+                    max_diff = row_max;
                 }
-                if de > epsilon || dc > epsilon {
+                if row_max > epsilon {
+                    worst = format!("{}#{}", label, i);
                     if mismatches.len() < 8 {
                         mismatches.push(format!(
-                            "frame {}: env {:.7} vs {:.7} (Δ={:.2e}), climax {:.7} vs {:.7} (Δ={:.2e})",
-                            i, env_new, env_gold, de, climax_new, climax_gold, dc
+                            "{} frame {}: env {:.7}/{:.7} climax {:.7}/{:.7} m2s {:.7}/{:.7} m1 {:.7}/{:.7} m2 {:.7}/{:.7} (max Δ={:.2e})",
+                            label, i,
+                            f.envelope, g.envelope, f.climax, g.climax,
+                            f.motor2_shaped, g.motor2_shaped,
+                            f.motor1_out, g.motor1_out, f.motor2_out, g.motor2_out, row_max
                         ));
                     }
                 }
@@ -347,11 +491,10 @@ fn parity_rust_golden() {
                 new_path.set_extension("csv.new");
                 fs::write(&new_path, &csv).expect("write .csv.new");
                 panic!(
-                    "Rust parity regression vs committed golden (epsilon={}):\n  worst frame: {}\n  max env diff: {:.2e}\n  max climax diff: {:.2e}\n  first mismatches:\n    {}\n  new output written to: {}\n  (If this change is intentional, overwrite tests/parity_golden.csv and verify the Kotlin ParityTest still passes with epsilon 1e-3.)",
+                    "Rust parity regression vs committed golden (epsilon={}):\n  worst: {}\n  max diff: {:.2e}\n  first mismatches:\n    {}\n  new output written to: {}\n  (If this change is intentional, overwrite tests/parity_golden.csv and verify the Kotlin ParityTest still passes with epsilon 1e-3.)",
                     epsilon,
-                    worst_frame,
-                    max_env_diff,
-                    max_climax_diff,
+                    worst,
+                    max_diff,
                     mismatches.join("\n    "),
                     new_path.display(),
                 );

@@ -36,9 +36,6 @@ enum class AudioSourceMode {
     Microphone
 }
 
-private const val OUTPUT_RISE_MS = 4f
-private const val OUTPUT_FALL_MS = 18f
-
 // ---------------------------------------------------------------------------
 // Processing state -- holds all live signal chain state
 // ---------------------------------------------------------------------------
@@ -93,6 +90,7 @@ data class ProcessingParams(
     val minVibe: Float = 0f,
     val maxVibe: Float = 1f,
     val outputGain: Float = 1f,
+    val outputSlewMs: Float = 85f,
     val climaxEnabled: Boolean = false,
     val climaxIntensity: Float = 0.7f,
     val climaxBuildUpMs: Float = 90_000f,
@@ -215,6 +213,9 @@ class AudioCaptureManager(private val context: Context) {
     var outputGain: Float
         get() = paramsRef.get().outputGain
         set(v) { paramsRef.updateAndGet { it.copy(outputGain = v) } }
+    var outputSlewMs: Float
+        get() = paramsRef.get().outputSlewMs
+        set(v) { paramsRef.updateAndGet { it.copy(outputSlewMs = v) } }
     var climaxEnabled: Boolean
         get() = paramsRef.get().climaxEnabled
         set(v) { paramsRef.updateAndGet { it.copy(climaxEnabled = v) } }
@@ -711,21 +712,16 @@ class AudioCaptureManager(private val context: Context) {
                 pattern = params.climaxPattern
             )
 
-            // Step 7: Apply output range mapping
-            val mapped = if (climaxOutput > 0.001f) {
-                params.minVibe + (params.maxVibe - params.minVibe) * climaxOutput
-            } else {
-                0f
-            }
-            val targetOutput = (mapped * params.outputGain).coerceIn(0f, 1f)
+            // Step 7: Output mapping (shared with Rust via map_output) + slew.
+            // mapOutput zeroes the target when silent or effectively zero, so
+            // the motor pumps back to rest; the slew then smooths toward it.
             val isSilent = energy < 0.005f &&
                     !gateOpen &&
                     state.envelope.state == EnvelopeState.Idle
-            outputLevel = if (isSilent || targetOutput <= 0.001f) {
-                0f
-            } else {
-                smoothOutput(outputLevel, targetOutput, deltaTimeS)
-            }
+            val targetOutput = mapOutput(
+                climaxOutput, params.minVibe, params.maxVibe, params.outputGain, isSilent
+            )
+            outputLevel = smoothOutput(outputLevel, targetOutput, deltaTimeS, params.outputSlewMs)
             val finalOutput = outputLevel.coerceIn(0f, 1f)
             state.lastFinalOutput = finalOutput
 
@@ -738,17 +734,10 @@ class AudioCaptureManager(private val context: Context) {
                 val dualCb = onDualOutputUpdate
                 if (dualCb != null && params.climaxEnabled) {
                     val motor2Raw = state.climaxEngine.motor2Output
-                    val motor2Mapped = if (!isSilent && motor2Raw > 0.001f) {
-                        params.minVibe + (params.maxVibe - params.minVibe) * motor2Raw
-                    } else {
-                        0f
-                    }
-                    val motor2Target = (motor2Mapped * params.outputGain).coerceIn(0f, 1f)
-                    outputLevel2 = if (isSilent || motor2Target <= 0.001f) {
-                        0f
-                    } else {
-                        smoothOutput(outputLevel2, motor2Target, deltaTimeS)
-                    }
+                    val motor2Target = mapOutput(
+                        motor2Raw, params.minVibe, params.maxVibe, params.outputGain, isSilent
+                    )
+                    outputLevel2 = smoothOutput(outputLevel2, motor2Target, deltaTimeS, params.outputSlewMs)
                     val motor2Final = outputLevel2.coerceIn(0f, 1f)
                     dualCb.invoke(finalOutput, motor2Final)
                 } else {
@@ -799,8 +788,37 @@ private fun smoothingAlpha(deltaTimeS: Float, timeMs: Float): Float {
     return (1f - exp(-deltaTimeS / tau)).coerceIn(0f, 1f)
 }
 
-private fun smoothOutput(current: Float, target: Float, deltaTimeS: Float): Float {
-    val timeMs = if (target >= current) OUTPUT_RISE_MS else OUTPUT_FALL_MS
+/**
+ * Map a shaped signal in [0,1] to a device output level: apply the active
+ * output range [minVibe, maxVibe] and output gain. Returns 0 when silent or
+ * when the signal is effectively zero, so the motor pumps back to rest between
+ * hits. Mirror of Rust audio::map_output -- covered by the parity golden.
+ */
+internal fun mapOutput(
+    shaped: Float,
+    minVibe: Float,
+    maxVibe: Float,
+    gain: Float,
+    isSilent: Boolean
+): Float {
+    if (isSilent || shaped <= 0.001f) return 0f
+    return ((minVibe + shaped * (maxVibe - minVibe)) * gain).coerceIn(0f, 1f)
+}
+
+/**
+ * Asymmetric output slew: rises fast (slewMs * 0.35) and falls slower (slewMs),
+ * matching the Rust desktop output stage so the haptic "pump" feel is identical
+ * on both platforms. slewMs is configurable (was a fixed 4/18ms on Android).
+ */
+private fun smoothOutput(
+    current: Float,
+    target: Float,
+    deltaTimeS: Float,
+    slewMs: Float
+): Float {
+    val upMs = (slewMs * 0.35f).coerceAtLeast(1f)
+    val downMs = slewMs.coerceAtLeast(1f)
+    val timeMs = if (target >= current) upMs else downMs
     val alpha = smoothingAlpha(deltaTimeS, timeMs)
     return (current + (target - current) * alpha).coerceIn(0f, 1f)
 }

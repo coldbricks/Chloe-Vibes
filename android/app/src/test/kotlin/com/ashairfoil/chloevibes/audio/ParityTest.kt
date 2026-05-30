@@ -2,10 +2,15 @@
 // ParityTest.kt -- Golden-file parity test for the Kotlin audio port
 //
 // Runs the complete Kotlin signal chain over the same deterministic
-// synthetic PCM that the Rust parity test (tests/parity.rs) uses, then
-// reads the Rust-generated golden CSV (tests/parity_golden.csv at the
-// repo root) and asserts that every per-frame envelope + climax pair
-// matches within epsilon 1e-3.
+// synthetic PCM that the Rust parity test (tests/parity.rs) uses, once per
+// SCENARIO, then reads the Rust-generated golden CSV
+// (tests/parity_golden.csv at the repo root) and asserts that every
+// per-frame column matches within epsilon 1e-3.
+//
+// Columns: envelope_out, climax_out, motor2_shaped (raw ClimaxEngine motor2),
+// and the shared output-stage mapping motor1_out / motor2_out (via the same
+// mapOutput used by AudioCaptureManager). The scenario list (and its order)
+// must match SCENARIOS in tests/parity.rs exactly.
 //
 // Epsilon is slightly looser than the Rust self-check (1e-4) to tolerate
 // differences in floating-point op ordering between the Rust rustfft
@@ -26,6 +31,7 @@ import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.exp
 import kotlin.math.floor
+import kotlin.math.max
 import kotlin.math.sin
 
 class ParityTest {
@@ -40,12 +46,12 @@ class ParityTest {
     private val frameSize: Int = 1024
     private val lcgSeed: Int = 0x51ED5EED.toInt()
 
-    // Test preset (must match Rust TestPreset exactly)
+    // Fixed test preset (must match Rust TestPreset exactly). Per-scenario
+    // overrides live in `scenarios`.
     private val gateThreshold = 0.02f
     private val gateAutoAmount = 0f
     private val gateSmoothing = 0f
 
-    private val triggerMode = TriggerMode.Dynamic
     private val threshold = 0.02f
     private val thresholdKnee = 0f
     private val dynamicCurve = 1f
@@ -53,7 +59,6 @@ class ParityTest {
     private val hybridBlend = 0.5f
     private val attackMs = 20f
     private val decayMs = 120f
-    private val sustainLevel = 0.5f
     private val releaseMs = 180f
     private val attackCurve = 1f
     private val decayCurve = 1f
@@ -66,10 +71,31 @@ class ParityTest {
     private val climaxTeaseDrop = 0.4f
     private val climaxSurgeBoost = 0.6f
     private val climaxPulseDepth = 0.2f
-    private val climaxPattern = ClimaxPattern.Wave
 
     private val freqMode = FrequencyMode.Full
     private val freqTarget = 1000f
+
+    // Output stage (shared mapOutput) -- must match Rust TestPreset.
+    private val minVibe = 0.1f
+    private val maxVibe = 0.9f
+    private val outputGain = 1.2f
+
+    // Scenario list -- order must match SCENARIOS in tests/parity.rs.
+    private data class Scenario(
+        val label: String,
+        val triggerMode: TriggerMode,
+        val sustainLevel: Float,
+        val climaxPattern: ClimaxPattern
+    )
+
+    private val scenarios = listOf(
+        Scenario("dynamic_wave", TriggerMode.Dynamic, 0.5f, ClimaxPattern.Wave),
+        Scenario("binary_wave", TriggerMode.Binary, 0.5f, ClimaxPattern.Wave),
+        Scenario("hybrid_wave", TriggerMode.Hybrid, 0.5f, ClimaxPattern.Wave),
+        Scenario("dynamic_highsustain", TriggerMode.Dynamic, 0.9f, ClimaxPattern.Wave),
+        Scenario("dynamic_stairs", TriggerMode.Dynamic, 0.5f, ClimaxPattern.Stairs),
+        Scenario("dynamic_surge", TriggerMode.Dynamic, 0.5f, ClimaxPattern.Surge)
+    )
 
     // -----------------------------------------------------------------------
     // Deterministic synthetic PCM -- formula must match Rust exactly.
@@ -131,9 +157,15 @@ class ParityTest {
     // Signal chain -- same shape as tests/parity.rs run_chain().
     // -----------------------------------------------------------------------
 
-    private data class FrameResult(val envelope: Float, val climax: Float)
+    private data class FrameResult(
+        val envelope: Float,
+        val climax: Float,
+        val motor2Shaped: Float,
+        val motor1Out: Float,
+        val motor2Out: Float
+    )
 
-    private fun runChain(pcm: FloatArray): List<FrameResult> {
+    private fun runChain(pcm: FloatArray, scenario: Scenario): List<FrameResult> {
         val analyzer = SpectralAnalyzer(sampleRate)
         val gate = Gate()
         val beat = BeatDetector()
@@ -168,7 +200,7 @@ class ParityTest {
                 isOnset = isOnset,
                 onsetStrength = onsetStrength,
                 currentTimeMs = currentTimeMs,
-                triggerMode = triggerMode,
+                triggerMode = scenario.triggerMode,
                 threshold = threshold,
                 thresholdKnee = thresholdKnee,
                 dynamicCurve = dynamicCurve,
@@ -176,7 +208,7 @@ class ParityTest {
                 hybridBlend = hybridBlend,
                 attackMs = attackMs,
                 decayMs = decayMs,
-                sustainLevel = sustainLevel,
+                sustainLevel = scenario.sustainLevel,
                 releaseMs = releaseMs,
                 attackCurve = attackCurve,
                 decayCurve = decayCurve,
@@ -199,13 +231,41 @@ class ParityTest {
                 teaseDrop = climaxTeaseDrop,
                 surgeBoost = climaxSurgeBoost,
                 pulseDepth = climaxPulseDepth,
-                pattern = climaxPattern
+                pattern = scenario.climaxPattern
             )
 
-            out.add(FrameResult(envOut, climaxOut))
+            // 7) Shared output stage (range map + gain + silence-zero) via the
+            // same mapOutput AudioCaptureManager uses, so it cannot drift.
+            val isSilent = energy < 0.005f && !gateOpen && env.state == EnvelopeState.Idle
+            val motor2Shaped = climax.motor2Output
+            val motor1Out = mapOutput(climaxOut, minVibe, maxVibe, outputGain, isSilent)
+            val motor2Out = mapOutput(motor2Shaped, minVibe, maxVibe, outputGain, isSilent)
+
+            out.add(FrameResult(envOut, climaxOut, motor2Shaped, motor1Out, motor2Out))
         }
 
         return out
+    }
+
+    private data class Row(
+        val scenario: String,
+        val frame: Int,
+        val envelope: Float,
+        val climax: Float,
+        val motor2Shaped: Float,
+        val motor1Out: Float,
+        val motor2Out: Float
+    )
+
+    private fun runAllScenarios(pcm: FloatArray): List<Row> {
+        val rows = ArrayList<Row>()
+        for (scenario in scenarios) {
+            val frames = runChain(pcm, scenario)
+            frames.forEachIndexed { i, f ->
+                rows.add(Row(scenario.label, i, f.envelope, f.climax, f.motor2Shaped, f.motor1Out, f.motor2Out))
+            }
+        }
+        return rows
     }
 
     // -----------------------------------------------------------------------
@@ -230,20 +290,22 @@ class ParityTest {
         return candidates.first().absoluteFile
     }
 
-    private data class GoldenRow(val frame: Int, val envelope: Float, val climax: Float)
-
-    private fun parseGolden(file: File): List<GoldenRow> {
-        val rows = ArrayList<GoldenRow>()
+    private fun parseGolden(file: File): List<Row> {
+        val rows = ArrayList<Row>()
         file.useLines { seq ->
             seq.forEachIndexed { i, line ->
                 if (i == 0) return@forEachIndexed // header
                 if (line.isBlank()) return@forEachIndexed
                 val parts = line.split(',')
                 rows.add(
-                    GoldenRow(
-                        frame = parts[0].trim().toInt(),
-                        envelope = parts[1].trim().toFloat(),
-                        climax = parts[2].trim().toFloat()
+                    Row(
+                        scenario = parts[0].trim(),
+                        frame = parts[1].trim().toInt(),
+                        envelope = parts[2].trim().toFloat(),
+                        climax = parts[3].trim().toFloat(),
+                        motor2Shaped = parts[4].trim().toFloat(),
+                        motor1Out = parts[5].trim().toFloat(),
+                        motor2Out = parts[6].trim().toFloat()
                     )
                 )
             }
@@ -260,7 +322,7 @@ class ParityTest {
         val pcm = generatePcm()
         assertEquals(totalSamples, pcm.size, "PCM length mismatch")
 
-        val frames = runChain(pcm)
+        val rows = runAllScenarios(pcm)
 
         val golden = goldenFile()
         if (!golden.isFile) {
@@ -271,42 +333,46 @@ class ParityTest {
         }
         val goldenRows = parseGolden(golden)
         assertEquals(
-            goldenRows.size, frames.size,
-            "frame count differs: golden=${goldenRows.size} kotlin=${frames.size}"
+            goldenRows.size, rows.size,
+            "row count differs: golden=${goldenRows.size} kotlin=${rows.size}"
         )
 
         val epsilon = 1e-3f
-        var maxEnvDiff = 0f
-        var maxClimaxDiff = 0f
-        var worstFrame = 0
+        var maxDiff = 0f
+        var worst = ""
         val mismatches = ArrayList<String>()
 
-        for (i in frames.indices) {
-            val k = frames[i]
+        for (i in rows.indices) {
+            val k = rows[i]
             val g = goldenRows[i]
-            assertEquals(i, g.frame, "frame index mismatch at row $i")
-            val de = abs(k.envelope - g.envelope)
-            val dc = abs(k.climax - g.climax)
-            if (de > maxEnvDiff) maxEnvDiff = de
-            if (dc > maxClimaxDiff) maxClimaxDiff = dc
-            if (de > epsilon || dc > epsilon) {
+            assertEquals(g.scenario, k.scenario, "scenario mismatch at row $i")
+            assertEquals(g.frame, k.frame, "frame index mismatch at row $i")
+            val rowMax = maxOf(
+                abs(k.envelope - g.envelope),
+                abs(k.climax - g.climax),
+                abs(k.motor2Shaped - g.motor2Shaped),
+                abs(k.motor1Out - g.motor1Out),
+                abs(k.motor2Out - g.motor2Out)
+            )
+            if (rowMax > maxDiff) maxDiff = rowMax
+            if (rowMax > epsilon) {
+                worst = "${k.scenario}#${k.frame}"
                 if (mismatches.size < 8) {
                     mismatches.add(
-                        "frame $i: env ${k.envelope} vs ${g.envelope} " +
-                                "(Δ=${"%.3e".format(de)}), climax ${k.climax} vs ${g.climax} " +
-                                "(Δ=${"%.3e".format(dc)})"
+                        "${k.scenario} frame ${k.frame}: env ${k.envelope}/${g.envelope} " +
+                                "climax ${k.climax}/${g.climax} m2s ${k.motor2Shaped}/${g.motor2Shaped} " +
+                                "m1 ${k.motor1Out}/${g.motor1Out} m2 ${k.motor2Out}/${g.motor2Out} " +
+                                "(maxΔ=${"%.3e".format(rowMax)})"
                     )
                 }
-                worstFrame = i
             }
         }
 
         if (mismatches.isNotEmpty()) {
             fail<Unit>(
                 "Kotlin parity regression vs Rust golden (epsilon=$epsilon):\n" +
-                        "  worst frame: $worstFrame\n" +
-                        "  max env diff: ${"%.3e".format(maxEnvDiff)}\n" +
-                        "  max climax diff: ${"%.3e".format(maxClimaxDiff)}\n" +
+                        "  worst: $worst\n" +
+                        "  max diff: ${"%.3e".format(maxDiff)}\n" +
                         "  first mismatches:\n    " + mismatches.joinToString("\n    ") + "\n" +
                         "  (Kotlin and Rust signal chains have drifted. " +
                         "Check recent edits to audio.rs or files under " +

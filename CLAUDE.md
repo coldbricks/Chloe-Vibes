@@ -186,15 +186,19 @@ These checks must pass before reporting a task as complete.
 
 Update this section as work progresses. It survives compaction because CLAUDE.md is re-injected each turn.
 
-**Current task:** Ongoing signal tuning and BLE responsiveness improvements
+**Current task:** Audit-driven hardening pass (branch `audit-hardening`, off a 2026-05-29 multi-agent audit that found 75 confirmed issues)
 **Blocked on:** Nothing
 **Recent changes:**
+- 2026-05-29: Parity hardening — CI now runs the Kotlin parity test; golden widened from 1→6 scenarios (Dynamic/Binary/Hybrid × Wave/Stairs/Surge + high-sustain) + motor2 + shared output-stage columns
+- 2026-05-29: Mirrored Kotlin sustain-stage clamp to match Rust; fixed spectral-centroid DC-bin bias (both engines)
+- 2026-05-29: Unified the output stage — shared `audio::map_output` (Rust) / `mapOutput` (Kotlin), parity-tested; Android slew is now configurable (`output_slew_ms`) and matches the desktop "pump" feel
+- 2026-05-29: Removed desktop-only beat-sync (TapTempo/quantize) — −581 lines in gui.rs; predictive onset (engine-level) retained
+- 2026-05-29: Settings correctness — surge_boost clamp 1.5, climax_build_up range aligned to engine, apply_preset is now a complete snapshot + re-sanitizes, fixed dead preset-migration branch
 - 2026-03-20: Improved Android haptic timing and BLE command responsiveness
-- 2026-03-20: Fixed gate threshold (raw energy), cranked gains, fixed BLE command spam
-- 2026-03-20: Added output gain slider, bumped input volume to 5x
-- 2026-03-19: Fixed gate threshold — replaced broken knee hysteresis, extended range to 0-1
-- 2026-03-19: Fixed background attack bug, added ADSR scope + manual entry + log freq slider
 
-**Known issues in current branch:**
-- No automated tests — all validation is manual on real devices (S23 Ultra + Domi 2)
-- MainScreen.kt is 1165 lines — large but functional, no immediate need to split
+**Validation:** 61 Rust tests + `cargo clippy -D warnings` + `cargo fmt --check`, and `gradlew testDebugUnitTest` (Kotlin parity across all 6 scenarios). Run both sides when touching the engine.
+
+**Known remaining audit items (not yet done):**
+- Phase-1 tail (deferred): Rust preset catalog lacks the 3 "Chloe" presets + `threshold_knee`/`dynamic_curve` fields Android has; numeric-precision refinements (f64 ms clock, precomputed FFT twiddle tables, Lorenz sub-stepping); `rms_power`/`dominant_frequency` computed in Kotlin but hardwired 0.0 in Rust
+- BLE dual-motor detection is broken on Android: it sniffs human model substrings ("Domi"/"Nora") that Lovense never advertises (devices advertise `LVS-XXXX`), so dual-motor wands silently run single-motor; no auto-reconnect on RF dropout
+- Pending audit phases: safety auto-stop/panic-stop, concurrency hardening (mic-thread join, visualizer race, onPause/onStop), Android UX/accessibility, feature work

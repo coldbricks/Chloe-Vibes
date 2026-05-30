@@ -297,8 +297,8 @@ mod tests {
 
     #[test]
     fn test_shared_f32_round_trip() {
-        let s = SharedF32::new(3.14);
-        assert!((s.load() - 3.14).abs() < 1e-6);
+        let s = SharedF32::new(1.5);
+        assert!((s.load() - 1.5).abs() < 1e-6);
         s.store(0.0);
         assert_eq!(s.load(), 0.0);
         s.store(-1.5);

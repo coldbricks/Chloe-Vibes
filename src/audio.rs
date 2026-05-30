@@ -267,8 +267,11 @@ impl SpectralAnalyzer {
 
         // Step 8: Spectral centroid (brightness)
         // Weighted average frequency, where weights are magnitudes.
+        // Skip bin 0 (DC, freq=0): it contributes nothing to weighted_sum but
+        // its magnitude would inflate total_mag, biasing the centroid (perceived
+        // brightness) downward. Must mirror the Kotlin loop start (1 until half).
         let (mut weighted_sum, mut total_mag) = (0.0f32, 0.0f32);
-        for (i, &mag) in magnitudes.iter().enumerate() {
+        for (i, &mag) in magnitudes.iter().enumerate().skip(1) {
             let freq = i as f32 * self.bin_resolution;
             weighted_sum += freq * mag;
             total_mag += mag;
@@ -1411,6 +1414,21 @@ fn smooth_step(value: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
+/// Map a shaped signal in [0,1] to a device output level: apply the active
+/// output range [min_vibe, max_vibe] and the output gain. Returns 0 when the
+/// stage is silent or the signal is effectively zero, so the motor pumps back
+/// to rest between hits instead of idling at min_vibe.
+///
+/// Shared by the desktop (gui.rs) and Android (AudioCaptureManager.kt) output
+/// stages and covered by the parity golden so the two cannot drift. The caller
+/// applies output slew (asymmetric smoothing) on top of this mapped target.
+pub fn map_output(shaped: f32, min_vibe: f32, max_vibe: f32, gain: f32, is_silent: bool) -> f32 {
+    if is_silent || shaped <= 0.001 {
+        return 0.0;
+    }
+    ((min_vibe + shaped * (max_vibe - min_vibe)) * gain).clamp(0.0, 1.0)
+}
+
 // ==========================================================================
 // Tests
 // ==========================================================================
@@ -1619,7 +1637,7 @@ mod tests {
                 ClimaxPattern::Wave,
             );
             assert!(
-                output >= 0.0 && output <= 1.5,
+                (0.0..=1.5).contains(&output),
                 "climax output should stay bounded, got {output}"
             );
         }
@@ -1895,7 +1913,7 @@ mod tests {
                 ClimaxPattern::Wave,
             );
             assert!(
-                output.is_finite() && output >= 0.0 && output <= 1.5,
+                output.is_finite() && (0.0..=1.5).contains(&output),
                 "climax output must be finite and bounded, got {output} at frame {i}"
             );
         }

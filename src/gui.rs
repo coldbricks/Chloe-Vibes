@@ -284,10 +284,6 @@ struct GuiApp {
     raw_energy: f32,
     using_rms_fallback: bool,
     output_delay: VecDeque<f32>,
-    tap_tempo: TapTempo,
-    quantize_enabled: bool,
-    beat_sync_mode: BeatSyncMode,
-    quantize_division: BeatDivision,
 
     // Preset UI state
     selected_preset_category: PresetCategory,
@@ -326,429 +322,6 @@ mod palette {
 const HISTORY_LEN: usize = 256;
 const ADSR_PREVIEW_HEIGHT: f32 = 100.0;
 const OUTPUT_HISTORY_HEIGHT: f32 = 80.0;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BeatDivision {
-    Half,
-    Quarter,
-    Eighth,
-}
-
-impl BeatDivision {
-    fn period_multiplier(self) -> f32 {
-        match self {
-            Self::Half => 2.0,
-            Self::Quarter => 1.0,
-            Self::Eighth => 0.5,
-        }
-    }
-
-    fn pulse_sharpness(self) -> f32 {
-        match self {
-            Self::Half => 2.0,
-            Self::Quarter => 2.4,
-            Self::Eighth => 2.9,
-        }
-    }
-
-    fn accent_width(self) -> f32 {
-        match self {
-            Self::Half => 0.28,
-            Self::Quarter => 0.22,
-            Self::Eighth => 0.16,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BeatSyncMode {
-    Tap,
-    Auto,
-    Hybrid,
-}
-
-impl BeatSyncMode {
-    fn allows_auto(self) -> bool {
-        matches!(self, Self::Auto | Self::Hybrid)
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Tap => "Tap",
-            Self::Auto => "Auto",
-            Self::Hybrid => "Hybrid",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BeatSyncSource {
-    None,
-    Tap,
-    Auto,
-    Hybrid,
-}
-
-impl BeatSyncSource {
-    fn label(self) -> &'static str {
-        match self {
-            Self::None => "--",
-            Self::Tap => "Tap",
-            Self::Auto => "Auto",
-            Self::Hybrid => "Hybrid",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct BeatSyncState {
-    bpm: Option<f32>,
-    confidence: f32,
-    source: BeatSyncSource,
-}
-
-struct TapTempo {
-    manual_timestamps_ms: VecDeque<f32>,
-    auto_timestamps_ms: VecDeque<f32>,
-    manual_bpm: Option<f32>,
-    auto_bpm: Option<f32>,
-    manual_confidence: f32,
-    auto_confidence: f32,
-    manual_last_ms: Option<f32>,
-    auto_last_ms: Option<f32>,
-    phase_anchor_ms: Option<f32>,
-    active_bpm: Option<f32>,
-    active_confidence: f32,
-    active_source: BeatSyncSource,
-}
-
-impl TapTempo {
-    const MAX_TAPS: usize = 10;
-    const MAX_AUTO_HITS: usize = 24;
-    const TAP_RESET_GAP_MS: f32 = 2200.0;
-    const AUTO_RESET_GAP_MS: f32 = 1800.0;
-    const MIN_INTERVAL_MS: f32 = 120.0;
-    const MAX_INTERVAL_MS: f32 = 2000.0;
-    const MIN_BPM: f32 = 45.0;
-    const MAX_BPM: f32 = 220.0;
-    const MANUAL_STALE_MS: f32 = 9000.0;
-    const AUTO_STALE_MS: f32 = 5000.0;
-
-    fn new() -> Self {
-        Self {
-            manual_timestamps_ms: VecDeque::with_capacity(Self::MAX_TAPS),
-            auto_timestamps_ms: VecDeque::with_capacity(Self::MAX_AUTO_HITS),
-            manual_bpm: None,
-            auto_bpm: None,
-            manual_confidence: 0.0,
-            auto_confidence: 0.0,
-            manual_last_ms: None,
-            auto_last_ms: None,
-            phase_anchor_ms: None,
-            active_bpm: None,
-            active_confidence: 0.0,
-            active_source: BeatSyncSource::None,
-        }
-    }
-
-    fn reset(&mut self) {
-        self.manual_timestamps_ms.clear();
-        self.auto_timestamps_ms.clear();
-        self.manual_bpm = None;
-        self.auto_bpm = None;
-        self.manual_confidence = 0.0;
-        self.auto_confidence = 0.0;
-        self.manual_last_ms = None;
-        self.auto_last_ms = None;
-        self.phase_anchor_ms = None;
-        self.active_bpm = None;
-        self.active_confidence = 0.0;
-        self.active_source = BeatSyncSource::None;
-    }
-
-    fn tap_now(&mut self, current_time_ms: f32, mode: BeatSyncMode) {
-        if let Some(previous_ms) = self.manual_last_ms {
-            let delta_ms = current_time_ms - previous_ms;
-            if delta_ms < Self::MIN_INTERVAL_MS * 0.6 {
-                return;
-            }
-            if delta_ms > Self::TAP_RESET_GAP_MS {
-                self.manual_timestamps_ms.clear();
-            }
-        }
-
-        self.manual_last_ms = Some(current_time_ms);
-        self.manual_timestamps_ms.push_back(current_time_ms);
-        while self.manual_timestamps_ms.len() > Self::MAX_TAPS {
-            self.manual_timestamps_ms.pop_front();
-        }
-
-        if let Some((bpm, confidence)) = Self::estimate_bpm(&self.manual_timestamps_ms) {
-            self.manual_bpm = Some(bpm);
-            self.manual_confidence = confidence;
-        }
-        self.align_phase(current_time_ms, true);
-        self.refresh_state(current_time_ms, mode);
-    }
-
-    fn process_auto_onset(
-        &mut self,
-        is_onset: bool,
-        onset_strength: f32,
-        current_time_ms: f32,
-        mode: BeatSyncMode,
-    ) {
-        if !is_onset {
-            self.refresh_state(current_time_ms, mode);
-            return;
-        }
-        if onset_strength < 1.02 {
-            self.refresh_state(current_time_ms, mode);
-            return;
-        }
-
-        if let Some(previous_ms) = self.auto_last_ms {
-            let delta_ms = current_time_ms - previous_ms;
-            if delta_ms < Self::MIN_INTERVAL_MS {
-                return;
-            }
-            if delta_ms > Self::AUTO_RESET_GAP_MS {
-                self.auto_timestamps_ms.clear();
-            }
-        }
-
-        self.auto_last_ms = Some(current_time_ms);
-        self.auto_timestamps_ms.push_back(current_time_ms);
-        while self.auto_timestamps_ms.len() > Self::MAX_AUTO_HITS {
-            self.auto_timestamps_ms.pop_front();
-        }
-
-        if let Some((bpm, confidence)) = Self::estimate_bpm(&self.auto_timestamps_ms) {
-            self.auto_bpm = Some(bpm);
-            self.auto_confidence = confidence;
-        }
-
-        if mode.allows_auto() {
-            self.align_phase(current_time_ms, false);
-        }
-
-        self.refresh_state(current_time_ms, mode);
-    }
-
-    fn quantize_mod(
-        &mut self,
-        current_time_ms: f32,
-        division: BeatDivision,
-        mode: BeatSyncMode,
-    ) -> f32 {
-        self.refresh_state(current_time_ms, mode);
-
-        let bpm = match self.active_bpm {
-            Some(value) => value,
-            None => return 1.0,
-        };
-        let phase_anchor_ms = self.phase_anchor_ms.unwrap_or(current_time_ms);
-        let beat_period_ms = 60_000.0 / bpm.max(1.0);
-        let cycle_ms = beat_period_ms * division.period_multiplier();
-        if !cycle_ms.is_finite() || cycle_ms < 1.0 {
-            return 1.0;
-        }
-
-        let phase = ((current_time_ms - phase_anchor_ms).rem_euclid(cycle_ms)) / cycle_ms;
-        let sinusoid = 0.5 + 0.5 * (phase * std::f32::consts::TAU).cos();
-        let nearest_edge = phase.min(1.0 - phase);
-        let edge_accent =
-            (1.0 - (nearest_edge / division.accent_width()).clamp(0.0, 1.0)).powf(3.0);
-        let pulse =
-            (0.7 * sinusoid.powf(division.pulse_sharpness()) + 0.3 * edge_accent).clamp(0.0, 1.0);
-
-        let depth = (0.22 + 0.68 * self.active_confidence).clamp(0.20, 0.95);
-        let floor = 1.0 - depth;
-        (floor + depth * pulse).clamp(0.0, 1.0)
-    }
-
-    fn sync_state(&mut self, current_time_ms: f32, mode: BeatSyncMode) -> BeatSyncState {
-        self.refresh_state(current_time_ms, mode);
-        BeatSyncState {
-            bpm: self.active_bpm,
-            confidence: self.active_confidence,
-            source: self.active_source,
-        }
-    }
-
-    fn refresh_state(&mut self, current_time_ms: f32, mode: BeatSyncMode) {
-        let manual = Self::fresh_signal(
-            self.manual_bpm,
-            self.manual_confidence,
-            self.manual_last_ms,
-            current_time_ms,
-            Self::MANUAL_STALE_MS,
-        );
-        let auto = Self::fresh_signal(
-            self.auto_bpm,
-            self.auto_confidence,
-            self.auto_last_ms,
-            current_time_ms,
-            Self::AUTO_STALE_MS,
-        );
-
-        self.active_bpm = None;
-        self.active_confidence = 0.0;
-        self.active_source = BeatSyncSource::None;
-
-        match mode {
-            BeatSyncMode::Tap => {
-                if let Some((bpm, confidence)) = manual {
-                    self.active_bpm = Some(bpm);
-                    self.active_confidence = confidence;
-                    self.active_source = BeatSyncSource::Tap;
-                }
-            }
-            BeatSyncMode::Auto => {
-                if let Some((bpm, confidence)) = auto {
-                    self.active_bpm = Some(bpm);
-                    self.active_confidence = confidence;
-                    self.active_source = BeatSyncSource::Auto;
-                }
-            }
-            BeatSyncMode::Hybrid => match (manual, auto) {
-                (Some((manual_bpm, manual_conf)), Some((auto_bpm, auto_conf))) => {
-                    let manual_weight = manual_conf.max(0.05) * 1.15;
-                    let auto_weight = auto_conf.max(0.05);
-                    let total_weight = (manual_weight + auto_weight).max(0.0001);
-                    let blended_bpm =
-                        (manual_bpm * manual_weight + auto_bpm * auto_weight) / total_weight;
-                    self.active_bpm = Some(blended_bpm.clamp(Self::MIN_BPM, Self::MAX_BPM));
-                    self.active_confidence = (manual_conf.max(auto_conf) * 0.85
-                        + manual_conf.min(auto_conf) * 0.15)
-                        .clamp(0.0, 1.0);
-                    self.active_source = BeatSyncSource::Hybrid;
-                }
-                (Some((bpm, confidence)), None) => {
-                    self.active_bpm = Some(bpm);
-                    self.active_confidence = confidence;
-                    self.active_source = BeatSyncSource::Tap;
-                }
-                (None, Some((bpm, confidence))) => {
-                    self.active_bpm = Some(bpm);
-                    self.active_confidence = confidence;
-                    self.active_source = BeatSyncSource::Auto;
-                }
-                (None, None) => {}
-            },
-        }
-    }
-
-    fn fresh_signal(
-        bpm: Option<f32>,
-        confidence: f32,
-        last_event_ms: Option<f32>,
-        current_time_ms: f32,
-        stale_after_ms: f32,
-    ) -> Option<(f32, f32)> {
-        let bpm = bpm?;
-        let last_event_ms = last_event_ms?;
-        let age_ms = (current_time_ms - last_event_ms).max(0.0);
-        if age_ms > stale_after_ms {
-            return None;
-        }
-
-        let freshness = (-age_ms / (stale_after_ms * 0.45)).exp().clamp(0.0, 1.0);
-        Some((
-            bpm.clamp(Self::MIN_BPM, Self::MAX_BPM),
-            (confidence * freshness).clamp(0.0, 1.0),
-        ))
-    }
-
-    fn estimate_bpm(timestamps_ms: &VecDeque<f32>) -> Option<(f32, f32)> {
-        if timestamps_ms.len() < 2 {
-            return None;
-        }
-
-        let mut intervals_ms = Vec::with_capacity(timestamps_ms.len().saturating_sub(1));
-        let mut previous = *timestamps_ms.front()?;
-        for &timestamp in timestamps_ms.iter().skip(1) {
-            let delta_ms = timestamp - previous;
-            previous = timestamp;
-            if (Self::MIN_INTERVAL_MS..=Self::MAX_INTERVAL_MS).contains(&delta_ms) {
-                intervals_ms.push(delta_ms);
-            }
-        }
-
-        if intervals_ms.is_empty() {
-            return None;
-        }
-
-        if intervals_ms.len() > 8 {
-            intervals_ms = intervals_ms[intervals_ms.len() - 8..].to_vec();
-        }
-
-        let mut sorted = intervals_ms.clone();
-        sorted.sort_by(|a, b| a.total_cmp(b));
-        let median_ms = sorted[sorted.len() / 2];
-        let tolerance_ms = (median_ms * 0.24).max(18.0);
-        let filtered: Vec<f32> = intervals_ms
-            .into_iter()
-            .filter(|value| (*value - median_ms).abs() <= tolerance_ms)
-            .collect();
-
-        if filtered.len() < 2 {
-            return None;
-        }
-
-        let mean_ms = filtered.iter().sum::<f32>() / filtered.len() as f32;
-        let variance = filtered
-            .iter()
-            .map(|value| (value - mean_ms).powi(2))
-            .sum::<f32>()
-            / filtered.len() as f32;
-        let jitter = variance.sqrt() / mean_ms.max(1.0);
-
-        let mut bpm = 60_000.0 / mean_ms.max(1.0);
-        while bpm < Self::MIN_BPM {
-            bpm *= 2.0;
-        }
-        while bpm > Self::MAX_BPM {
-            bpm *= 0.5;
-        }
-
-        let stability = (1.0 - (jitter / 0.18)).clamp(0.0, 1.0);
-        let sample_score = ((filtered.len() as f32 - 1.0) / 6.0).clamp(0.0, 1.0);
-        let confidence = (0.28 + 0.72 * sample_score) * stability;
-
-        Some((
-            bpm.clamp(Self::MIN_BPM, Self::MAX_BPM),
-            confidence.clamp(0.0, 1.0),
-        ))
-    }
-
-    fn align_phase(&mut self, event_time_ms: f32, hard_reset: bool) {
-        if hard_reset {
-            self.phase_anchor_ms = Some(event_time_ms);
-            return;
-        }
-
-        let period_ms = self
-            .active_bpm
-            .or(self.manual_bpm)
-            .or(self.auto_bpm)
-            .map(|bpm| 60_000.0 / bpm.max(1.0));
-        let (Some(anchor_ms), Some(period_ms)) = (self.phase_anchor_ms, period_ms) else {
-            self.phase_anchor_ms = Some(event_time_ms);
-            return;
-        };
-
-        if !period_ms.is_finite() || period_ms <= 1.0 {
-            self.phase_anchor_ms = Some(event_time_ms);
-            return;
-        }
-
-        let beats_from_anchor = ((event_time_ms - anchor_ms) / period_ms).round();
-        let expected_event = anchor_ms + beats_from_anchor * period_ms;
-        let phase_error_ms = event_time_ms - expected_event;
-        self.phase_anchor_ms = Some(anchor_ms + phase_error_ms * 0.35);
-    }
-}
 
 // Stop devices on shutdown
 impl Drop for GuiApp {
@@ -971,7 +544,13 @@ impl GuiApp {
 
         let mut settings = ctx.storage.map(Settings::load).unwrap_or_default();
         settings.sanitize();
-        if settings.current_preset_name.eq_ignore_ascii_case("Default") {
+        // Recover from a stored preset name that no longer maps to a real preset:
+        // legacy "Default" files, or a preset renamed/removed across versions.
+        // An empty name means "custom" (user-edited) and must be left untouched.
+        let stored_name = settings.current_preset_name.clone();
+        let is_unknown_named =
+            !stored_name.is_empty() && presets::find_preset(&stored_name).is_none();
+        if stored_name.eq_ignore_ascii_case("Default") || is_unknown_named {
             if let Some(preset) = presets::find_preset("Ride Intensity") {
                 settings.apply_preset(&preset);
             }
@@ -1052,10 +631,6 @@ impl GuiApp {
             raw_energy: 0.0,
             using_rms_fallback: false,
             output_delay: VecDeque::with_capacity(512),
-            tap_tempo: TapTempo::new(),
-            quantize_enabled: false,
-            beat_sync_mode: BeatSyncMode::Hybrid,
-            quantize_division: BeatDivision::Quarter,
 
             // Preset UI
             selected_preset_category: PresetCategory::Init,
@@ -1409,12 +984,6 @@ impl eframe::App for GuiApp {
                 let onset_ok = is_onset
                     && onset_strength > 1.02
                     && energy > self.settings.gate_threshold * 0.40;
-                self.tap_tempo.process_auto_onset(
-                    onset_ok,
-                    onset_strength,
-                    current_time_ms,
-                    self.beat_sync_mode,
-                );
 
                 // 5. Gate (uses raw pre-volume energy so threshold is
                 // volume-independent, matching Android behavior)
@@ -1452,7 +1021,7 @@ impl eframe::App for GuiApp {
                 );
 
                 // 7. Optional climax modulation layer
-                let mut shaped_output = self.climax_engine.process(
+                let shaped_output = self.climax_engine.process(
                     envelope_output,
                     energy,
                     self.gate_is_open,
@@ -1468,13 +1037,6 @@ impl eframe::App for GuiApp {
                     self.settings.climax_pulse_depth,
                     self.settings.climax_pattern,
                 );
-                if self.quantize_enabled {
-                    shaped_output *= self.tap_tempo.quantize_mod(
-                        current_time_ms,
-                        self.quantize_division,
-                        self.beat_sync_mode,
-                    );
-                }
                 self.climax_phase = if self.settings.climax_mode_enabled {
                     self.climax_engine.phase_progress(
                         current_time_ms,
@@ -1484,22 +1046,21 @@ impl eframe::App for GuiApp {
                     0.0
                 };
 
-                // 8. Apply output range (min_vibe / max_vibe) + output gain
-                let mapped = self.settings.min_vibe
-                    + shaped_output
-                        * (self.settings.max_vibe - self.settings.min_vibe);
-                let final_intensity = (mapped * self.settings.output_gain).clamp(0.0, 1.0);
-
-                // 9. Safety: force to zero if energy is negligible.
-                // Only reset the envelope, NEVER the climax engine — a brief
-                // silence between notes should not destroy minutes of build-up.
-                let final_intensity = if energy < 0.005 && !self.gate_is_open
-                    && self.envelope.state == audio::EnvelopeState::Idle
-                {
-                    0.0
-                } else {
-                    final_intensity.clamp(0.0, 1.0)
-                };
+                // 8. Apply output range (min_vibe / max_vibe) + output gain via
+                // the shared, parity-tested output mapping. is_silent forces a
+                // true zero (energy negligible, gate shut, envelope idle) so a
+                // brief silence pumps back to rest; the climax engine is
+                // intentionally NOT reset so minutes of build-up survive.
+                let is_silent = energy < 0.005
+                    && !self.gate_is_open
+                    && self.envelope.state == audio::EnvelopeState::Idle;
+                let final_intensity = audio::map_output(
+                    shaped_output,
+                    self.settings.min_vibe,
+                    self.settings.max_vibe,
+                    self.settings.output_gain,
+                    is_silent,
+                );
 
                 // Apply timing trim (delay/advance) via small ring buffer
                 let dt = delta_time.max(0.0001);
@@ -1615,9 +1176,13 @@ impl eframe::App for GuiApp {
             } else {
                 self.vibration_level
             };
-            let motor2_mapped = self.settings.min_vibe
-                + motor2_raw * (self.settings.max_vibe - self.settings.min_vibe);
-            let motor2_gained = (motor2_mapped * self.settings.output_gain).clamp(0.0, 1.0);
+            let motor2_gained = audio::map_output(
+                motor2_raw,
+                self.settings.min_vibe,
+                self.settings.max_vibe,
+                self.settings.output_gain,
+                is_silent,
+            );
             // Apply same slew smoothing as motor1 so both motors have matching latency
             let m2_up_ms = (self.settings.output_slew_ms * 0.35).max(1.0);
             let m2_down_ms = self.settings.output_slew_ms.max(1.0);
@@ -1749,8 +1314,6 @@ impl eframe::App for GuiApp {
                 if ui.add(legacy_btn).clicked() {
                     self.settings.use_advanced_processing = false;
                     self.settings.climax_mode_enabled = false;
-                    self.quantize_enabled = false;
-                    self.tap_tempo.reset();
                     self.envelope.reset();
                     self.climax_engine.reset(current_time_ms);
                     mark_custom(&mut self.settings);
@@ -2004,8 +1567,6 @@ impl eframe::App for GuiApp {
                         }
                         self.settings.use_advanced_processing = true;
                         self.settings.climax_mode_enabled = false;
-                        self.quantize_enabled = false;
-                        self.tap_tempo.reset();
                         self.envelope.reset();
                         self.climax_engine.reset(current_time_ms);
                     }
@@ -2214,88 +1775,6 @@ impl eframe::App for GuiApp {
                         self.settings.trim_ms = defaults::TRIM_MS;
                     }
 
-                    ui.separator();
-                    ui.checkbox(&mut self.quantize_enabled, "Quantize");
-                    if self.quantize_enabled {
-                        ComboBox::from_id_salt("beat_sync_mode")
-                            .selected_text(self.beat_sync_mode.label())
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut self.beat_sync_mode,
-                                    BeatSyncMode::Tap,
-                                    "Tap",
-                                );
-                                ui.selectable_value(
-                                    &mut self.beat_sync_mode,
-                                    BeatSyncMode::Auto,
-                                    "Auto",
-                                );
-                                ui.selectable_value(
-                                    &mut self.beat_sync_mode,
-                                    BeatSyncMode::Hybrid,
-                                    "Hybrid",
-                                );
-                            });
-
-                        ComboBox::from_id_salt("quantize_div")
-                            .selected_text(match self.quantize_division {
-                                BeatDivision::Quarter => "1/4",
-                                BeatDivision::Eighth => "1/8",
-                                BeatDivision::Half => "1/2",
-                            })
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut self.quantize_division,
-                                    BeatDivision::Half,
-                                    "1/2",
-                                );
-                                ui.selectable_value(
-                                    &mut self.quantize_division,
-                                    BeatDivision::Quarter,
-                                    "1/4",
-                                );
-                                ui.selectable_value(
-                                    &mut self.quantize_division,
-                                    BeatDivision::Eighth,
-                                    "1/8",
-                                );
-                            });
-                        if ui.button("Tap").clicked() {
-                            self.tap_tempo
-                                .tap_now(current_time_ms, self.beat_sync_mode);
-                        }
-                        if ui.button("Reset BPM").clicked() {
-                            self.tap_tempo.reset();
-                        }
-                        let sync_state = self
-                            .tap_tempo
-                            .sync_state(current_time_ms, self.beat_sync_mode);
-                        if let Some(bpm) = sync_state.bpm {
-                            ui.label(
-                                RichText::new(format!("BPM {:.1}", bpm))
-                                    .size(10.0)
-                                    .color(palette::ACCENT_TEAL)
-                                    .monospace(),
-                            );
-                            ui.label(
-                                RichText::new(format!(
-                                    "{} {:>2.0}%",
-                                    sync_state.source.label(),
-                                    sync_state.confidence * 100.0
-                                ))
-                                .size(10.0)
-                                .color(palette::TEXT_SECONDARY)
-                                .monospace(),
-                            );
-                        } else {
-                            ui.label(
-                                RichText::new("BPM --")
-                                    .size(10.0)
-                                    .color(palette::TEXT_DIM)
-                                    .monospace(),
-                            );
-                        }
-                    }
                 });
 
                 ui.add_space(2.0);

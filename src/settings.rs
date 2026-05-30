@@ -194,7 +194,18 @@ impl Settings {
         self.climax_pulse_depth = preset.climax_pulse_depth;
         self.climax_pattern = preset.climax_pattern;
         self.output_gain = defaults::OUTPUT_GAIN;
+        // Reset legacy (pre-ADSR) params too, so an applied preset is a complete
+        // snapshot — otherwise stale legacy state leaks across preset changes,
+        // violating the immutable-snapshot invariant.
+        self.enable_persistence = defaults::ENABLE_PERSISTENCE;
+        self.hold_delay_ms = defaults::HOLD_DELAY_MS;
+        self.decay_rate_per_sec = defaults::DECAY_RATE_PER_SEC;
+        self.use_advanced_processing = defaults::USE_ADVANCED_PROCESSING;
         self.current_preset_name = preset.name.to_string();
+        // Re-clamp to valid ranges so applied state == reloaded state (e.g. a
+        // preset's surge_boost of 1.2 must survive, which is why sanitize() now
+        // clamps surge_boost to 1.5 rather than 1.0).
+        self.sanitize();
     }
 
     /// Clamp all numeric settings to valid ranges (guards against corrupted storage)
@@ -223,10 +234,14 @@ impl Settings {
         self.trim_ms = self.trim_ms.clamp(-500.0, 500.0);
         self.target_frequency = self.target_frequency.clamp(20.0, 20000.0);
         self.climax_intensity = self.climax_intensity.clamp(0.0, 1.0);
-        self.climax_build_up_ms = self.climax_build_up_ms.clamp(10000.0, 600000.0);
+        // Match the ClimaxEngine's own clamp (audio.rs: build_up_ms.clamp(8_000, 240_000))
+        // so a persisted value is never silently re-interpreted by the engine.
+        self.climax_build_up_ms = self.climax_build_up_ms.clamp(8_000.0, 240_000.0);
         self.climax_tease_ratio = self.climax_tease_ratio.clamp(0.0, 1.0);
         self.climax_tease_drop = self.climax_tease_drop.clamp(0.0, 1.0);
-        self.climax_surge_boost = self.climax_surge_boost.clamp(0.0, 1.0);
+        // Engine accepts up to 1.5 (audio.rs surge path); clamping to 1.0 here would
+        // silently destroy the "Break Me" preset's intentional 1.2 surge on reload.
+        self.climax_surge_boost = self.climax_surge_boost.clamp(0.0, 1.5);
         self.climax_pulse_depth = self.climax_pulse_depth.clamp(0.0, 1.0);
     }
 }

@@ -220,7 +220,11 @@ class EnvelopeProcessor {
                             sin(currentTimeMs * 0.00491f) * 0.10f
                     )
                     val modulation = 1f + primary + secondary + tertiary + crossFreq + noise
-                    value = sustainLevel * modulation
+                    // Clamp to [0,1] to mirror Rust (audio.rs: sustain_level * modulation
+                    // is .clamp(0.0, 1.0)). Without this the engines diverge for any
+                    // sustain_level above ~0.61, where modulation (peak ~1.64) pushes the
+                    // stored value past 1.0 on Kotlin only.
+                    value = (sustainLevel * modulation).coerceIn(0f, 1f)
                 }
             }
 

@@ -200,9 +200,12 @@ class SpectralAnalyzer(private val sampleRate: Float = 48000f) {
         val rmsPower = if (available.isNotEmpty()) sqrt(rmsSum / available.size) else 0f
 
         // Step 8: Spectral centroid
+        // Skip bin 0 (DC, freq=0): it contributes nothing to weightedSum but its
+        // magnitude would inflate totalMag, biasing the centroid downward. Must
+        // mirror the Rust loop (magnitudes.iter().enumerate().skip(1)).
         var weightedSum = 0f
         var totalMag = 0f
-        for (i in 0 until half) {
+        for (i in 1 until half) {
             val freq = i * binResolution
             weightedSum += freq * magnitudes[i]
             totalMag += magnitudes[i]
