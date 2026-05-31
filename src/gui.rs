@@ -1162,36 +1162,38 @@ impl eframe::App for GuiApp {
             // Store processed output for device tasks
             self.processed_output.store(self.vibration_level);
 
-            // Store secondary motor output (from ClimaxEngine dual-motor phasing).
-            // When climax is enabled: motor2 gets the phase-offset signal.
-            // When climax is disabled: motor2 tracks motor1.
-            // Safety zero-out for motor2 matching motor1 (don't buzz during silence)
+            // Secondary motor (motor 2) is driven by the HIGH-frequency content
+            // of the live audio. Motor 1 carries the full body vibe; on a
+            // dual-motor device this puts bass/body on motor 1 and treble/detail
+            // on motor 2 -- tuned by the audio itself, not the climax engine.
+            // NOTE: motor2 scales the already-mapped motor1 level directly (no
+            // second map_output), so both motors live in the same output space.
             let is_silent = self.raw_energy < 0.005
                 && !self.gate_is_open
                 && self.envelope.state == audio::EnvelopeState::Idle;
-            let motor2_raw = if is_silent {
+            let motor2_target = if is_silent {
                 0.0
-            } else if self.settings.climax_mode_enabled {
-                self.climax_engine.motor2_output
             } else {
-                self.vibration_level
+                // Treble fraction = high bands (Hi-Mid..Air) / total band energy.
+                // Bands 0..4 = Sub/Bass/Lo-Mid/Mid, bands 4..8 = Hi-Mid/Pres/Brill/Air.
+                let be = &self.last_spectral.band_energies;
+                let low_e = be[0] + be[1] + be[2] + be[3];
+                let high_e = be[4] + be[5] + be[6] + be[7];
+                let total = low_e + high_e;
+                let treble_frac = if total > 1e-9 { high_e / total } else { 0.0 };
+                // Gain so even modest treble lifts motor 2; clamp keeps it sane.
+                let treble_weight = (treble_frac * 3.0).clamp(0.0, 1.0);
+                (self.vibration_level * treble_weight).clamp(0.0, 1.0)
             };
-            let motor2_gained = audio::map_output(
-                motor2_raw,
-                self.settings.min_vibe,
-                self.settings.max_vibe,
-                self.settings.output_gain,
-                is_silent,
-            );
             // Apply same slew smoothing as motor1 so both motors have matching latency
             let m2_up_ms = (self.settings.output_slew_ms * 0.35).max(1.0);
             let m2_down_ms = self.settings.output_slew_ms.max(1.0);
-            let motor2_alpha = if motor2_gained >= self.motor2_level {
+            let motor2_alpha = if motor2_target >= self.motor2_level {
                 smoothing_alpha(delta_time, m2_up_ms)
             } else {
                 smoothing_alpha(delta_time, m2_down_ms)
             };
-            self.motor2_level += (motor2_gained - self.motor2_level) * motor2_alpha;
+            self.motor2_level += (motor2_target - self.motor2_level) * motor2_alpha;
             self.motor2_level = self.motor2_level.clamp(0.0, 1.0);
             self.processed_output_2.store(self.motor2_level);
 

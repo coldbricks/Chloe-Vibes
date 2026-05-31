@@ -22,47 +22,6 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      - name: Patch BLE scan behavior for unnamed devices
-        shell: python
-        run: |
-          from pathlib import Path
-
-          path = Path('android/app/src/main/kotlin/com/ashairfoil/chloevibes/device/BleDeviceManager.kt')
-          text = path.read_text()
-
-          old = '''            val device = result.device
-            // Device name can be null in early advertisements — try scanRecord
-            // first (more reliable), then fall back to device.name, then skip
-            // only if both are null AND we haven't seen this address before.
-            val name = result.scanRecord?.deviceName
-                ?: device.name
-                ?: discoveredDevices[device.address]?.name
-                ?: return
-            val isLovense = name.startsWith("LVS-") || name.contains("Lovense", ignoreCase = true)
-
-            val info = BleDeviceInfo(
-'''
-
-          new = '''            val device = result.device
-            val advertisedName = result.scanRecord?.deviceName
-                ?: device.name
-                ?: discoveredDevices[device.address]?.name
-            val name = advertisedName ?: "Unknown BLE ${device.address.takeLast(5)}"
-            val isLovense = name.startsWith("LVS-") || name.contains("Lovense", ignoreCase = true)
-
-            Log.d(
-                "ChloeVibes",
-                "BLE seen: name=$advertisedName, address=${device.address}, rssi=${result.rssi}, uuids=${result.scanRecord?.serviceUuids}"
-            )
-
-            val info = BleDeviceInfo(
-'''
-
-          if old not in text:
-              raise SystemExit('Expected BLE scan block not found')
-
-          path.write_text(text.replace(old, new))
-
       - name: Build debug APK
         working-directory: android
         run: |

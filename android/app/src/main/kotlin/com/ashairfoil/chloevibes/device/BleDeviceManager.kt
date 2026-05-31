@@ -145,6 +145,24 @@ class BleDeviceManager(private val context: Context) {
         /** CCCD descriptor UUID for enabling notifications. */
         val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
         private const val SCAN_TIMEOUT_MS = 15_000L
+
+        // Lovense DeviceType identifiers (the code before the first ':' in the
+        // "<code>:<fw>:<mac>" reply) with two INDEPENDENT vibration motors that
+        // accept Vibrate1:/Vibrate2:. Codes can be multi-letter, so we match the
+        // FULL code exactly -- e.g. "OC" (Osci 3) must not collide with "O" (Osci).
+        //
+        // Only "P" (Edge / Edge 2) is fixture-verified high-confidence, so it is
+        // the only one enabled. The design is deliberately ASYMMETRIC: a false
+        // "dual" makes a single-motor toy drop Vibrate2 and possibly go silent,
+        // whereas leaving a real dual device on plain "Vibrate:" still drives all
+        // its motors uniformly -- a safe, working fallback. So when unsure, stay
+        // single. Single-motor models (Domi "W", Lush "S", Gush "ED", Nora, Max,
+        // Hush "Z", ...) are intentionally NOT here.
+        //
+        // Medium-confidence dual candidates from protocol research, to enable only
+        // after testing on real hardware: "J" (Dolce), "N" (Gemini), "OC" (Osci 3).
+        // Flexer "EI" is dual-actuator but uses Mply:, not Vibrate1/2 -- do NOT add.
+        private val DUAL_VIBRATE_IDENTIFIERS = setOf("P")
     }
 
     // -----------------------------------------------------------------------
@@ -187,13 +205,20 @@ class BleDeviceManager(private val context: Context) {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             val device = result.device
             // Device name can be null in early advertisements — try scanRecord
-            // first (more reliable), then fall back to device.name, then skip
-            // only if both are null AND we haven't seen this address before.
-            val name = result.scanRecord?.deviceName
+            // first (more reliable), then fall back to device.name, then to a
+            // previously-seen name. Unlike before, we no longer drop unnamed
+            // devices: a Lovense wand often advertises with a null name for the
+            // first few packets, so skipping them hid the device entirely.
+            val advertisedName = result.scanRecord?.deviceName
                 ?: device.name
                 ?: discoveredDevices[device.address]?.name
-                ?: return
+            val name = advertisedName ?: "Unknown BLE ${device.address.takeLast(5)}"
             val isLovense = name.startsWith("LVS-") || name.contains("Lovense", ignoreCase = true)
+
+            Log.d(
+                "ChloeVibes",
+                "BLE seen: name=$advertisedName, address=${device.address}, rssi=${result.rssi}, uuids=${result.scanRecord?.serviceUuids}"
+            )
 
             val info = BleDeviceInfo(
                 name = name,
@@ -253,15 +278,10 @@ class BleDeviceManager(private val context: Context) {
                     Log.d("ChloeVibes", "BLE connected to: ${gatt.device.name ?: gatt.device.address}")
                     connectionState = ConnectionState.Connected
                     connectedDeviceName = gatt.device.name
-                    // Detect dual-motor devices from name at connection time
-                    gatt.device.name?.let { name ->
-                        if (name.contains("Domi", ignoreCase = true) ||
-                            name.contains("Edge", ignoreCase = true) ||
-                            name.contains("Nora", ignoreCase = true)
-                        ) {
-                            isDualMotor = true
-                        }
-                    }
+                    // Dual-motor capability is detected from the DeviceType
+                    // response once services are ready (see parseLovenseResponse).
+                    // Lovense advertises as "LVS-XXXX", so the model name is never
+                    // in the BLE name -- the old name-substring check never fired.
                     handler.post { onConnectionStateChanged?.invoke(connectionState) }
                     try { gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH) } catch (_: Exception) { }
                     try { gatt.requestMtu(185) } catch (_: Exception) { }
@@ -333,7 +353,10 @@ class BleDeviceManager(private val context: Context) {
             }
             connectionState = ConnectionState.Ready
             handler.post { onConnectionStateChanged?.invoke(connectionState) }
-            handler.postDelayed({ sendCommand("Battery;") }, 500)
+            // Ask the device what it is first -- the DeviceType reply drives
+            // dual-motor detection (parseLovenseResponse) -- then poll battery.
+            handler.postDelayed({ sendCommand(LovenseProtocol.deviceType()) }, 300)
+            handler.postDelayed({ sendCommand(LovenseProtocol.battery()) }, 700)
         }
 
         override fun onCharacteristicWrite(
@@ -622,18 +645,31 @@ class BleDeviceManager(private val context: Context) {
     private fun parseLovenseResponse(response: String) {
         val trimmed = response.trim().removeSuffix(";")
 
-        // Simple numeric response: "85;" → battery 85%
-        trimmed.toIntOrNull()?.let { level ->
-            if (level in 0..100) {
-                batteryLevel = level
-                handler.post { onBatteryUpdate?.invoke(level) }
-                return
+        // DeviceType reply: "<identifier>:<version>:<serial>", e.g. "P:02:0082..".
+        // The leading identifier is the Lovense model code -- map it to motor
+        // capability. Checked BEFORE battery parsing since it contains ':'.
+        if (trimmed.contains(':')) {
+            // The type code is 1-4 letters ("P", "OC", "ED", ...); reject other
+            // colon-bearing replies so they can't be misread as a device type.
+            val identifier = trimmed.substringBefore(':').trim().uppercase()
+            if (identifier.matches(Regex("^[A-Z]{1,4}$"))) {
+                applyDeviceType(identifier)
             }
+            return
         }
 
-        // Newer Lovense firmware: battery response as "Bxx;" where xx is 1-100,
-        // or device type "Axx:yy:zzzzzz;" etc.  Also "OK;" is just an ACK.
-        if (trimmed.length >= 2 && trimmed[0].uppercaseChar() == 'B') {
+        // Simple numeric battery response: "85" → 85%
+        val numeric = trimmed.toIntOrNull()
+        if (numeric != null) {
+            if (numeric in 0..100) {
+                batteryLevel = numeric
+                handler.post { onBatteryUpdate?.invoke(numeric) }
+            }
+            return
+        }
+
+        // Some firmware reports battery as "Bxx" (no colon).
+        if (trimmed.length >= 2 && trimmed[0].uppercaseChar() == 'B' && trimmed[1].isDigit()) {
             trimmed.substring(1).toIntOrNull()?.let { level ->
                 if (level in 0..100) {
                     batteryLevel = level
@@ -641,22 +677,19 @@ class BleDeviceManager(private val context: Context) {
                 }
             }
         }
+    }
 
-        // Device type response -- detect dual-motor devices.
-        // Domi 2 responds with device type starting with "W" (wand)
-        // Nora responds with "A", Edge with "P" -- all dual motor.
-        val upperTrimmed = trimmed.uppercase()
-        if (upperTrimmed.startsWith("W") || upperTrimmed.startsWith("P")) {
-            isDualMotor = true
-        }
-        // Also detect from device name at connection time
-        connectedDeviceName?.let { name ->
-            if (name.contains("Domi", ignoreCase = true) ||
-                name.contains("Edge", ignoreCase = true) ||
-                name.contains("Nora", ignoreCase = true)
-            ) {
-                isDualMotor = true
-            }
-        }
+    /**
+     * Map a Lovense DeviceType identifier (the leading code in the
+     * "<id>:<version>:<serial>" reply) to dual-motor capability. Only identifiers
+     * known to accept independent Vibrate1:/Vibrate2: commands are treated as
+     * dual; everything else stays single-motor. Safe by default -- a single-motor
+     * device silently ignores Vibrate2, so we never guess "dual" for an unknown
+     * model and end up sending commands it drops.
+     */
+    private fun applyDeviceType(identifier: String) {
+        val dual = identifier in DUAL_VIBRATE_IDENTIFIERS
+        isDualMotor = dual
+        Log.d("ChloeVibes", "Lovense DeviceType id=$identifier -> dualMotor=$dual")
     }
 }

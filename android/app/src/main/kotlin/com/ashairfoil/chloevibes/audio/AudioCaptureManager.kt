@@ -729,14 +729,25 @@ class AudioCaptureManager(private val context: Context) {
             // write gate is clear when a real trigger arrives.  Send the stop
             // command once when output drops to zero, then go silent.
             if (finalOutput > 0.001f || lastSentOutput > 0.001f) {
-                // Dual-motor output: climax engine generates phase-offset
-                // signal for motor 2, creating spatial movement
+                // Motor 2 is driven by the HIGH-frequency content of the live
+                // audio (treble/detail); motor 1 carries the full body vibe. On a
+                // dual-motor device this puts bass/body on motor 1 and sizzle on
+                // motor 2 -- tuned by the audio itself, not the climax engine.
+                // Mirrors the Rust desktop motor2 derivation in gui.rs.
                 val dualCb = onDualOutputUpdate
-                if (dualCb != null && params.climaxEnabled) {
-                    val motor2Raw = state.climaxEngine.motor2Output
-                    val motor2Target = mapOutput(
-                        motor2Raw, params.minVibe, params.maxVibe, params.outputGain, isSilent
-                    )
+                if (dualCb != null) {
+                    val motor2Target = if (isSilent) {
+                        0f
+                    } else {
+                        // Bands 0..3 = Sub/Bass/Lo-Mid/Mid, 4..7 = Hi-Mid/Pres/Brill/Air.
+                        val be = spectralData.bandEnergies
+                        val lowE = be[0] + be[1] + be[2] + be[3]
+                        val highE = be[4] + be[5] + be[6] + be[7]
+                        val total = lowE + highE
+                        val trebleFrac = if (total > 1e-9f) highE / total else 0f
+                        val trebleWeight = (trebleFrac * 3.0f).coerceIn(0f, 1f)
+                        (finalOutput * trebleWeight).coerceIn(0f, 1f)
+                    }
                     outputLevel2 = smoothOutput(outputLevel2, motor2Target, deltaTimeS, params.outputSlewMs)
                     val motor2Final = outputLevel2.coerceIn(0f, 1f)
                     dualCb.invoke(finalOutput, motor2Final)
