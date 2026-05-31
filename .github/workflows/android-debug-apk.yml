@@ -51,4 +51,6 @@ jobs:
           allowUpdates: true
           removeArtifacts: true
           replacesArtifacts: true
-          makeLatest: true
+          # Keep the comprehensive "latest" (Windows + Android) release as the
+          # GitHub "Latest" — this rolling APK-only release must not claim it.
+          makeLatest: false
