@@ -17,6 +17,13 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-ff6a00?style=for-the-badge&labelColor=08060d" alt="MIT License" /></a>
 </p>
 
+<p align="center">
+  <img src="assets/demo.gif" alt="ChloeVibes desktop console driving a Lovense Domi from live audio" width="820" />
+</p>
+<p align="center">
+  <em>Desktop console driving a Lovense Domi from live audio in real time (Advanced FFT + ADSR mode). Output level and device intensity track the derived envelope frame by frame.</em>
+</p>
+
 ---
 
 ## General Data
