@@ -298,21 +298,45 @@ struct GuiApp {
 // Color palette — dark theme with accent colors
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)] // design tokens -- not every tier is referenced yet
 mod palette {
     use eframe::egui::Color32;
 
-    pub const BG_PRIMARY: Color32 = Color32::from_rgb(15, 15, 20);
-    pub const BG_SECONDARY: Color32 = Color32::from_rgb(22, 22, 32);
-    pub const BG_TERTIARY: Color32 = Color32::from_rgb(30, 30, 42);
-    pub const ACCENT_PURPLE: Color32 = Color32::from_rgb(124, 58, 237);
-    pub const ACCENT_PURPLE_DIM: Color32 = Color32::from_rgb(88, 40, 168);
-    pub const ACCENT_TEAL: Color32 = Color32::from_rgb(16, 185, 129);
-    pub const ACCENT_PINK: Color32 = Color32::from_rgb(236, 72, 153);
-    pub const ACCENT_AMBER: Color32 = Color32::from_rgb(245, 158, 11);
-    pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(243, 244, 246);
-    pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(156, 163, 175);
-    pub const TEXT_DIM: Color32 = Color32::from_rgb(107, 114, 128);
-    pub const GRID_LINE: Color32 = Color32::from_rgb(40, 40, 55);
+    // EFIS / pro-console palette: near-black "glass" surfaces where depth comes
+    // from tone (not borders), and color is rationed -- one cyan for data/
+    // "you set this", one green for "engaged & good", amber/red only at
+    // caution/fault. The old ACCENT_* names are kept as aliases so every
+    // existing call site inherits the new look with no churn.
+
+    // --- Surfaces (faint navy-black, like a DiGiCo / SSL Live screen) ---
+    pub const BG_PRIMARY: Color32 = Color32::from_rgb(11, 13, 17); // navy-black canvas
+    pub const BG_SECONDARY: Color32 = Color32::from_rgb(24, 28, 34); // raised section panel
+    pub const BG_TERTIARY: Color32 = Color32::from_rgb(40, 45, 53); // bezel grey (tactile bodies)
+    pub const WELL: Color32 = Color32::from_rgb(8, 11, 16); // recessed navy inset behind meters/scopes
+    pub const EDGE_HIGHLIGHT: Color32 = Color32::from_rgb(54, 62, 73); // top-edge bevel light
+
+    // --- Accents (rationed; cool azure like a console selected channel) ---
+    pub const CYAN: Color32 = Color32::from_rgb(56, 190, 235); // primary data accent / set-points
+    pub const CYAN_DIM: Color32 = Color32::from_rgb(30, 108, 140);
+    pub const GREEN: Color32 = Color32::from_rgb(54, 204, 110); // active / engaged / safe
+    pub const AMBER: Color32 = Color32::from_rgb(255, 179, 30); // caution
+    pub const RED: Color32 = Color32::from_rgb(255, 59, 48); // warning / clip / fault
+
+    // --- Back-compat aliases (old primary purple -> cyan, etc.) ---
+    pub const ACCENT_PURPLE: Color32 = CYAN;
+    pub const ACCENT_PURPLE_DIM: Color32 = CYAN_DIM;
+    pub const ACCENT_TEAL: Color32 = GREEN;
+    pub const ACCENT_PINK: Color32 = RED;
+    pub const ACCENT_AMBER: Color32 = AMBER;
+
+    // --- Text tiers ---
+    pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(232, 237, 242); // soft off-white
+    pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(122, 130, 142); // captions / units
+    pub const TEXT_DIM: Color32 = Color32::from_rgb(107, 116, 128); // disabled / ghost
+
+    // --- Structure ---
+    pub const HAIRLINE: Color32 = Color32::from_rgb(42, 48, 58); // 1px dividers / frames
+    pub const GRID_LINE: Color32 = HAIRLINE;
 }
 
 // ---------------------------------------------------------------------------
@@ -522,8 +546,45 @@ fn capture_thread(
 // GuiApp Construction
 // ---------------------------------------------------------------------------
 
+/// Install a condensed technical label font + a tabular mono readout font from
+/// the Windows system fonts: Bahnschrift (DIN-style condensed, the cockpit/
+/// console feel) for proportional text, Consolas for monospace readouts.
+/// Falls back silently to egui defaults if a font file isn't present.
+fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    let mut changed = false;
+    if let Ok(bytes) = std::fs::read("C:/Windows/Fonts/bahnschrift.ttf") {
+        fonts.font_data.insert(
+            "bahnschrift".to_owned(),
+            egui::FontData::from_owned(bytes).into(),
+        );
+        fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default()
+            .insert(0, "bahnschrift".to_owned());
+        changed = true;
+    }
+    if let Ok(bytes) = std::fs::read("C:/Windows/Fonts/consola.ttf") {
+        fonts.font_data.insert(
+            "consolas".to_owned(),
+            egui::FontData::from_owned(bytes).into(),
+        );
+        fonts
+            .families
+            .entry(egui::FontFamily::Monospace)
+            .or_default()
+            .insert(0, "consolas".to_owned());
+        changed = true;
+    }
+    if changed {
+        ctx.set_fonts(fonts);
+    }
+}
+
 impl GuiApp {
     fn new(server_addr: Option<String>, ctx: &CreationContext) -> Self {
+        install_fonts(&ctx.egui_ctx);
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let client = None;
         let devices = Default::default();
@@ -691,34 +752,63 @@ impl eframe::App for GuiApp {
         self.use_advanced_shared
             .store(self.settings.use_advanced_processing, Ordering::Relaxed);
 
-        // Apply custom dark theme
+        // Apply the EFIS / pro-console theme: near-black glass, one cyan data
+        // accent, green for engaged, hairline structure, low corner radius and
+        // restrained hover so it reads as precise equipment, not a consumer app.
         let mut visuals = if self.settings.use_dark_mode {
             Visuals::dark()
         } else {
             Visuals::light()
         };
         if self.settings.use_dark_mode {
+            let cr = CornerRadius::same(3);
+            let hairline = Stroke::new(1.0, palette::HAIRLINE);
+
             visuals.panel_fill = palette::BG_PRIMARY;
             visuals.window_fill = palette::BG_SECONDARY;
-            visuals.extreme_bg_color = Color32::from_rgb(10, 10, 14);
-            visuals.faint_bg_color = palette::BG_TERTIARY;
-            visuals.widgets.noninteractive.bg_fill = palette::BG_SECONDARY;
-            visuals.widgets.inactive.bg_fill = palette::BG_TERTIARY;
-            visuals.widgets.hovered.bg_fill = Color32::from_rgb(45, 45, 62);
-            visuals.widgets.active.bg_fill = palette::ACCENT_PURPLE_DIM;
-            visuals.selection.bg_fill = palette::ACCENT_PURPLE;
-            visuals.selection.stroke = Stroke::new(1.0, palette::ACCENT_PURPLE);
-            visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, palette::TEXT_SECONDARY);
-            visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, palette::TEXT_PRIMARY);
-            visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, Color32::WHITE);
-            visuals.widgets.active.fg_stroke = Stroke::new(1.0, Color32::WHITE);
-            visuals.widgets.noninteractive.corner_radius = CornerRadius::same(6);
-            visuals.widgets.inactive.corner_radius = CornerRadius::same(6);
-            visuals.widgets.hovered.corner_radius = CornerRadius::same(6);
-            visuals.widgets.active.corner_radius = CornerRadius::same(6);
-            visuals.window_corner_radius = CornerRadius::same(10);
+            visuals.extreme_bg_color = palette::WELL;
+            visuals.faint_bg_color = palette::BG_SECONDARY;
+            visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(56, 190, 235, 70);
+            visuals.selection.stroke = Stroke::new(1.0, palette::CYAN);
+            visuals.hyperlink_color = palette::CYAN;
+            visuals.warn_fg_color = palette::AMBER;
+            visuals.error_fg_color = palette::RED;
+            visuals.window_corner_radius = CornerRadius::same(6);
+
+            let w = &mut visuals.widgets;
+            // Labels, separators, frames
+            w.noninteractive.bg_fill = palette::BG_SECONDARY;
+            w.noninteractive.bg_stroke = hairline;
+            w.noninteractive.fg_stroke = Stroke::new(1.0, palette::TEXT_PRIMARY);
+            w.noninteractive.corner_radius = cr;
+            // Buttons / inputs at rest sit on bezel grey with a hairline edge
+            w.inactive.bg_fill = palette::BG_TERTIARY;
+            w.inactive.bg_stroke = hairline;
+            w.inactive.fg_stroke = Stroke::new(1.0, palette::TEXT_PRIMARY);
+            w.inactive.corner_radius = cr;
+            // Hovered: restrained lift + cyan hairline, no bright flash
+            w.hovered.bg_fill = palette::EDGE_HIGHLIGHT;
+            w.hovered.bg_stroke = Stroke::new(1.0, palette::CYAN);
+            w.hovered.fg_stroke = Stroke::new(1.0, palette::TEXT_PRIMARY);
+            w.hovered.corner_radius = cr;
+            w.hovered.expansion = 1.0;
+            // Active / pressed: cyan body, dark text
+            w.active.bg_fill = palette::CYAN;
+            w.active.bg_stroke = Stroke::new(1.0, palette::CYAN);
+            w.active.fg_stroke = Stroke::new(1.0, palette::BG_PRIMARY);
+            w.active.corner_radius = cr;
+            w.active.expansion = 1.0;
+            // Open combo/menus
+            w.open.bg_fill = palette::BG_TERTIARY;
+            w.open.bg_stroke = Stroke::new(1.0, palette::CYAN);
+            w.open.fg_stroke = Stroke::new(1.0, palette::TEXT_PRIMARY);
+            w.open.corner_radius = cr;
         }
         ctx.set_visuals(visuals);
+        ctx.style_mut(|s| {
+            s.spacing.item_spacing = vec2(6.0, 4.0);
+            s.spacing.button_padding = vec2(8.0, 4.0);
+        });
 
         // --- Connection Handling (unchanged) ---
         if let Some(task) = self.connection_task.take() {
@@ -1222,25 +1312,24 @@ impl eframe::App for GuiApp {
                 );
                 let painter = ui.painter();
 
-                // Background
-                painter.rect_filled(rect, 4.0, palette::BG_TERTIARY);
+                // Recessed well behind the meter
+                painter.rect_filled(rect, 3.0, palette::WELL);
 
-                // Filled portion
+                // Filled portion -- calibrated meter zones (safe/caution/clip)
                 let fill_width = rect.width() * self.vibration_level;
                 if fill_width > 0.5 {
                     let fill_rect = Rect::from_min_size(
                         rect.min,
                         vec2(fill_width, rect.height()),
                     );
-                    // Color based on intensity
                     let color = if self.vibration_level > 0.85 {
-                        palette::ACCENT_PINK
-                    } else if self.vibration_level > 0.5 {
-                        palette::ACCENT_PURPLE
+                        palette::RED
+                    } else if self.vibration_level > 0.6 {
+                        palette::AMBER
                     } else {
-                        palette::ACCENT_TEAL
+                        palette::GREEN
                     };
-                    painter.rect_filled(fill_rect, 4.0, color);
+                    painter.rect_filled(fill_rect, 3.0, color);
                 }
             }
 
@@ -2699,13 +2788,13 @@ fn draw_adsr_envelope(
     release_curve: f32,
     envelope: &EnvelopeProcessor,
 ) {
-    // Background
-    painter.rect_filled(rect, 8.0, palette::BG_SECONDARY);
+    // Recessed scope well + hairline frame
+    painter.rect_filled(rect, 4.0, palette::WELL);
     painter.rect_stroke(
         rect,
-        8.0,
-        Stroke::new(1.0, Color32::from_rgba_premultiplied(124, 58, 237, 25)),
-        StrokeKind::Outside,
+        4.0,
+        Stroke::new(1.0, palette::HAIRLINE),
+        StrokeKind::Inside,
     );
 
     let w = rect.width();
@@ -2787,27 +2876,22 @@ fn draw_adsr_envelope(
         t += resolution;
     }
 
-    // Draw filled area under curve (as quad strips — the curve is not convex)
+    // Faint fill under the curve -- properly translucent (not additive), so a
+    // high sustain no longer floods the panel with a bright block.
     for i in 0..points.len().saturating_sub(1) {
         let p0 = points[i];
         let p1 = points[i + 1];
         let quad = vec![pos2(p0.x, origin.y), p0, p1, pos2(p1.x, origin.y)];
         painter.add(Shape::convex_polygon(
             quad,
-            Color32::from_rgba_premultiplied(16, 185, 129, 15),
+            Color32::from_rgba_unmultiplied(56, 190, 235, 16),
             Stroke::NONE,
         ));
     }
 
-    // Draw the curve line with glow
+    // Single restrained azure curve, no glow.
     if points.len() >= 2 {
-        // Glow pass (wider, dimmer)
-        painter.add(Shape::line(
-            points.clone(),
-            Stroke::new(4.0, Color32::from_rgba_premultiplied(16, 185, 129, 40)),
-        ));
-        // Main line (reuse vec — no clone needed since this is the last use)
-        painter.add(Shape::line(points, Stroke::new(2.0, palette::ACCENT_TEAL)));
+        painter.add(Shape::line(points, Stroke::new(1.5, palette::CYAN)));
     }
 
     // Phase separator lines
@@ -2935,17 +3019,17 @@ fn draw_output_history(
     gate_is_open: bool,
     gate_threshold: f32,
 ) {
-    painter.rect_filled(rect, 8.0, palette::BG_SECONDARY);
+    painter.rect_filled(rect, 4.0, palette::WELL);
     let border_color = if gate_is_open {
-        Color32::from_rgba_premultiplied(236, 72, 153, 70) // neon pink glow when open
+        palette::CYAN
     } else {
-        Color32::from_rgba_premultiplied(124, 58, 237, 30) // subtle purple when closed
+        palette::HAIRLINE
     };
     painter.rect_stroke(
         rect,
-        8.0,
+        4.0,
         Stroke::new(1.0, border_color),
-        StrokeKind::Outside,
+        StrokeKind::Inside,
     );
 
     let w = rect.width();
@@ -2972,9 +3056,9 @@ fn draw_output_history(
     let x_end = rect.max.x - padding;
     let mut x = x_start;
     let thresh_color = if gate_is_open {
-        Color32::from_rgba_premultiplied(236, 72, 153, 140)
+        palette::CYAN
     } else {
-        Color32::from_rgba_premultiplied(236, 72, 153, 70)
+        Color32::from_rgba_unmultiplied(56, 190, 235, 110)
     };
     while x < x_end {
         let seg_end = (x + dash_len).min(x_end);
@@ -3007,7 +3091,7 @@ fn draw_output_history(
                 pos2(x1, y1),
                 pos2(x1, bottom),
             ],
-            Color32::from_rgba_premultiplied(124, 58, 237, 12),
+            Color32::from_rgba_unmultiplied(90, 100, 115, 26),
             Stroke::NONE,
         ));
     }
@@ -3021,16 +3105,7 @@ fn draw_output_history(
     }
 
     if line_points.len() >= 2 {
-        // Glow
-        painter.add(Shape::line(
-            line_points.clone(),
-            Stroke::new(3.0, Color32::from_rgba_premultiplied(16, 185, 129, 35)),
-        ));
-        // Main line
-        painter.add(Shape::line(
-            line_points,
-            Stroke::new(1.5, palette::ACCENT_TEAL),
-        ));
+        painter.add(Shape::line(line_points, Stroke::new(1.5, palette::GREEN)));
     }
 }
 
@@ -3041,17 +3116,17 @@ fn draw_spectrum_bars(
     band_energies: &[f32],
     gate_is_open: bool,
 ) {
-    painter.rect_filled(rect, 8.0, palette::BG_SECONDARY);
+    painter.rect_filled(rect, 4.0, palette::WELL);
     let border_color = if gate_is_open {
-        Color32::from_rgba_premultiplied(16, 185, 129, 50) // teal glow when active
+        palette::CYAN
     } else {
-        Color32::from_rgba_premultiplied(124, 58, 237, 30)
+        palette::HAIRLINE
     };
     painter.rect_stroke(
         rect,
-        8.0,
+        4.0,
         Stroke::new(1.0, border_color),
-        StrokeKind::Outside,
+        StrokeKind::Inside,
     );
 
     let padding = 8.0;
