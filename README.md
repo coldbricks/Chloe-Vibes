@@ -128,6 +128,13 @@ Final-stage slow time-domain modulation. Disabled by default. See Section 3.
 
 A single parity-locked stage (`map_output` in Rust, `mapOutput` in Kotlin). Below threshold the stage returns zero. Above threshold the shaped envelope is mapped into the device range [min, max], scaled by gain, and clamped. Both clients apply asymmetric output slew: 85 ms nominal, with the rising edge at approximately 30 ms (0.35 of the configured slew). This stage is verified value-for-value by the parity test (Section 6).
 
+### 2.7 Algorithm Selection (Desktop)
+
+The desktop client provides two processing algorithms, selectable at runtime. The Android client always uses the advanced algorithm.
+
+- **Advanced FFT + ADSR.** The default. The full signal chain described in Sections 2.1 through 2.6.
+- **Original Chloe Vibes (RMS).** The original loudness-follower algorithm, inherited from the project predecessor and retained as a selectable mode. The capture thread derives a single loudness value from a low-pass filter and full-band RMS. The pipeline is: RMS loudness, scaled by the volume control, optional hold-and-decay persistence (configurable hold delay and decay rate), then clamp to 0 to 1. The FFT band analysis, gate, beat detector, ADSR envelope, and Climax Engine are bypassed in this mode.
+
 ---
 
 ## 3. Climax Engine
