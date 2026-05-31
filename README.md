@@ -51,8 +51,8 @@ The Android engine is a direct port of the Rust engine (`src/audio.rs`). Output 
 > **WARNING.** This system commands a physical haptic device against a human body. No automatic safety cutoff or panic-stop is implemented in this version. The operator retains full responsibility for output level and for stopping the device. See Section 9.
 
 <p align="center">
-  <img src="assets/screenshot-windows.png" alt="Windows desktop console" width="760" /><br>
-  <em>Figure 1. Windows desktop console. Live 8-band spectrum, ADSR envelope preview, energy and output history, and device panel.</em>
+  <img src="assets/screenshot-windows.png" alt="Windows desktop console" width="820" /><br>
+  <em>Figure 1. Windows desktop console (Advanced FFT + ADSR mode). Top to bottom: transport and audio status, energy gate and 8-band spectrum, ADSR envelope shape, preset and Chloe rhythm controls, signal parameters, and the connected Lovense Domi device panel.</em>
 </p>
 
 <p align="center">
