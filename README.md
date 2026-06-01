@@ -9,12 +9,12 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Windows-Rust_·_egui-23f6ff?style=for-the-badge&logo=windows&logoColor=23f6ff&labelColor=08060d" alt="Windows, Rust + egui" />
-  <img src="https://img.shields.io/badge/Android-Kotlin_·_Compose-72ff00?style=for-the-badge&logo=android&logoColor=72ff00&labelColor=08060d" alt="Android, Kotlin + Compose" />
-  <img src="https://img.shields.io/badge/Lovense-BLE-ff2ea6?style=for-the-badge&labelColor=08060d" alt="Lovense BLE" />
-  <img src="https://img.shields.io/badge/Buttplug.io-9.0.9-fff240?style=for-the-badge&labelColor=08060d" alt="Buttplug.io 9.0.9" />
-  <img src="https://img.shields.io/badge/Version-1.1.0-7f5cff?style=for-the-badge&labelColor=08060d" alt="Version 1.1.0" />
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-ff6a00?style=for-the-badge&labelColor=08060d" alt="MIT License" /></a>
+  <img src="https://img.shields.io/badge/Windows-Rust_·_egui-2A3890?style=for-the-badge&logo=windows&logoColor=2A3890&labelColor=A0A1A5" alt="Windows, Rust + egui" />
+  <img src="https://img.shields.io/badge/Android-Kotlin_·_Compose-2A3890?style=for-the-badge&logo=android&logoColor=2A3890&labelColor=A0A1A5" alt="Android, Kotlin + Compose" />
+  <img src="https://img.shields.io/badge/Lovense-BLE-2A3890?style=for-the-badge&labelColor=A0A1A5" alt="Lovense BLE" />
+  <img src="https://img.shields.io/badge/Buttplug.io-9.0.9-2A3890?style=for-the-badge&labelColor=A0A1A5" alt="Buttplug.io 9.0.9" />
+  <img src="https://img.shields.io/badge/Version-1.1.0-2A3890?style=for-the-badge&labelColor=A0A1A5" alt="Version 1.1.0" />
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-2A3890?style=for-the-badge&labelColor=A0A1A5" alt="MIT License" /></a>
 </p>
 
 <p align="center">
