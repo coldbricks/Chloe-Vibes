@@ -5,7 +5,7 @@
 <p align="center">
   <strong>ChloeVibes</strong><br>
   Audio-Reactive Haptic Control System<br>
-  Technical Reference, Software Version 1.3.0
+  Technical Reference, Software Version 1.4.0
 </p>
 
 <p align="center">
@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Android-Kotlin_·_Compose-2A3890?style=for-the-badge&logo=android&logoColor=2A3890&labelColor=A0A1A5" alt="Android, Kotlin + Compose" />
   <img src="https://img.shields.io/badge/Lovense-BLE-2A3890?style=for-the-badge&labelColor=A0A1A5" alt="Lovense BLE" />
   <img src="https://img.shields.io/badge/Buttplug.io-9.0.9-2A3890?style=for-the-badge&labelColor=A0A1A5" alt="Buttplug.io 9.0.9" />
-  <img src="https://img.shields.io/badge/Version-1.3.0-2A3890?style=for-the-badge&labelColor=A0A1A5" alt="Version 1.3.0" />
+  <img src="https://img.shields.io/badge/Version-1.4.0-2A3890?style=for-the-badge&labelColor=A0A1A5" alt="Version 1.4.0" />
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-2A3890?style=for-the-badge&labelColor=A0A1A5" alt="MIT License" /></a>
 </p>
 
@@ -37,7 +37,7 @@
 | Spectral resolution | 2048-point FFT, 1024 usable bins, 23.4 Hz per bin at 48 kHz |
 | Output interface | Lovense BLE over Nordic UART Service; Buttplug 9.0.9 client on desktop |
 | Output resolution | Integer intensity 0 to 20 (21 discrete levels) |
-| Software version | 1.3.0 |
+| Software version | 1.4.0 |
 | License | MIT |
 
 This document describes the operation, specifications, and limitations of the ChloeVibes haptic control system. It assumes familiarity with digital signal processing, Bluetooth Low Energy, and the relevant build toolchains.
@@ -139,7 +139,9 @@ The desktop client provides two processing algorithms, selectable at runtime. Th
 
 One-press automatic parameter fitting. On activation the client listens to 4 to 15 seconds of the playing material and derives: the most rhythmically salient frequency band (per-band onset-aligned spectral-flux concentration, requiring a 1.3x margin over the runner-up), the beat interval (median and IQR of merged inter-onset intervals), the material's crest factor, and the median spectral centroid. It then writes a fitted parameter set — drive band, trigger mode and curve, and an envelope whose decay fits inside the beat interval — through a 1.5 s glide, and reports a lock-quality score on the button. Unlockable material (ambient, speech) is reported honestly as NO LOCK and nothing is written.
 
-AUTO-LOCK is a supervisor above the signal chain, not a chain stage: it writes the same whitelisted parameter fields the sliders write and cannot touch volume, output gain, the output floor/ceiling, gate, Climax, or timing trim. Its binary trigger level is capped at the 90th percentile of the output the dynamic path actually produced during listening. Any manual parameter change or preset selection cancels the lock; one press reverts to the exact pre-lock settings; an active lock is never persisted to storage without an explicit Keep. Design document: `docs/AUTO_LOCK_DESIGN.md`.
+The fitted response targets a bass-drum waveform: instant attack, one continuous exponential decay spanning most of the beat, landing on a low floor exactly as the next beat fires. Band selection is punch-first (largest per-hit energy jump over the quietest between-hit floor), and detected tempo is folded into the perceptual beat octave (70 to 180 BPM) before envelope fitting, so an eighth-note detection grid does not halve the envelope. Every press starts a fresh listen: only audio arriving after the press is judged, so a NO LOCK can be retried immediately on new material.
+
+AUTO-LOCK is a supervisor above the signal chain, not a chain stage: it writes the same whitelisted parameter fields the sliders write and cannot touch volume, output gain, the output floor/ceiling, gate, Climax, or timing trim. Its binary trigger level is seeded from observed output with a hard 0.85 cap, and the user's configured ceiling always binds downstream. Any manual parameter change or preset selection cancels the lock; one press reverts to the exact pre-lock settings; an active lock is never persisted to storage without an explicit Keep. Design document: `docs/AUTO_LOCK_DESIGN.md`.
 
 ---
 
@@ -291,9 +293,9 @@ The Android engine is a direct port of the Rust engine. Output equivalence is en
 | Output resolution | Lovense intensity 0 to 20 integer (21 levels) |
 | BLE command rate | Desktop 50 Hz (20 ms, 0.5% dead-band); Android 33 Hz (30 ms minimum interval) |
 | Desktop stack | Rust, `eframe`/`egui` 0.33.3, Buttplug 9.0.9, `rustfft`, WASAPI loopback |
-| Android stack | Kotlin, Jetpack Compose (Material3), package `com.ashairfoil.chloevibes`, version 1.3.0 (versionCode 3) |
+| Android stack | Kotlin, Jetpack Compose (Material3), package `com.ashairfoil.chloevibes`, version 1.4.0 (versionCode 4) |
 | Android SDK | minSdk 26 (Android 8.0), target/compile SDK 35, Java/Kotlin 17 |
-| Test suite | 44 Rust unit tests + the parity golden test, clippy `-D warnings`, `fmt --check`, Kotlin unit and parity tests |
+| Test suite | 70 Rust unit tests + the parity golden test, clippy `-D warnings`, `fmt --check`, Kotlin unit and parity tests |
 | Safety (desktop) | Dead-man watchdog (2 s pipeline-stall timeout, retried stop), panic-stop hook, verified stop-all |
 | License | MIT |
 
