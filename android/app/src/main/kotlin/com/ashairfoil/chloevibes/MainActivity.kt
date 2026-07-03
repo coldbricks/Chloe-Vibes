@@ -23,6 +23,7 @@ import com.ashairfoil.chloevibes.audio.AudioSourceMode
 import com.ashairfoil.chloevibes.audio.EnvelopeState
 import com.ashairfoil.chloevibes.audio.NUM_BANDS
 import com.ashairfoil.chloevibes.audio.findPreset
+import com.ashairfoil.chloevibes.device.BleDeviceInfo
 import com.ashairfoil.chloevibes.device.BleDeviceManager
 import com.ashairfoil.chloevibes.device.ConnectionState
 import com.ashairfoil.chloevibes.ui.ChloeVibesTheme
@@ -35,7 +36,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var bleDeviceManager: BleDeviceManager
     private val uiState = MainScreenState()
     private val handler = Handler(Looper.getMainLooper())
-    private val discoveredDevices = mutableStateListOf<Pair<String, String>>()
+    private val discoveredDevices = mutableStateListOf<BleDeviceInfo>()
 
     // UI update runnable (~30Hz)
     private val uiUpdateRunnable = object : Runnable {
@@ -83,9 +84,13 @@ class MainActivity : ComponentActivity() {
         // Wire BLE callbacks
         bleDeviceManager.onDeviceDiscovered = { device ->
             handler.post {
-                val entry = Pair(device.name, device.address)
-                if (discoveredDevices.none { it.second == device.address }) {
-                    discoveredDevices.add(entry)
+                // Replace-or-add so late-arriving names and fresher RSSI
+                // readings update the entry instead of being dropped.
+                val index = discoveredDevices.indexOfFirst { it.address == device.address }
+                if (index >= 0) {
+                    discoveredDevices[index] = device
+                } else {
+                    discoveredDevices.add(device)
                 }
             }
         }
@@ -221,7 +226,9 @@ class MainActivity : ComponentActivity() {
         val needed = mutableListOf<String>()
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            // Android 12+: Nearby Devices permissions are required for BLE.
+            // Android 12+: Nearby Devices permissions only. The manifest
+            // asserts neverForLocation on BLUETOOTH_SCAN, so no Location
+            // permission (and no GPS) is needed to scan.
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN)
                 != PackageManager.PERMISSION_GRANTED
             ) {
@@ -231,13 +238,6 @@ class MainActivity : ComponentActivity() {
                 != PackageManager.PERMISSION_GRANTED
             ) {
                 needed.add(Manifest.permission.BLUETOOTH_CONNECT)
-            }
-            // Because we do not use neverForLocation, Android may filter or
-            // suppress BLE scan results unless Location permission is granted.
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
-                != PackageManager.PERMISSION_GRANTED
-            ) {
-                needed.add(Manifest.permission.ACCESS_FINE_LOCATION)
             }
         } else {
             // Pre-Android 12: BLE scanning requires ACCESS_FINE_LOCATION

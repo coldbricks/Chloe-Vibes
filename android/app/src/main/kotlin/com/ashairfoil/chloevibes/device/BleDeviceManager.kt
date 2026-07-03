@@ -105,6 +105,14 @@ class BleDeviceManager(private val context: Context) {
     private var isScanning = false
     private val handler = Handler(Looper.getMainLooper())
 
+    // Auto-reconnect -- re-establish the link after an unexpected drop
+    // (RF dropout, peer supervision timeout). Cleared by an explicit
+    // disconnect() so a user-requested disconnect stays disconnected.
+    @Volatile private var lastConnectAddress: String? = null
+    @Volatile private var userRequestedDisconnect = false
+    @Volatile private var reconnectAttempts = 0
+    private val reconnectRunnable = Runnable { attemptReconnect() }
+
     // Callbacks
     var onDeviceDiscovered: ((BleDeviceInfo) -> Unit)? = null
     var onConnectionStateChanged: ((ConnectionState) -> Unit)? = null
@@ -145,6 +153,9 @@ class BleDeviceManager(private val context: Context) {
         /** CCCD descriptor UUID for enabling notifications. */
         val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
         private const val SCAN_TIMEOUT_MS = 15_000L
+        private const val MAX_RECONNECT_ATTEMPTS = 6
+        private const val RECONNECT_BASE_DELAY_MS = 600L
+        private const val RECONNECT_MAX_DELAY_MS = 8_000L
 
         // Lovense DeviceType identifiers (the code before the first ':' in the
         // "<code>:<fw>:<mac>" reply) with two INDEPENDENT vibration motors that
@@ -242,7 +253,21 @@ class BleDeviceManager(private val context: Context) {
 
     /** Connect to a device by address. */
     fun connect(address: String): Boolean {
+        handler.removeCallbacks(reconnectRunnable)
+        userRequestedDisconnect = false
+        reconnectAttempts = 0
+        lastConnectAddress = address
+        return connectInternal(address)
+    }
+
+    private fun connectInternal(address: String): Boolean {
+        // Scanning while a connection attempt is in flight starves the link
+        // layer on many stacks and is a common cause of GATT error 133. This
+        // lives here (not in connect()) so auto-reconnect attempts get the
+        // same guard — the user may have started a scan mid-backoff.
+        stopScan()
         resetWriteState()
+        closeGatt()
         val device = bluetoothAdapter?.getRemoteDevice(address) ?: return false
         Log.d("ChloeVibes", "BLE connecting to device: $address")
         connectionState = ConnectionState.Connecting
@@ -252,14 +277,24 @@ class BleDeviceManager(private val context: Context) {
         return gatt != null
     }
 
-    /** Disconnect from the current device. */
-    fun disconnect() {
-        Log.d("ChloeVibes", "BLE disconnecting from device: ${connectedDeviceName ?: "unknown"}")
-        gatt?.disconnect()
-        gatt?.close()
+    /** Release the current GATT client interface, if any. */
+    private fun closeGatt() {
+        gatt?.let {
+            try { it.disconnect() } catch (_: Exception) { }
+            try { it.close() } catch (_: Exception) { }
+        }
         gatt = null
         writeCharacteristic = null
         notifyCharacteristic = null
+    }
+
+    /** Disconnect from the current device. */
+    fun disconnect() {
+        Log.d("ChloeVibes", "BLE disconnecting from device: ${connectedDeviceName ?: "unknown"}")
+        userRequestedDisconnect = true
+        lastConnectAddress = null
+        handler.removeCallbacks(reconnectRunnable)
+        closeGatt()
         resetWriteState()
         connectionState = ConnectionState.Disconnected
         connectedDeviceName = null
@@ -268,8 +303,61 @@ class BleDeviceManager(private val context: Context) {
         onConnectionStateChanged?.invoke(connectionState)
     }
 
+    /**
+     * Reconnect after an unexpected link loss. Exponential backoff, capped;
+     * gives up after MAX_RECONNECT_ATTEMPTS and reports Disconnected.
+     */
+    private fun scheduleReconnect() {
+        reconnectAttempts += 1
+        val shift = (reconnectAttempts - 1).coerceAtMost(4)
+        val delay = (RECONNECT_BASE_DELAY_MS shl shift).coerceAtMost(RECONNECT_MAX_DELAY_MS)
+        Log.d(
+            "ChloeVibes",
+            "BLE link lost; reconnect attempt $reconnectAttempts/$MAX_RECONNECT_ATTEMPTS in ${delay}ms"
+        )
+        connectionState = ConnectionState.Connecting
+        handler.post { onConnectionStateChanged?.invoke(connectionState) }
+        handler.removeCallbacks(reconnectRunnable)
+        handler.postDelayed(reconnectRunnable, delay)
+    }
+
+    private fun attemptReconnect() {
+        if (userRequestedDisconnect) return
+        if (connectionState == ConnectionState.Connected || connectionState == ConnectionState.Ready) return
+        val address = lastConnectAddress ?: return
+        if (!connectInternal(address)) {
+            // Synchronous failure (adapter off/null): no GATT callback will
+            // ever fire, so drive the retry/give-up path from here or the
+            // state machine is stuck showing Connecting forever.
+            if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+                scheduleReconnect()
+            } else {
+                connectionState = ConnectionState.Disconnected
+                handler.post { onConnectionStateChanged?.invoke(connectionState) }
+            }
+        }
+    }
+
+    /**
+     * Whether a callback's gatt is the one this manager currently owns. A
+     * superseded client's late callbacks (especially STATE_DISCONNECTED after
+     * a re-connect) must not clobber the live connection's state. The
+     * null-while-Connecting case covers the tiny window between
+     * connectGatt() registering the callback and the field assignment.
+     */
+    private fun isCurrentGatt(g: BluetoothGatt): Boolean {
+        val current = gatt
+        return current === g ||
+            (current == null && connectionState == ConnectionState.Connecting)
+    }
+
     private val gattCallback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+            if (!isCurrentGatt(gatt)) {
+                Log.d("ChloeVibes", "Ignoring callback from superseded GATT client (newState=$newState)")
+                try { gatt.close() } catch (_: Exception) { }
+                return
+            }
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 Log.e("ChloeVibes", "GATT error: status=$status, newState=$newState")
             }
@@ -299,17 +387,32 @@ class BleDeviceManager(private val context: Context) {
                 }
                 BluetoothGatt.STATE_DISCONNECTED -> {
                     Log.d("ChloeVibes", "BLE disconnected (status=$status)")
-                    connectionState = ConnectionState.Disconnected
+                    // ALWAYS close the client interface here. Android caps the
+                    // process at ~32 GATT clients; leaking one per dropped or
+                    // failed connection eventually makes every connectGatt()
+                    // fail until the app is killed ("works after a restart").
+                    try { gatt.close() } catch (_: Exception) { }
+                    if (this@BleDeviceManager.gatt === gatt) {
+                        this@BleDeviceManager.gatt = null
+                    }
                     connectedDeviceName = null
                     writeCharacteristic = null
                     notifyCharacteristic = null
                     resetWriteState()
-                    handler.post { onConnectionStateChanged?.invoke(connectionState) }
+                    if (!userRequestedDisconnect && lastConnectAddress != null &&
+                        reconnectAttempts < MAX_RECONNECT_ATTEMPTS
+                    ) {
+                        scheduleReconnect()
+                    } else {
+                        connectionState = ConnectionState.Disconnected
+                        handler.post { onConnectionStateChanged?.invoke(connectionState) }
+                    }
                 }
             }
         }
 
         override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+            if (!isCurrentGatt(gatt)) return
             // MTU exchange finished (success or not) -- now it's safe to issue the
             // next GATT op. Discover services here so it isn't dropped.
             Log.d("ChloeVibes", "MTU changed: mtu=$mtu status=$status; discovering services")
@@ -317,8 +420,12 @@ class BleDeviceManager(private val context: Context) {
         }
 
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+            if (!isCurrentGatt(gatt)) return
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 Log.w("ChloeVibes", "onServicesDiscovered failed: status=$status")
+                // Drop the link instead of sitting half-connected; the
+                // disconnect callback closes the client and retries.
+                gatt.disconnect()
                 return
             }
             Log.d("ChloeVibes", "Services discovered: ${gatt.services.size}")
@@ -360,8 +467,11 @@ class BleDeviceManager(private val context: Context) {
                 }
             }
 
-            // No compatible service/characteristic found
+            // No compatible service/characteristic found -- incompatible
+            // device, so do not auto-reconnect to it.
             Log.w("ChloeVibes", "No compatible GATT characteristics found for device")
+            lastConnectAddress = null
+            connectionState = ConnectionState.Disconnected
             handler.post { onConnectionStateChanged?.invoke(ConnectionState.Disconnected) }
             gatt.disconnect()
             gatt.close()
@@ -375,6 +485,7 @@ class BleDeviceManager(private val context: Context) {
                 gatt.writeDescriptor(it)
             }
             connectionState = ConnectionState.Ready
+            reconnectAttempts = 0
             Log.d("ChloeVibes", "Connection Ready; requesting DeviceType + battery")
             handler.post { onConnectionStateChanged?.invoke(connectionState) }
             // Ask the device what it is first -- the DeviceType reply drives

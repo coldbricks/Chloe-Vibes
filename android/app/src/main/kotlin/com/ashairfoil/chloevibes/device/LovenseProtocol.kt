@@ -79,4 +79,41 @@ object LovenseProtocol {
 
     /** Stop all motors. */
     fun stop(): String = "Vibrate:0;"
+
+    // Advertised-name model hints. Classic firmware advertises
+    // "LVS-<code><digits>" where <code> is the same identifier the DeviceType
+    // query returns; newer firmware embeds the model word directly
+    // ("LVS-Domi38"). Display-only, best effort -- capability decisions
+    // (dual-motor etc.) always come from the DeviceType reply after connect.
+    private val MODEL_CODES = mapOf(
+        "A" to "Nora",
+        "C" to "Nora",
+        "B" to "Max",
+        "S" to "Lush",
+        "Z" to "Hush",
+        "W" to "Domi",
+        "P" to "Edge",
+        "L" to "Ambi",
+        "O" to "Osci",
+        "N" to "Gemini",
+        "J" to "Dolce",
+        "OC" to "Osci 3",
+        "ED" to "Gush",
+        "EI" to "Flexer"
+    )
+
+    /**
+     * Best-effort model name from a BLE advertised name, or null if the name
+     * is not a recognizable Lovense advertisement.
+     */
+    fun modelHint(advertisedName: String): String? {
+        val body = advertisedName.removePrefix("LVS-")
+        if (body == advertisedName) return null
+        val word = body.trimEnd { it.isDigit() }
+        if (word.isEmpty() || !word.all { it.isLetter() }) return null
+        if (word.length >= 3) {
+            return word.replaceFirstChar { it.uppercaseChar() }
+        }
+        return MODEL_CODES[word.uppercase()]
+    }
 }

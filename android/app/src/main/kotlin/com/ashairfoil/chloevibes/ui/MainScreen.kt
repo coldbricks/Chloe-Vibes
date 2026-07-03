@@ -87,9 +87,12 @@ import com.ashairfoil.chloevibes.audio.PresetCategory
 import com.ashairfoil.chloevibes.audio.TriggerMode
 import com.ashairfoil.chloevibes.audio.applyCurve
 import com.ashairfoil.chloevibes.audio.presetsInCategory
+import com.ashairfoil.chloevibes.device.BleDeviceInfo
 import com.ashairfoil.chloevibes.device.ConnectionState
+import com.ashairfoil.chloevibes.device.LovenseProtocol
 import kotlin.math.exp
 import kotlin.math.ln
+import kotlin.math.pow
 
 // ---------------------------------------------------------------------------
 // ViewModel state
@@ -200,7 +203,7 @@ fun MainScreen(
     onScanDevices: () -> Unit,
     onConnectDevice: (String) -> Unit,
     onDisconnectDevice: () -> Unit,
-    discoveredDevices: List<Pair<String, String>>, // (name, address)
+    discoveredDevices: List<BleDeviceInfo>,
     onParameterChanged: () -> Unit
 ) {
     val scrollState = rememberScrollState()
@@ -274,7 +277,7 @@ fun MainScreen(
 
         // INPUT section
         SectionHeader("INPUT")
-        LabeledSlider("Volume", state.mainVolume, 0f, 10f, "%.2f") {
+        LabeledSlider("Volume", state.mainVolume, 0f, 10f, "%.2f", taper = 3f) {
             state.mainVolume = it; state.selectedPresetName = "Custom"; onParameterChanged()
         }
         FrequencyModeSelector(state.frequencyMode) {
@@ -373,7 +376,7 @@ fun MainScreen(
 
         // OUTPUT section
         SectionHeader("OUTPUT")
-        LabeledSlider("Gain", state.outputGain, 0f, 20f, "%.1f", ChloeColors.Pink) {
+        LabeledSlider("Gain", state.outputGain, 0f, 20f, "%.1f", ChloeColors.Pink, taper = 3f) {
             state.outputGain = it; state.selectedPresetName = "Custom"; onParameterChanged()
         }
         LabeledSlider("Floor", state.minVibe, 0f, 1f, "%.2f") {
@@ -590,7 +593,7 @@ private fun ControlsRow(
     onStopCapture: () -> Unit,
     onScanDevices: () -> Unit,
     onDisconnectDevice: () -> Unit,
-    discoveredDevices: List<Pair<String, String>>,
+    discoveredDevices: List<BleDeviceInfo>,
     onConnectDevice: (String) -> Unit
 ) {
     var showDeviceDialog by remember { mutableStateOf(false) }
@@ -649,19 +652,44 @@ private fun ControlsRow(
             onDismissRequest = { showDeviceDialog = false },
             title = { Text("Select Device") },
             text = {
-                Column {
+                Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
                     if (discoveredDevices.isEmpty()) {
                         Text("Scanning for devices...", color = ChloeColors.OnSurfaceDim)
                     }
-                    discoveredDevices.forEach { (name, address) ->
+                    // Stable keys only: sorting by live RSSI reordered rows
+                    // under the user's finger mid-scan (tap lands on the
+                    // wrong toy). RSSI is still shown as text per row.
+                    val sorted = discoveredDevices.sortedWith(
+                        compareByDescending<BleDeviceInfo> { it.isLovense }
+                            .thenBy { it.name }
+                            .thenBy { it.address }
+                    )
+                    sorted.forEach { device ->
+                        val hint = LovenseProtocol.modelHint(device.name)
+                        val title = when {
+                            hint != null -> "Lovense $hint"
+                            device.isLovense -> "Lovense"
+                            else -> device.name
+                        }
                         TextButton(
                             onClick = {
-                                onConnectDevice(address)
+                                onConnectDevice(device.address)
                                 showDeviceDialog = false
                             },
                             modifier = Modifier.fillMaxWidth()
                         ) {
-                            Text(name, color = ChloeColors.OnSurface)
+                            Column(modifier = Modifier.fillMaxWidth()) {
+                                Text(
+                                    title,
+                                    color = if (device.isLovense) ChloeColors.Teal else ChloeColors.OnSurface,
+                                    fontWeight = if (device.isLovense) FontWeight.SemiBold else FontWeight.Normal
+                                )
+                                Text(
+                                    "${device.name} · ${device.rssi} dBm",
+                                    color = ChloeColors.OnSurfaceDim,
+                                    fontSize = 11.sp
+                                )
+                            }
                         }
                     }
                 }
@@ -926,19 +954,27 @@ private fun LabeledSlider(
     format: String,
     accentColor: Color = ChloeColors.OnSurface,
     logarithmic: Boolean = false,
+    taper: Float = 1f,
     onValueChange: (Float) -> Unit
 ) {
     var showDialog by remember { mutableStateOf(false) }
 
-    // For logarithmic sliders, map actual value ↔ 0..1 slider position
+    // For logarithmic sliders, map actual value ↔ 0..1 slider position.
+    // taper > 1 is a power taper (works with min = 0, unlike log): the low
+    // end of the range gets most of the physical travel, so parameters whose
+    // useful values sit far below max are not crammed into the first 15%.
     val sliderValue = if (logarithmic) {
         val minLog = ln(min)
         val maxLog = ln(max)
         ((ln(value.coerceIn(min, max)) - minLog) / (maxLog - minLog)).coerceIn(0f, 1f)
+    } else if (taper != 1f) {
+        val span = max - min
+        if (span <= 0f) 0f
+        else ((value.coerceIn(min, max) - min) / span).pow(1f / taper).coerceIn(0f, 1f)
     } else {
         value
     }
-    val sliderRange = if (logarithmic) 0f..1f else min..max
+    val sliderRange = if (logarithmic || taper != 1f) 0f..1f else min..max
 
     Row(
         verticalAlignment = Alignment.CenterVertically,
@@ -959,6 +995,8 @@ private fun LabeledSlider(
                     val minLog = ln(min)
                     val maxLog = ln(max)
                     onValueChange(exp(minLog + pos * (maxLog - minLog)))
+                } else if (taper != 1f) {
+                    onValueChange(min + (max - min) * pos.pow(taper))
                 } else {
                     onValueChange(pos)
                 }
