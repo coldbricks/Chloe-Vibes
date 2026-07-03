@@ -10,11 +10,11 @@
 // ==========================================================================
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     iter::from_fn,
     sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex, OnceLock,
     },
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -42,6 +42,7 @@ use crate::{
         FrequencyMode, Gate, SharedSpectralData, SpectralAnalyzer, SpectralData, TriggerMode,
         BAND_NAMES,
     },
+    auto_lock::{AutoLock, AutoLockState},
     presets::{self, PresetCategory},
     settings::{defaults, DeviceSettings, OscillatorSettings, Settings, VibratorSettings},
     util::{self, MinCutoff, SharedF32},
@@ -82,8 +83,37 @@ enum ConnectionState {
 // ---------------------------------------------------------------------------
 
 struct Device {
+    name: String,
     props: Arc<Mutex<DeviceProps>>,
-    _task: tokio::task::JoinHandle<()>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// Values-only snapshot of a dropped device's tuning, restored on reconnect
+/// within the grace window. Without this, a 2s RF blip rebuilt DeviceProps
+/// from defaults — a multiplier the user lowered for comfort snapped back to
+/// 1.0 on a running session.
+struct SavedDeviceTuning {
+    is_enabled: bool,
+    multiplier: f32,
+    min: f32,
+    max: f32,
+    vibrators: Vec<VibratorProps>,
+    oscillators: Vec<OscillatorProps>,
+}
+
+impl Device {
+    /// Abort the command and battery tasks. Must be called when the device
+    /// leaves the map, otherwise a stale task keeps polling a dead handle
+    /// and a reconnected device (same name) never gets a live task again.
+    fn abort_tasks(&self) {
+        self.task.abort();
+        self.props
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .battery_state
+            .task
+            .abort();
+    }
 }
 
 struct DeviceProps {
@@ -98,7 +128,7 @@ struct DeviceProps {
 
 struct BatteryState {
     shared_level: SharedF32,
-    _task: tokio::task::JoinHandle<()>,
+    task: tokio::task::JoinHandle<()>,
 }
 
 impl BatteryState {
@@ -108,10 +138,7 @@ impl BatteryState {
             let shared_level = shared_level.clone();
             runtime.spawn(battery_check_bg_task(device, shared_level))
         };
-        Self {
-            shared_level,
-            _task: task,
-        }
+        Self { shared_level, task }
     }
 
     pub fn get_level(&self) -> Option<f32> {
@@ -239,13 +266,28 @@ impl DeviceProps {
 
 struct GuiApp {
     runtime: tokio::runtime::Runtime,
-    client: Option<ButtplugClient>,
+    client: Option<Arc<ButtplugClient>>,
     connection_state: ConnectionState,
     connection_task: Option<tokio::task::JoinHandle<Result<ButtplugClient, ButtplugClientError>>>,
     server_addr: Option<String>,
     server_name: String,
     capture_status: Arc<Mutex<String>>,
-    devices: HashMap<String, Device>,
+    // Keyed by Buttplug device INDEX (unique per connection); names collide
+    // when two identical toys are connected.
+    devices: HashMap<u32, Device>,
+    // Tuning of recently dropped devices (by name -> (tuning, when)), so an
+    // RF blip resumes the session with the user's comfort settings intact.
+    // Pruned by RECONNECT_GRACE.
+    recent_disconnects: HashMap<String, (SavedDeviceTuning, Instant)>,
+    // Written every update() with app_now_ms(); device tasks stop output when
+    // it goes stale (dead-man watchdog).
+    pipeline_heartbeat: Arc<AtomicU64>,
+    // Definitive result of the last scan start/stop op.
+    scan_result: Arc<Mutex<Option<ScanOpResult>>>,
+    // True while a scan start/stop op is in flight (button disabled).
+    scan_op_in_flight: Arc<AtomicBool>,
+    // Result of the last "Stop all devices" command; Some = stop FAILED.
+    stop_all_error: Arc<Mutex<Option<String>>>,
 
     // Audio data from capture thread
     sound_power: SharedF32,            // Legacy: simple RMS power
@@ -270,6 +312,9 @@ struct GuiApp {
     envelope: EnvelopeProcessor,
     beat_detector: BeatDetector,
     climax_engine: ClimaxEngine,
+
+    // AUTO-LOCK supervisor (see docs/AUTO_LOCK_DESIGN.md)
+    auto_lock: AutoLock,
 
     // NEW: cached spectral data for UI display
     last_spectral: SpectralData,
@@ -346,6 +391,74 @@ mod palette {
 const HISTORY_LEN: usize = 256;
 const ADSR_PREVIEW_HEIGHT: f32 = 100.0;
 const OUTPUT_HISTORY_HEIGHT: f32 = 80.0;
+
+// ---------------------------------------------------------------------------
+// Safety plumbing: pipeline heartbeat, dead-man watchdog, panic-stop
+// ---------------------------------------------------------------------------
+
+/// If the UI/pipeline thread stops producing fresh output for this long,
+/// the per-device tasks command a stop rather than hold the last intensity
+/// on a human body. Sized to sit well above normal frame hitches (window
+/// drags, shader stalls) but far below "the app is actually hung".
+const WATCHDOG_TIMEOUT_MS: u64 = 2_000;
+
+/// How long a dropped device's enable state is remembered, so a brief BLE
+/// blip resumes the session instead of coming back silently disabled.
+const RECONNECT_GRACE: Duration = Duration::from_secs(60);
+
+/// Milliseconds since app start on a monotonic clock. Shared time base for
+/// the pipeline heartbeat and the device watchdogs.
+fn app_now_ms() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+type PanicStopPair = (tokio::runtime::Handle, Arc<ButtplugClient>);
+
+/// (was_start, error message if the scan op failed)
+type ScanOpResult = (bool, Option<String>);
+
+fn panic_stop_slot() -> &'static Mutex<Option<PanicStopPair>> {
+    static SLOT: OnceLock<Mutex<Option<PanicStopPair>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+/// Best-effort: command all devices to stop before the process dies from a
+/// panic. Chained in FRONT of the existing crash-log hook; bounded so a dead
+/// server cannot hang the crash path.
+fn register_panic_stop(handle: tokio::runtime::Handle, client: Arc<ButtplugClient>) {
+    static HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
+    *panic_stop_slot().lock().unwrap_or_else(|e| e.into_inner()) = Some((handle, client));
+    HOOK_INSTALLED.get_or_init(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            // The capture thread catches and retries its own init panics
+            // (device busy/unplugged); a recovered panic must not stop a
+            // running session. Panics anywhere else are treated as fatal.
+            let is_recovered_capture_panic = std::thread::current().name() == Some("capture");
+            if !is_recovered_capture_panic {
+                let _ = std::panic::catch_unwind(panic_stop_devices);
+            }
+            prev(info);
+        }));
+    });
+}
+
+fn panic_stop_devices() {
+    let pair = panic_stop_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    if let Some((handle, client)) = pair {
+        let (tx, rx) = std::sync::mpsc::channel();
+        handle.spawn(async move {
+            let _ = client.stop_all_devices().await;
+            let _ = tx.send(());
+        });
+        // Give the stop command a bounded window to reach the hardware.
+        let _ = rx.recv_timeout(Duration::from_millis(1_500));
+    }
+}
 
 // Stop devices on shutdown
 impl Drop for GuiApp {
@@ -602,6 +715,22 @@ impl GuiApp {
         let processed_output_2 = SharedF32::new(0.0);
         let capture_status = Arc::new(Mutex::new(String::from("audio: starting")));
         let capture_status2 = capture_status.clone();
+        let pipeline_heartbeat = Arc::new(AtomicU64::new(app_now_ms()));
+
+        // Debug diagnostic: log heartbeat age so pipeline stalls (minimize,
+        // window drag, hangs) are measurable during development.
+        #[cfg(debug_assertions)]
+        {
+            let hb = pipeline_heartbeat.clone();
+            runtime.spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(1));
+                loop {
+                    interval.tick().await;
+                    let age = app_now_ms().saturating_sub(hb.load(Ordering::Relaxed));
+                    eprintln!("[hb-probe] pipeline heartbeat age: {age}ms");
+                }
+            });
+        }
 
         let mut settings = ctx.storage.map(Settings::load).unwrap_or_default();
         settings.sanitize();
@@ -622,17 +751,23 @@ impl GuiApp {
         let use_advanced_shared = Arc::new(AtomicBool::new(settings.use_advanced_processing));
         let use_advanced_capture = use_advanced_shared.clone();
 
-        let _capture_thread = std::thread::spawn(move || {
-            capture_thread(
-                sound_power2,
-                spectral_data2,
-                low_pass_freq,
-                polling_rate_ms,
-                use_polling_rate,
-                use_advanced_capture,
-                capture_status2,
-            )
-        });
+        // Named so the panic-stop hook can recognize this thread's RECOVERED
+        // panics (capture init is wrapped in catch_unwind + retry) and not
+        // halt a running session for them.
+        let _capture_thread = std::thread::Builder::new()
+            .name("capture".to_string())
+            .spawn(move || {
+                capture_thread(
+                    sound_power2,
+                    spectral_data2,
+                    low_pass_freq,
+                    polling_rate_ms,
+                    use_polling_rate,
+                    use_advanced_capture,
+                    capture_status2,
+                )
+            })
+            .expect("failed to spawn audio capture thread");
 
         // Load embedded logo (graceful — app works without it)
         let logo_texture = match image::load_from_memory(include_bytes!("../assets/logo.png")) {
@@ -662,6 +797,11 @@ impl GuiApp {
             server_name: String::from("<not connected>"),
             capture_status,
             devices,
+            recent_disconnects: HashMap::new(),
+            pipeline_heartbeat,
+            scan_result: Arc::new(Mutex::new(None)),
+            scan_op_in_flight: Arc::new(AtomicBool::new(false)),
+            stop_all_error: Arc::new(Mutex::new(None)),
             sound_power,
             spectral_data,
             processed_output,
@@ -680,6 +820,7 @@ impl GuiApp {
             envelope: EnvelopeProcessor::new(),
             beat_detector: BeatDetector::new(),
             climax_engine: ClimaxEngine::new(),
+            auto_lock: AutoLock::new(),
             last_spectral: SpectralData::default(),
             gate_is_open: false,
             climax_phase: 0.0,
@@ -710,7 +851,7 @@ impl eframe::App for GuiApp {
     fn save(&mut self, storage: &mut dyn Storage) {
         // Save device settings if toggle is enabled
         if self.settings.save_device_settings {
-            for (device_name, device) in &self.devices {
+            for device in self.devices.values() {
                 let mut vibrators = Vec::new();
                 let mut oscillators = Vec::new();
                 let props = &device.props.lock().unwrap_or_else(|e| e.into_inner());
@@ -740,10 +881,20 @@ impl eframe::App for GuiApp {
                 };
                 self.settings
                     .device_settings
-                    .insert(device_name.clone(), device_settings);
+                    .insert(device.name.clone(), device_settings);
             }
         }
-        self.settings.save(storage);
+        // Persistence guard: never let auto-save persist an active Auto-Lock.
+        // A crash or quit mid-lock must not silently replace the user's tuned
+        // settings, so the pre-lock values are swapped in for the write.
+        if let Some(snapshot) = self.auto_lock.pre_lock_snapshot() {
+            let live = self.auto_lock.live_params(&self.settings);
+            snapshot.apply(&mut self.settings);
+            self.settings.save(storage);
+            live.apply(&mut self.settings);
+        } else {
+            self.settings.save(storage);
+        }
         storage.flush();
     }
 
@@ -810,16 +961,68 @@ impl eframe::App for GuiApp {
             s.spacing.button_padding = vec2(8.0, 4.0);
         });
 
-        // --- Connection Handling (unchanged) ---
+        // --- Pipeline heartbeat (dead-man watchdog time base) ---
+        self.pipeline_heartbeat
+            .store(app_now_ms(), Ordering::Relaxed);
+
+        // Engine clock, shared by the pipeline and the Auto-Lock UI.
+        let current_time_ms = {
+            static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+            let start = START.get_or_init(Instant::now);
+            start.elapsed().as_secs_f32() * 1000.0
+        };
+
+        // --- Definitive scan start/stop results ---
+        // is_scanning reflects what the server actually did, not what we
+        // hoped: a failed START leaves it off, a failed STOP leaves it ON.
+        if let Some((was_start, err)) = self
+            .scan_result
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            match err {
+                None => self.is_scanning = was_start,
+                Some(e) => {
+                    self.is_scanning = !was_start;
+                    let what = if was_start {
+                        "Start scan failed"
+                    } else {
+                        "Stop scan failed"
+                    };
+                    self.connection_state = ConnectionState::Error(format!("{what}: {e}"));
+                }
+            }
+        }
+
+        // --- Server health check ---
+        // A dead Intiface/websocket link used to leave the app claiming
+        // "Connected" with dead output and no recovery UI short of restart.
+        if matches!(self.connection_state, ConnectionState::Connected) {
+            let alive = self.client.as_ref().map(|c| c.connected()).unwrap_or(false);
+            if !alive {
+                for (_, device) in self.devices.drain() {
+                    device.abort_tasks();
+                }
+                self.client = None;
+                self.is_scanning = false;
+                self.connection_state =
+                    ConnectionState::Error("Server connection lost".to_string());
+            }
+        }
+
+        // --- Connection Handling ---
         if let Some(task) = self.connection_task.take() {
             if task.is_finished() {
                 match self.runtime.block_on(task) {
                     Ok(Ok(client)) => {
+                        let client = Arc::new(client);
                         self.server_name = client
                             .server_name()
                             .as_deref()
                             .unwrap_or("<unknown>")
                             .to_string();
+                        register_panic_stop(self.runtime.handle().clone(), client.clone());
                         self.client = Some(client);
                         self.connection_state = ConnectionState::Connected;
                         if self.settings.start_scanning_on_startup {
@@ -892,41 +1095,29 @@ impl eframe::App for GuiApp {
                                 } else {
                                     palette::BG_TERTIARY
                                 });
-                                if ui.add(scan_btn).clicked() {
-                                    if self.is_scanning {
-                                        match self
-                                            .runtime
-                                            .block_on(client.stop_scanning())
-                                        {
-                                            Ok(_) => {
-                                                self.is_scanning = false;
-                                            }
-                                            Err(e) => {
-                                                self.connection_state = ConnectionState::Error(
-                                                    format!(
-                                                        "Stop scan failed: {e}"
-                                                    ),
-                                                );
-                                            }
-                                        }
-                                    } else {
-                                        match self
-                                            .runtime
-                                            .block_on(client.start_scanning())
-                                        {
-                                            Ok(_) => {
-                                                self.is_scanning = true;
-                                            }
-                                            Err(e) => {
-                                                self.is_scanning = false;
-                                                self.connection_state = ConnectionState::Error(
-                                                    format!(
-                                                        "Start scan failed: {e}"
-                                                    ),
-                                                );
-                                            }
-                                        }
-                                    }
+                                // Never block the UI thread on a server
+                                // round-trip: a slow/hung Intiface froze the
+                                // whole app here. One op in flight at a time;
+                                // is_scanning only changes when the server
+                                // confirms (drained at frame start).
+                                let scan_busy =
+                                    self.scan_op_in_flight.load(Ordering::Relaxed);
+                                if ui.add_enabled(!scan_busy, scan_btn).clicked() {
+                                    let start = !self.is_scanning;
+                                    self.scan_op_in_flight.store(true, Ordering::Relaxed);
+                                    let client = client.clone();
+                                    let slot = self.scan_result.clone();
+                                    let in_flight = self.scan_op_in_flight.clone();
+                                    self.runtime.spawn(async move {
+                                        let res = if start {
+                                            client.start_scanning().await
+                                        } else {
+                                            client.stop_scanning().await
+                                        };
+                                        *slot.lock().unwrap_or_else(|p| p.into_inner()) =
+                                            Some((start, res.err().map(|e| e.to_string())));
+                                        in_flight.store(false, Ordering::Relaxed);
+                                    });
                                 }
                             }
                         }
@@ -970,6 +1161,33 @@ impl eframe::App for GuiApp {
                     self.show_settings = true;
                 }
 
+                // AUTO-LOCK: fit the chain to the playing material
+                // (docs/AUTO_LOCK_DESIGN.md). Advanced pipeline only.
+                if self.settings.use_advanced_processing {
+                    let al_fill = match self.auto_lock.state {
+                        AutoLockState::Locked { .. } => palette::GREEN,
+                        AutoLockState::Listening { .. } => palette::CYAN,
+                        AutoLockState::NoLock { .. } => palette::AMBER,
+                        AutoLockState::Idle => palette::BG_TERTIARY,
+                    };
+                    let al_btn = Button::new(
+                        RichText::new(self.auto_lock.button_label(current_time_ms))
+                            .color(Color32::WHITE),
+                    )
+                    .fill(al_fill);
+                    if ui.add(al_btn).clicked() {
+                        self.auto_lock.on_button(current_time_ms);
+                    }
+                    if self.auto_lock.is_locked() {
+                        if ui.small_button("Revert").clicked() {
+                            self.auto_lock.revert(&mut self.settings);
+                        }
+                        if ui.small_button("Keep").clicked() {
+                            self.auto_lock.keep(&mut self.settings);
+                        }
+                    }
+                }
+
                 let stop_w = 120.0;
                 ui.add_space(ui.available_width() - stop_w);
 
@@ -979,13 +1197,36 @@ impl eframe::App for GuiApp {
                 .fill(Color32::from_rgb(240, 0, 0));
                 if ui.add_sized([stop_w, 30.0], stop_btn).clicked() {
                     if let Some(client) = &self.client {
-                        self.runtime.spawn(client.stop_all_devices());
+                        // Verified stop: the result is checked and a failure is
+                        // shown in red. Disabling every device also makes the
+                        // per-device tasks send zeros within one 20ms tick, so
+                        // the hardware stops even if this RPC fails.
+                        let client = client.clone();
+                        let err_slot = self.stop_all_error.clone();
+                        self.runtime.spawn(async move {
+                            let res = client.stop_all_devices().await;
+                            *err_slot.lock().unwrap_or_else(|p| p.into_inner()) = match res {
+                                Ok(_) => None,
+                                Err(e) => Some(format!(
+                                    "STOP COMMAND FAILED: {e} — power the device off"
+                                )),
+                            };
+                        });
                         for device in self.devices.values_mut() {
                             device.props.lock().unwrap_or_else(|e| e.into_inner()).is_enabled = false;
                         }
                     }
                 }
             });
+
+            let stop_error = self
+                .stop_all_error
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(msg) = stop_error {
+                ui.colored_label(palette::RED, msg);
+            }
 
             ui.separator();
 
@@ -994,12 +1235,6 @@ impl eframe::App for GuiApp {
             // ============================================================
             let delta_time = ctx.input(|x| x.stable_dt);
             let main_mul = self.settings.main_volume;
-            let current_time_ms = {
-                static START: std::sync::OnceLock<Instant> =
-                    std::sync::OnceLock::new();
-                let start = START.get_or_init(Instant::now);
-                start.elapsed().as_secs_f32() * 1000.0
-            };
 
             if self.settings.use_advanced_processing {
                 // ====== NEW PIPELINE (ChloeVibes-derived) ======
@@ -1188,8 +1423,26 @@ impl eframe::App for GuiApp {
                 self.vibration_level +=
                     (trimmed_intensity - self.vibration_level) * output_alpha;
                 self.vibration_level = self.vibration_level.clamp(0.0, 1.0);
+
+                // AUTO-LOCK supervisor: observes this frame, manages the
+                // listen/commit/glide state machine. Writes only whitelisted
+                // Settings fields (docs/AUTO_LOCK_DESIGN.md).
+                self.auto_lock.tick(
+                    current_time_ms,
+                    &self.last_spectral,
+                    raw_energy_for_gate,
+                    onset_ok,
+                    envelope_output,
+                    using_rms_fallback,
+                    self.beat_detector.tempo_confidence,
+                    &mut self.settings,
+                );
             } else {
                 // ====== LEGACY PIPELINE (original Chloe Vibes) ======
+                // Auto-Lock only supervises the advanced pipeline.
+                if !matches!(self.auto_lock.state, AutoLockState::Idle) {
+                    self.auto_lock.cancel();
+                }
                 let source = sanitize_unit(self.sound_power.load());
                 let sound_power = sanitize_unit(source * main_mul);
                 self.input_level = source;
@@ -1447,7 +1700,7 @@ impl eframe::App for GuiApp {
             let algorithm_text = if self.settings.use_advanced_processing {
                 "FFT spectrum -> gate -> trigger -> ADSR -> optional beat/climax modulation -> output range."
             } else {
-                "RMS loudness -> volume^2 -> optional hold/decay persistence -> clamp 0..1 -> device output."
+                "RMS loudness -> volume scaling -> optional hold/decay persistence -> clamp 0..1 -> device output."
             };
             ui.label(
                 RichText::new(algorithm_text)
@@ -2502,15 +2755,7 @@ impl eframe::App for GuiApp {
                         TextFormat::default(),
                     );
                     text.append(
-                        "Warning!!!",
-                        0.0,
-                        TextFormat {
-                            color: Color32::RED,
-                            ..Default::default()
-                        },
-                    );
-                    text.append(
-                        " Exponential: 200% = 4x!",
+                        "Linear scaling: 200% = 2x.",
                         0.0,
                         TextFormat::default(),
                     );
@@ -2566,14 +2811,72 @@ impl eframe::App for GuiApp {
             // ============================================================
             ui.heading("Devices");
             if let Some(client) = &self.client {
-                for bp_device in client.devices() {
+                let bp_devices = client.devices();
+
+                // Prune devices that dropped. Without this, entries lived
+                // forever: on reconnect no new command task was spawned, and
+                // the old task kept polling a dead handle — the device
+                // reappeared in the list but never vibrated again. Keyed by
+                // Buttplug device INDEX: names collide when two identical
+                // toys are connected.
+                let live: HashSet<u32> = bp_devices.iter().map(|d| d.index()).collect();
+                let gone: Vec<u32> = self
+                    .devices
+                    .keys()
+                    .filter(|idx| !live.contains(idx))
+                    .copied()
+                    .collect();
+                for idx in gone {
+                    if let Some(device) = self.devices.remove(&idx) {
+                        let saved = {
+                            let props =
+                                device.props.lock().unwrap_or_else(|e| e.into_inner());
+                            SavedDeviceTuning {
+                                is_enabled: props.is_enabled,
+                                multiplier: props.multiplier,
+                                min: props.min,
+                                max: props.max,
+                                vibrators: props.vibrators.clone(),
+                                oscillators: props.oscillators.clone(),
+                            }
+                        };
+                        device.abort_tasks();
+                        self.recent_disconnects
+                            .insert(device.name.clone(), (saved, Instant::now()));
+                    }
+                }
+                self.recent_disconnects
+                    .retain(|_, (_, at)| at.elapsed() < RECONNECT_GRACE);
+
+                for bp_device in bp_devices {
+                    let device_index = bp_device.index();
                     let device_name = bp_device.name().to_string();
-                    if !self.devices.contains_key(&device_name) {
+                    if !self.devices.contains_key(&device_index) {
                         let props = Arc::new(Mutex::new(DeviceProps::new(
                             &self.runtime,
                             bp_device.clone(),
                             &self.settings,
                         )));
+
+                        // Resume the session after a brief RF blip with the
+                        // user's tuning intact — enable state AND comfort
+                        // settings (multiplier/min/max/per-motor), so output
+                        // never jumps past what they had dialed in.
+                        if let Some((saved, _)) =
+                            self.recent_disconnects.remove(&device_name)
+                        {
+                            let mut p = props.lock().unwrap_or_else(|e| e.into_inner());
+                            p.is_enabled = saved.is_enabled;
+                            p.multiplier = saved.multiplier;
+                            p.min = saved.min;
+                            p.max = saved.max;
+                            if saved.vibrators.len() == p.vibrators.len() {
+                                p.vibrators = saved.vibrators;
+                            }
+                            if saved.oscillators.len() == p.oscillators.len() {
+                                p.oscillators = saved.oscillators;
+                            }
+                        }
 
                         // Spawn per-device task.
                         // Reads processed_output (after envelope/gate).
@@ -2585,6 +2888,7 @@ impl eframe::App for GuiApp {
                             let props = props.clone();
                             let processed = self.processed_output.clone();
                             let processed2 = self.processed_output_2.clone();
+                            let heartbeat = self.pipeline_heartbeat.clone();
                             async move {
                                 // Rate limiter state (from Gemini/ChloeVibes approach)
                                 let mut last_sent: f64 = -1.0;
@@ -2594,8 +2898,44 @@ impl eframe::App for GuiApp {
                                 // make the difference between "buzzing" and "alive".
                                 let resolution: f64 = 0.005;
                                 let mut consecutive_errors: u32 = 0;
+                                // Enable-state signature: a toggle must force
+                                // a send even when the computed level is
+                                // steady, otherwise disabling a device (or
+                                // the stop-all fallback flipping is_enabled)
+                                // sends nothing and the motor keeps running.
+                                let mut last_enable_sig: u64 = u64::MAX;
 
                                 loop {
+                                    // Dead-man watchdog: if the pipeline stops
+                                    // producing fresh output (UI hang, panic
+                                    // mid-frame), do not hold the last intensity
+                                    // on a human body — stop and idle until the
+                                    // heartbeat resumes.
+                                    let heartbeat_age = app_now_ms()
+                                        .saturating_sub(heartbeat.load(Ordering::Relaxed));
+                                    if heartbeat_age > WATCHDOG_TIMEOUT_MS {
+                                        if last_sent > 0.0 || last_sent_m2 > 0.0 {
+                                            eprintln!(
+                                                "Pipeline heartbeat stale ({heartbeat_age}ms); stopping device"
+                                            );
+                                            // Only mark stopped on SUCCESS —
+                                            // a failed stop must be retried
+                                            // on the next 250ms pass, not
+                                            // forgotten while the motor runs.
+                                            match bp_device.stop().await {
+                                                Ok(_) => {
+                                                    last_sent = 0.0;
+                                                    last_sent_m2 = 0.0;
+                                                }
+                                                Err(e) => eprintln!(
+                                                    "Watchdog stop failed (will retry): {e}"
+                                                ),
+                                            }
+                                        }
+                                        tokio::time::sleep(Duration::from_millis(250)).await;
+                                        continue;
+                                    }
+
                                     let now = tokio::time::Instant::now();
                                     let vibration_level = processed.load();
                                     let vibration_level_2 = processed2.load();
@@ -2604,27 +2944,48 @@ impl eframe::App for GuiApp {
                                     let mut oscillate_cmd = None;
                                     {
                                         let guard = props.lock().unwrap_or_else(|e| e.into_inner());
-                                        let speed =
-                                            guard.calculate_output(
-                                                vibration_level,
-                                            );
+                                        // A disabled device drives zero, so a
+                                        // toggle at a steady level registers
+                                        // as a change (and a hard stop).
+                                        let speed = if guard.is_enabled {
+                                            guard.calculate_output(vibration_level)
+                                        } else {
+                                            0.0
+                                        };
                                         let speed_f64 = speed as f64;
 
                                         // === RATE LIMITER ===
                                         // Only send if:
                                         //   a) intensity changed by more than 0.5%, OR
-                                        //   b) this is a hard stop (going to zero)
-                                        let speed2 = guard.calculate_output(vibration_level_2);
+                                        //   b) this is a hard stop (going to zero), OR
+                                        //   c) any enable toggle changed
+                                        let speed2 = if guard.is_enabled {
+                                            guard.calculate_output(vibration_level_2)
+                                        } else {
+                                            0.0
+                                        };
                                         let speed2_f64 = speed2 as f64;
                                         let change = (speed_f64 - last_sent).abs();
                                         let change_m2 = (speed2_f64 - last_sent_m2).abs();
                                         let is_hard_stop = speed_f64 < 0.005
                                             && last_sent >= 0.005;
+                                        let mut enable_sig: u64 = guard.is_enabled as u64;
+                                        for v in &guard.vibrators {
+                                            enable_sig = (enable_sig << 1) | v.is_enabled as u64;
+                                        }
+                                        for o in &guard.oscillators {
+                                            enable_sig = (enable_sig << 1) | o.is_enabled as u64;
+                                        }
 
-                                        if change >= resolution || change_m2 >= resolution || is_hard_stop {
+                                        if change >= resolution
+                                            || change_m2 >= resolution
+                                            || is_hard_stop
+                                            || enable_sig != last_enable_sig
+                                        {
                                             should_send = true;
                                             last_sent = speed_f64;
                                             last_sent_m2 = speed2_f64;
+                                            last_enable_sig = enable_sig;
                                         }
 
                                         if should_send {
@@ -2727,8 +3088,15 @@ impl eframe::App for GuiApp {
                                         if had_error {
                                             consecutive_errors += 1;
                                             if consecutive_errors >= 10 {
-                                                eprintln!("Device task exiting after 10 consecutive BLE errors");
-                                                break;
+                                                // Do NOT exit: an exited task
+                                                // means a device that looks
+                                                // connected but never vibrates.
+                                                // Back off; if the device is
+                                                // really gone the client drops
+                                                // it and the UI thread aborts
+                                                // this task.
+                                                eprintln!("10+ consecutive BLE errors; backing off");
+                                                tokio::time::sleep(Duration::from_secs(1)).await;
                                             }
                                         } else {
                                             consecutive_errors = 0;
@@ -2747,13 +3115,14 @@ impl eframe::App for GuiApp {
                         });
 
                         let device = Device {
+                            name: device_name.clone(),
                             props,
-                            _task: task,
+                            task,
                         };
-                        self.devices.insert(device_name.clone(), device);
+                        self.devices.insert(device_index, device);
                     }
                     let device =
-                        self.devices.get_mut(&device_name).unwrap();
+                        self.devices.get_mut(&device_index).unwrap();
                     device_widget(
                         ui,
                         bp_device,
@@ -3449,6 +3818,7 @@ fn settings_window_widget(ctx: &egui::Context, show_settings: &mut bool, setting
 // Device Widget (unchanged from original)
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct VibratorProps {
     is_enabled: bool,
     multiplier: f32,
@@ -3467,6 +3837,7 @@ impl Default for VibratorProps {
     }
 }
 
+#[derive(Clone)]
 struct OscillatorProps {
     is_enabled: bool,
     multiplier: f32,
@@ -3540,7 +3911,10 @@ fn device_widget(
                 });
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Multiplier: ");
-                    let slider = ui.add(Slider::new(&mut props.multiplier, 0.0..=20.0));
+                    // Logarithmic: linearly, the whole useful zone (0-2x) sat
+                    // in the first 10% of travel of the 0-20x range.
+                    let slider =
+                        ui.add(Slider::new(&mut props.multiplier, 0.0..=20.0).logarithmic(true));
                     if slider.double_clicked() {
                         props.multiplier = 1.0;
                     }
@@ -3596,7 +3970,7 @@ fn vibrator_widget(ui: &mut Ui, index: usize, vibe: &mut VibratorProps) {
             vibe.is_enabled = !vibe.is_enabled;
         }
         ui.label("Multiplier: ");
-        let slider = ui.add(Slider::new(&mut vibe.multiplier, 0.0..=5.0));
+        let slider = ui.add(Slider::new(&mut vibe.multiplier, 0.0..=5.0).logarithmic(true));
         if slider.double_clicked() {
             vibe.multiplier = 1.0;
         }
@@ -3627,7 +4001,7 @@ fn oscillator_widget(ui: &mut Ui, index: usize, osc: &mut OscillatorProps) {
             osc.is_enabled = !osc.is_enabled;
         }
         ui.label("Multiplier: ");
-        let slider = ui.add(Slider::new(&mut osc.multiplier, 0.0..=5.0));
+        let slider = ui.add(Slider::new(&mut osc.multiplier, 0.0..=5.0).logarithmic(true));
         if slider.double_clicked() {
             osc.multiplier = 1.0;
         }

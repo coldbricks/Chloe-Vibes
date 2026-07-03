@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod audio;
+mod auto_lock;
 mod gui;
 mod presets;
 mod settings;
