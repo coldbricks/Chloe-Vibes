@@ -5,7 +5,7 @@
 <p align="center">
   <strong>ChloeVibes</strong><br>
   Audio-Reactive Haptic Control System<br>
-  Technical Reference, Software Version 1.1.0
+  Technical Reference, Software Version 1.3.0
 </p>
 
 <p align="center">
@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Android-Kotlin_·_Compose-2A3890?style=for-the-badge&logo=android&logoColor=2A3890&labelColor=A0A1A5" alt="Android, Kotlin + Compose" />
   <img src="https://img.shields.io/badge/Lovense-BLE-2A3890?style=for-the-badge&labelColor=A0A1A5" alt="Lovense BLE" />
   <img src="https://img.shields.io/badge/Buttplug.io-9.0.9-2A3890?style=for-the-badge&labelColor=A0A1A5" alt="Buttplug.io 9.0.9" />
-  <img src="https://img.shields.io/badge/Version-1.1.0-2A3890?style=for-the-badge&labelColor=A0A1A5" alt="Version 1.1.0" />
+  <img src="https://img.shields.io/badge/Version-1.3.0-2A3890?style=for-the-badge&labelColor=A0A1A5" alt="Version 1.3.0" />
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-2A3890?style=for-the-badge&labelColor=A0A1A5" alt="MIT License" /></a>
 </p>
 
@@ -37,7 +37,7 @@
 | Spectral resolution | 2048-point FFT, 1024 usable bins, 23.4 Hz per bin at 48 kHz |
 | Output interface | Lovense BLE over Nordic UART Service; Buttplug 9.0.9 client on desktop |
 | Output resolution | Integer intensity 0 to 20 (21 discrete levels) |
-| Software version | 1.1.0 |
+| Software version | 1.3.0 |
 | License | MIT |
 
 This document describes the operation, specifications, and limitations of the ChloeVibes haptic control system. It assumes familiarity with digital signal processing, Bluetooth Low Energy, and the relevant build toolchains.
@@ -55,7 +55,7 @@ The system is delivered as two clients built on one shared signal engine:
 
 The Android engine is a direct port of the Rust engine (`src/audio.rs`). Output equivalence between the two clients is enforced by a continuous-integration parity test (Section 6). The clients are not permitted to diverge; CI fails on any deviation.
 
-> **WARNING.** This system commands a physical haptic device against a human body. No automatic safety cutoff or panic-stop is implemented in this version. The operator retains full responsibility for output level and for stopping the device. See Section 9.
+> **WARNING.** This system commands a physical haptic device against a human body. The desktop client implements a dead-man watchdog (output is commanded to stop if the processing pipeline stalls for 2 s), a panic-stop hook (devices are stopped before the process dies on a crash), and a verified stop-all control. These reduce, but do not eliminate, risk: the Android client has no watchdog in this version, and no software can stop a device if the process is killed outright. The operator retains full responsibility for output level and for stopping the device. See Section 9.
 
 <p align="center">
   <img src="assets/screenshot-windows.png" alt="Windows desktop console" width="820" /><br>
@@ -134,6 +134,12 @@ The desktop client provides two processing algorithms, selectable at runtime. Th
 
 - **Advanced FFT + ADSR.** The default. The full signal chain described in Sections 2.1 through 2.6.
 - **Original Chloe Vibes (RMS).** The original loudness-follower algorithm, inherited from the project predecessor and retained as a selectable mode. The capture thread derives a single loudness value from a low-pass filter and full-band RMS. The pipeline is: RMS loudness, scaled by the volume control, optional hold-and-decay persistence (configurable hold delay and decay rate), then clamp to 0 to 1. The FFT band analysis, gate, beat detector, ADSR envelope, and Climax Engine are bypassed in this mode.
+
+### 2.8 AUTO-LOCK (Desktop)
+
+One-press automatic parameter fitting. On activation the client listens to 4 to 15 seconds of the playing material and derives: the most rhythmically salient frequency band (per-band onset-aligned spectral-flux concentration, requiring a 1.3x margin over the runner-up), the beat interval (median and IQR of merged inter-onset intervals), the material's crest factor, and the median spectral centroid. It then writes a fitted parameter set — drive band, trigger mode and curve, and an envelope whose decay fits inside the beat interval — through a 1.5 s glide, and reports a lock-quality score on the button. Unlockable material (ambient, speech) is reported honestly as NO LOCK and nothing is written.
+
+AUTO-LOCK is a supervisor above the signal chain, not a chain stage: it writes the same whitelisted parameter fields the sliders write and cannot touch volume, output gain, the output floor/ceiling, gate, Climax, or timing trim. Its binary trigger level is capped at the 90th percentile of the output the dynamic path actually produced during listening. Any manual parameter change or preset selection cancels the lock; one press reverts to the exact pre-lock settings; an active lock is never persisted to storage without an explicit Keep. Design document: `docs/AUTO_LOCK_DESIGN.md`.
 
 ---
 
@@ -243,6 +249,10 @@ Independent `Vibrate1`/`Vibrate2` control on Android is confirmed only for the L
 
 Unfiltered low-latency scan with a 15 s timeout. Connect over TRANSPORT_LE. Request HIGH connection priority. Request a 185-byte MTU. Call `discoverServices()` only from the `onMtuChanged` callback. Issuing service discovery immediately after the MTU request drops discovery on many host stacks (GATT status 19). Verified on Samsung Galaxy S23 Ultra with Lovense Edge 2.
 
+Scanning stops before any connection attempt (concurrent scan + connect provokes GATT error 133 on many stacks), the GATT client is closed on every disconnect path (Android caps a process at roughly 32 clients; leaking them makes every later connect fail until the app is killed), and an unexpected link loss triggers automatic reconnection with exponential backoff (600 ms to 8 s, 6 attempts). On Android 12+ the `BLUETOOTH_SCAN` permission carries the `neverForLocation` assertion, so scanning requires no Location permission and no GPS.
+
+**Desktop device lifecycle.** Dropped devices are pruned and their command tasks aborted; a device that reconnects within 60 s resumes with its enable state and per-device tuning (multiplier, floor, ceiling, per-motor settings) intact. The connection to the Buttplug server is health-checked every frame; a dead server surfaces a reconnect control instead of a stale "Connected" state.
+
 ---
 
 ## 6. Cross-Platform Parity
@@ -281,12 +291,11 @@ The Android engine is a direct port of the Rust engine. Output equivalence is en
 | Output resolution | Lovense intensity 0 to 20 integer (21 levels) |
 | BLE command rate | Desktop 50 Hz (20 ms, 0.5% dead-band); Android 33 Hz (30 ms minimum interval) |
 | Desktop stack | Rust, `eframe`/`egui` 0.33.3, Buttplug 9.0.9, `rustfft`, WASAPI loopback |
-| Android stack | Kotlin, Jetpack Compose (Material3), package `com.ashairfoil.chloevibes`, version 1.1.0 (versionCode 2) |
+| Android stack | Kotlin, Jetpack Compose (Material3), package `com.ashairfoil.chloevibes`, version 1.3.0 (versionCode 3) |
 | Android SDK | minSdk 26 (Android 8.0), target/compile SDK 35, Java/Kotlin 17 |
-| Test suite | 61 Rust tests (runner count; 36 distinct test functions), clippy `-D warnings`, `fmt --check`, Kotlin unit and parity tests |
+| Test suite | 44 Rust unit tests + the parity golden test, clippy `-D warnings`, `fmt --check`, Kotlin unit and parity tests |
+| Safety (desktop) | Dead-man watchdog (2 s pipeline-stall timeout, retried stop), panic-stop hook, verified stop-all |
 | License | MIT |
-
-> **NOTE.** The product version is 1.1.0, as carried by the `VERSION` file and the Android build. The desktop crate `Cargo.toml` version currently reads 0.5.0 and is scheduled to be raised to 1.1.0. This is an internal version discrepancy, not a separate release.
 
 ---
 
@@ -322,10 +331,12 @@ Minimum platform: Android 8.0 (API 26). Target: API 35.
 
 ## 9. Limitations
 
-The following are not implemented in this version. Operate accordingly.
+The following limitations apply to this version. Operate accordingly.
 
-- **No automatic safety cutoff.** No panic-stop and no automatic intensity limiter are implemented. The only means of halting output are the manual "Stop all devices" control and, on desktop, automatic stop on application close.
-- **No automatic reconnection.** A BLE or RF dropout requires manual reconnection. The session does not re-establish the link on its own.
+- **Safety coverage is partial.** The desktop client has a dead-man watchdog (pipeline stall &gt; 2 s commands a stop, retried until it succeeds), a panic-stop hook, and a verified stop-all whose failure is reported on screen. The Android client has none of these yet; its safeguards are the manual stop, stop-on-app-close, and the automatic zero sent when a device is disabled. No software protects against an outright process kill or battery pull — behavior then depends on the device's own link-loss handling.
+- **No automatic intensity limiter.** Output level remains entirely the operator's responsibility.
+- **Reconnect scope.** Automatic reconnection (Android BLE backoff; desktop device re-adoption) restores the session within a 60 s grace window on desktop; a longer outage returns the device disabled with default tuning, and a dead Buttplug server still requires a manual reconnect click.
+- **AUTO-LOCK is desktop-only** in this version, and one-shot: it does not re-fit when the music changes (press again to re-lock).
 - **Android dual-motor scope.** Independent dual-motor control is confirmed only for the Lovense Edge and Edge 2 (Section 5.3).
 - **Catalog parity gap.** The desktop preset catalog lacks the three Chloe presets and the `threshold_knee` / `dynamic_curve` fields present on Android.
 - **Reserved fields.** `rms_power` and `dominant_frequency` are hardwired to 0.0 in the Rust engine.
