@@ -316,6 +316,11 @@ struct GuiApp {
     // AUTO-LOCK supervisor (see docs/AUTO_LOCK_DESIGN.md)
     auto_lock: AutoLock,
 
+    // Fresh-spectral-frame detection: gate + beat detector must be ticked
+    // once per capture frame, not once per UI repaint.
+    last_spectral_sig: u64,
+    last_onset_strength: f32,
+
     // NEW: cached spectral data for UI display
     last_spectral: SpectralData,
     gate_is_open: bool,
@@ -417,6 +422,10 @@ type PanicStopPair = (tokio::runtime::Handle, Arc<ButtplugClient>);
 
 /// (was_start, error message if the scan op failed)
 type ScanOpResult = (bool, Option<String>);
+
+/// Debug diagnostics: onset events since the last [pipe] snapshot.
+#[cfg(debug_assertions)]
+static DIAG_ONSETS: AtomicU64 = AtomicU64::new(0);
 
 fn panic_stop_slot() -> &'static Mutex<Option<PanicStopPair>> {
     static SLOT: OnceLock<Mutex<Option<PanicStopPair>>> = OnceLock::new();
@@ -548,6 +557,13 @@ fn capture_thread(
 
         let mut analyzer = SpectralAnalyzer::new(sample_rate);
         let mut total_frames_read: u64 = 0;
+        let mut frames_since_analysis: usize = 0;
+        // Analyze on a fixed ~1024-frame hop (~47Hz at 48k), not per poll.
+        // The beat detector's frame-based statistics (43-frame flux window)
+        // assume this cadence; analyzing every ~11ms poll produced 77%-overlap
+        // windows whose shrunken flux inflated inter-onset jitter ~6x on real
+        // material (measured: IOI IQR 21ms at this hop vs 130ms per-poll).
+        let analysis_hop_frames = (audio::FFT_SIZE / 2).max(1);
         let mut last_status_time = Instant::now();
 
         if let Err(e) = capture.start() {
@@ -634,9 +650,13 @@ fn capture_thread(
                 sound_power.store(low_pass_rms.max(raw_rms));
             }
 
-            // NEW: Full spectral analysis via FFT
-            let spectral = analyzer.analyze(samples, channels);
-            spectral_shared.store(spectral);
+            // NEW: Full spectral analysis via FFT, on the fixed hop cadence
+            frames_since_analysis += frames_read_this_tick;
+            if frames_since_analysis >= analysis_hop_frames {
+                frames_since_analysis = 0;
+                let spectral = analyzer.analyze(samples, channels);
+                spectral_shared.store(spectral);
+            }
 
             if last_status_time.elapsed() >= Duration::from_secs(1) {
                 set_capture_status(
@@ -821,6 +841,8 @@ impl GuiApp {
             beat_detector: BeatDetector::new(),
             climax_engine: ClimaxEngine::new(),
             auto_lock: AutoLock::new(),
+            last_spectral_sig: 0,
+            last_onset_strength: 0.0,
             last_spectral: SpectralData::default(),
             gate_is_open: false,
             climax_phase: 0.0,
@@ -1282,8 +1304,33 @@ impl eframe::App for GuiApp {
                 self.using_rms_fallback = using_rms_fallback;
 
                 // 4. Beat detection (for onset retrigger)
-                let (detected_onset, onset_strength) =
-                    self.beat_detector.process(self.last_spectral.spectral_flux, current_time_ms);
+                //
+                // Process the detector ONCE per fresh capture frame. The UI
+                // repaints far faster than the capture thread produces frames
+                // (~240fps vs ~90Hz), and re-feeding duplicate flux values
+                // compresses the detector's 43-frame statistics window
+                // several-fold — measured on real music as ~6x inflation of
+                // inter-onset jitter (IQR 21ms -> 130ms), which starves tempo
+                // confidence and Auto-Lock.
+                let spectral_sig = {
+                    let mut sig = self.last_spectral.spectral_flux.to_bits() as u64;
+                    for b in &self.last_spectral.band_energies {
+                        sig = sig.rotate_left(7) ^ b.to_bits() as u64;
+                    }
+                    sig
+                };
+                let fresh_spectral = spectral_sig != self.last_spectral_sig;
+                self.last_spectral_sig = spectral_sig;
+
+                let (detected_onset, onset_strength) = if fresh_spectral {
+                    let (onset, strength) = self
+                        .beat_detector
+                        .process(self.last_spectral.spectral_flux, current_time_ms);
+                    self.last_onset_strength = strength;
+                    (onset, strength)
+                } else {
+                    (false, self.last_onset_strength)
+                };
 
                 // Predictive onset: when tempo is locked, pre-trigger ~2 device
                 // write intervals early so the attack command arrives on-beat
@@ -1310,14 +1357,24 @@ impl eframe::App for GuiApp {
                     && onset_strength > 1.02
                     && energy > self.settings.gate_threshold * 0.40;
 
+                #[cfg(debug_assertions)]
+                if onset_ok {
+                    DIAG_ONSETS.fetch_add(1, Ordering::Relaxed);
+                }
+
                 // 5. Gate (uses raw pre-volume energy so threshold is
-                // volume-independent, matching Android behavior)
-                self.gate_is_open = self.gate.process(
-                    raw_energy_for_gate,
-                    self.settings.gate_threshold,
-                    self.settings.auto_gate_amount,
-                    self.settings.gate_smoothing,
-                );
+                // volume-independent, matching Android behavior). Same
+                // fresh-frame rule: the gate's close smoothing is per-call,
+                // so duplicate calls made it close several times faster than
+                // the slider says.
+                if fresh_spectral {
+                    self.gate_is_open = self.gate.process(
+                        raw_energy_for_gate,
+                        self.settings.gate_threshold,
+                        self.settings.auto_gate_amount,
+                        self.settings.gate_smoothing,
+                    );
+                }
 
                 // 6. Envelope ADSR (the big upgrade)
                 let envelope_output = self.envelope.drive(
@@ -1423,6 +1480,37 @@ impl eframe::App for GuiApp {
                 self.vibration_level +=
                     (trimmed_intensity - self.vibration_level) * output_alpha;
                 self.vibration_level = self.vibration_level.clamp(0.0, 1.0);
+
+                // Debug diagnostic: one pipeline snapshot per ~second, for
+                // chasing no-signal/oscillation reports against real settings.
+                #[cfg(debug_assertions)]
+                {
+                    use std::sync::atomic::AtomicU32;
+                    static DIAG_FRAME: AtomicU32 = AtomicU32::new(0);
+                    if DIAG_FRAME.fetch_add(1, Ordering::Relaxed).is_multiple_of(60) {
+                        let onsets = DIAG_ONSETS.swap(0, Ordering::Relaxed);
+                        eprintln!(
+                            "[pipe] e={:.5} stable={:.5} gate={} th_eff={:.4} auto={:.2} env={:?} out={:.4} trig={:?} minv={:.2} rmsfb={} conf={:.2} pred_in={:.0}ms str={:.2} onsets={}",
+                            energy,
+                            stable_energy,
+                            self.gate_is_open,
+                            self.gate.effective_threshold(
+                                self.settings.gate_threshold,
+                                self.settings.auto_gate_amount
+                            ),
+                            self.settings.auto_gate_amount,
+                            self.envelope.state,
+                            self.vibration_level,
+                            self.settings.trigger_mode,
+                            self.settings.min_vibe,
+                            using_rms_fallback,
+                            self.beat_detector.tempo_confidence,
+                            self.beat_detector.predicted_next_onset_ms - current_time_ms,
+                            onset_strength,
+                            onsets
+                        );
+                    }
+                }
 
                 // AUTO-LOCK supervisor: observes this frame, manages the
                 // listen/commit/glide state machine. Writes only whitelisted

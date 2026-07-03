@@ -14,6 +14,24 @@ anti-adaptation). Auto-Lock maximizes contrast: pick the band that carries the
 rhythm, fit decay/release into the inter-onset interval so every hit fully
 blooms and the trough between hits is preserved.
 
+## Target waveform (field brief, 2026-07-03)
+
+Think like a bass drum: **punch up instantly, one continuous musical decay
+down, and the decay LANDS exactly where the next beat begins.** A sawtooth
+metronome with an organic boom. Never a flat dead gap (mechanical), never a
+truncated cut (jolting). Concretely: instant attack (fast path), exponential
+decay (curve ~1.8) spanning ~78% of the perceptually folded beat, landing on
+a low sustain floor (~0.08) that doubles as the retrigger-ready state, with
+jitter margin before the next hit. Side effect exploited deliberately: the
+onset detector fires on the subdivision grid (eighth notes), and off-beat
+onsets arrive mid-Decay where the engine eats them — only the felt beat
+relaunches the punch.
+
+Band selection is punch-first, not rhythm-first: per band, the median
+per-hit energy jump times hit reliability, divided by the between-hit floor.
+The kick's huge jump out of a quiet floor beats a loud-but-ticky hi-hat and
+a bassline-smeared band.
+
 ## Architecture
 
 A **supervising estimator-controller** (`src/auto_lock.rs`), owned by the App
@@ -30,8 +48,10 @@ The write-struct simply lacks the fields Auto-Lock must never touch:
 `main_volume`, `output_gain`, `min_vibe`, `max_vibe`, per-device multipliers,
 all `climax_*`, `trim_ms` (user latency calibration), `gate_threshold` /
 `auto_gate_amount` (writing the gate creates a feedback loop with the onset
-veto). `binary_level` is capped at the p90 of the *observed* dynamic envelope
-output — the lock can never deliver more than the material already did.
+veto). `binary_level` is seeded from the observed dynamic envelope p90 with a
+0.55 punch floor and a hard 0.85 cap — the USER's ceiling (`max_vibe`,
+`output_gain`, device multipliers) always binds downstream, so the consent
+boundary is structural, not statistical.
 
 ## State machine
 

@@ -200,6 +200,11 @@ pub struct AutoLock {
     /// What we last wrote — any mismatch means the user (or a preset click)
     /// took over, which cancels the lock without fighting them.
     expected: Option<LockParams>,
+    /// Only audio captured AFTER this timestamp counts toward the current
+    /// listen. Without it, a retry after NO LOCK instantly re-analyzed the
+    /// same stale ring and bounced straight back to NO LOCK — the button
+    /// appeared dead.
+    listen_from_ms: f32,
 }
 
 impl AutoLock {
@@ -212,6 +217,7 @@ impl AutoLock {
             snapshot: None,
             glide: None,
             expected: None,
+            listen_from_ms: 0.0,
         }
     }
 
@@ -252,6 +258,8 @@ impl AutoLock {
     pub fn on_button(&mut self, now_ms: f32) {
         match self.state {
             AutoLockState::Idle | AutoLockState::NoLock { .. } => {
+                // Fresh listen: only audio arriving from now on counts.
+                self.listen_from_ms = now_ms;
                 self.state = AutoLockState::Listening { started_ms: now_ms };
             }
             AutoLockState::Listening { .. } => {
@@ -261,6 +269,7 @@ impl AutoLock {
             AutoLockState::Locked { .. } => {
                 // Re-lock on fresh material. The original pre-lock snapshot
                 // is kept, so Revert still returns to the user's settings.
+                self.listen_from_ms = now_ms;
                 self.state = AutoLockState::Listening { started_ms: now_ms };
                 self.glide = None;
             }
@@ -408,6 +417,9 @@ impl AutoLock {
     fn valid_window_ms(&self) -> f32 {
         let mut total = 0.0;
         for pair in self.frames.iter().collect::<Vec<_>>().windows(2) {
+            if pair[1].t_ms < self.listen_from_ms {
+                continue;
+            }
             if pair[1].valid {
                 total += pair[1].t_ms - pair[0].t_ms;
             }
@@ -420,7 +432,7 @@ impl AutoLock {
     // -----------------------------------------------------------------------
 
     fn try_commit(&mut self, now_ms: f32, engine_conf: f32, settings: &mut Settings) {
-        let features = match self.estimate() {
+        let features = match self.estimate(self.listen_from_ms) {
             Ok(f) => f,
             Err(reason) => {
                 self.state = AutoLockState::NoLock { reason };
@@ -482,8 +494,10 @@ impl AutoLock {
         }
     }
 
-    fn estimate(&self) -> Result<Features, &'static str> {
-        let frames: Vec<&FrameSample> = self.frames.iter().collect();
+    /// Estimate features from ring data captured at or after `from_ms`
+    /// (0.0 = the whole ring). A fresh listen must not re-judge stale audio.
+    fn estimate(&self, from_ms: f32) -> Result<Features, &'static str> {
+        let frames: Vec<&FrameSample> = self.frames.iter().filter(|f| f.t_ms >= from_ms).collect();
         if frames.len() < 40 {
             return Err("not enough audio");
         }
@@ -493,7 +507,12 @@ impl AutoLock {
         let silence_ratio = silent as f32 / frames.len() as f32;
 
         // Inter-onset intervals, filtered to a plausible beat range
-        let onsets: Vec<f32> = self.onsets.iter().copied().collect();
+        let onsets: Vec<f32> = self
+            .onsets
+            .iter()
+            .copied()
+            .filter(|&o| o >= from_ms)
+            .collect();
         if onsets.len() < 8 {
             return Err("no steady rhythm");
         }
@@ -509,36 +528,87 @@ impl AutoLock {
         let ioi_median = percentile_sorted(&iois, 0.5);
         let ioi_iqr = percentile_sorted(&iois, 0.75) - percentile_sorted(&iois, 0.25);
 
-        // Per-band rhythmic salience: the fraction of each band's total
-        // half-wave-rectified energy delta that lands at onset times. High =
-        // the band moves WITH the beat, independent of its absolute loudness.
-        let mut at_onset = [0.0f32; N_BANDS];
-        let mut total = [1e-6f32; N_BANDS];
+        // Per-band PUNCH: the objective is the biggest per-hit impact, not
+        // merely the most rhythmic band. For each band:
+        //   hit height  = median over onsets of the max energy jump inside
+        //                 the onset-aligned window (how hard each hit lands)
+        //   floor       = median energy jump on non-aligned frames (the mush
+        //                 between hits that dilutes the contrast)
+        //   reliability = fraction of onsets where the band actually moved
+        // punch = hit_height * reliability / (floor + regularizer). A kick
+        // with huge jumps out of a quiet floor dominates; a loud-but-ticky
+        // hi-hat or a band smeared by a bassline loses.
+        let n = frames.len();
+        let mut delta_rows: Vec<[f32; N_BANDS]> = Vec::with_capacity(n.saturating_sub(1));
+        let mut aligned_rows: Vec<bool> = Vec::with_capacity(n.saturating_sub(1));
         for pair in frames.windows(2) {
             let (prev, cur) = (pair[0], pair[1]);
-            let aligned = onsets
-                .iter()
-                .any(|&o| cur.t_ms >= o && cur.t_ms - o <= ONSET_ALIGN_MS);
-            for b in 0..N_BANDS {
-                let delta = (cur.band_energies[b] - prev.band_energies[b]).max(0.0);
-                total[b] += delta;
-                if aligned {
-                    at_onset[b] += delta;
+            let mut row = [0.0f32; N_BANDS];
+            for (b, slot) in row.iter_mut().enumerate() {
+                *slot = (cur.band_energies[b] - prev.band_energies[b]).max(0.0);
+            }
+            delta_rows.push(row);
+            aligned_rows.push(
+                onsets
+                    .iter()
+                    .any(|&o| cur.t_ms >= o && cur.t_ms - o <= ONSET_ALIGN_MS),
+            );
+        }
+
+        let mut punch = [0.0f32; N_BANDS];
+        for b in 0..N_BANDS {
+            // Per-onset peak jump in this band
+            let mut hit_peaks: Vec<f32> = Vec::with_capacity(onsets.len());
+            for &o in &onsets {
+                let mut peak = 0.0f32;
+                let mut in_window = false;
+                for (row, pair) in delta_rows.iter().zip(frames.windows(2)) {
+                    let t = pair[1].t_ms;
+                    if t >= o && t - o <= ONSET_ALIGN_MS {
+                        in_window = true;
+                        peak = peak.max(row[b]);
+                    } else if t > o + ONSET_ALIGN_MS {
+                        break;
+                    }
+                }
+                if in_window {
+                    hit_peaks.push(peak);
                 }
             }
+            if hit_peaks.is_empty() {
+                continue;
+            }
+            hit_peaks.sort_by(|a, c| a.partial_cmp(c).unwrap());
+            let hit_height = percentile_sorted(&hit_peaks, 0.5);
+            let reliability = hit_peaks.iter().filter(|&&p| p > 1e-4).count() as f32
+                / hit_peaks.len().max(1) as f32;
+
+            // Between-hit activity: MEAN of non-aligned deltas (median is
+            // almost always exactly 0 for rectified deltas, which made every
+            // band look perfectly clean).
+            let (mut floor_sum, mut floor_n) = (0.0f32, 0u32);
+            for (row, &a) in delta_rows.iter().zip(aligned_rows.iter()) {
+                if !a {
+                    floor_sum += row[b];
+                    floor_n += 1;
+                }
+            }
+            let floor = floor_sum / floor_n.max(1) as f32;
+
+            // Punch = absolute per-hit impact, scaled by consistency and by a
+            // BOUNDED contrast bonus (1.0 for a silent floor, 0.25 when the
+            // between-hit mush equals the hit itself). Absolute hit height
+            // stays in charge, so the kick's big jump beats a clean-but-tiny
+            // treble tick.
+            let contrast = hit_height / (hit_height + 3.0 * floor + 1e-6);
+            punch[b] = hit_height * reliability * contrast;
         }
-        let mut salience = [0.0f32; N_BANDS];
-        for b in 0..N_BANDS {
-            // Weight concentration by absolute activity so a near-silent band
-            // with two lucky spikes can't win.
-            let activity = (total[b] / frames.len() as f32).sqrt();
-            salience[b] = (at_onset[b] / total[b]) * activity;
-        }
+
         let mut order: Vec<usize> = (0..N_BANDS).collect();
-        order.sort_by(|&a, &b| salience[b].partial_cmp(&salience[a]).unwrap());
+        order.sort_by(|&a, &b| punch[b].partial_cmp(&punch[a]).unwrap());
         let best_band = order[0];
-        let salience_margin = if salience[order[1]] > 1e-6 {
-            salience[best_band] / salience[order[1]]
+        let salience_margin = if punch[order[1]] > 1e-6 {
+            punch[best_band] / punch[order[1]]
         } else {
             f32::INFINITY
         };
@@ -582,15 +652,38 @@ impl AutoLock {
         })
     }
 
+    /// Fold a raw inter-onset interval into the perceptual beat octave
+    /// (70-180 BPM => 333-857ms). Onset detectors track the subdivision grid
+    /// (verified on real material: a 125 BPM track detects as a rock-solid
+    /// 250 BPM eighth-note grid), but the envelope must breathe with the
+    /// FELT beat, not the subdivision.
+    fn fold_to_perceptual_beat(ioi_ms: f32) -> f32 {
+        let mut t = ioi_ms;
+        if t <= 0.0 {
+            return t;
+        }
+        while t < 333.0 {
+            t *= 2.0;
+        }
+        while t > 857.0 {
+            t /= 2.0;
+        }
+        t
+    }
+
     /// Feature -> parameter mapping. All numbers land inside sanitize()
     /// ranges; intensity-bearing fields are capped by observed output.
     fn map_features(f: &Features, settings: &Settings) -> LockParams {
-        let t = f.ioi_median;
+        let t = Self::fold_to_perceptual_beat(f.ioi_median);
 
-        // Frequency focus, only with a clear winner
+        // Frequency focus, only with a clear winner. For low-band winners use
+        // the tightest LowPass that covers the winning band: extract_energy
+        // normalizes by band count, so LowPass at the Sub edge is pure
+        // kick energy — the field-proven recipe for a hard beat lock.
         let (frequency_mode, target_frequency) = if f.salience_margin >= SALIENCE_MARGIN {
             match f.best_band {
-                0 | 1 => (FrequencyMode::LowPass, BAND_EDGES[2]), // sub+bass together
+                0 => (FrequencyMode::LowPass, BAND_EDGES[1]), // sub only
+                1 => (FrequencyMode::LowPass, BAND_EDGES[2]), // sub+bass
                 2 | 3 => (
                     FrequencyMode::BandPass,
                     (BAND_EDGES[f.best_band] * BAND_EDGES[f.best_band + 1]).sqrt(),
@@ -603,29 +696,37 @@ impl AutoLock {
 
         // Trigger shape from material punchiness
         let (trigger_mode, hybrid_blend, dynamic_curve) = if f.crest >= 4.0 {
-            (TriggerMode::Hybrid, 0.7, 1.0)
+            (TriggerMode::Hybrid, 0.75, 1.0)
         } else if f.crest >= 2.2 {
-            (TriggerMode::Hybrid, 0.45, 1.2)
+            (TriggerMode::Hybrid, 0.55, 1.2)
         } else {
             // Compressed material: stay dynamic, expand contrast via curve
             (TriggerMode::Dynamic, settings.hybrid_blend, 1.6)
         };
 
-        // Never deliver more than the dynamic path already did
-        let binary_level = f.envelope_p90.clamp(0.0, 0.65);
+        // PUNCH delivery: each hit should land near the top of the USER'S
+        // configured range — max_vibe, output_gain, and device multipliers
+        // still bound everything downstream, so the consent ceiling is
+        // untouched. The observed p90 seeds the level, the 0.55 floor
+        // guarantees the binary component actually thumps, and 0.85 leaves
+        // headroom for the engine's velocity overshoot to ride above it.
+        let binary_level = (f.envelope_p90 * 1.25).max(0.55).clamp(0.0, 0.85);
 
-        // Envelope fitted to the beat. Decay MUST fit inside the IOI: the
-        // engine only retriggers from Sustain, so a decay longer than the
-        // gap between hits silently eats beats.
-        let decay_ms = (0.30 * t).clamp(50.0, 600.0).min(0.6 * t);
-        let sustain_target = if t < 300.0 {
-            0.18
-        } else if t < 600.0 {
-            0.28
-        } else {
-            0.38
-        };
-        let release_target = (0.55 * t).clamp(80.0, 1500.0);
+        // THE TARGET WAVEFORM (field brief): punch up instantly, ONE
+        // continuous musical decay down, and the decay LANDS exactly where
+        // the next beat begins — a metronome that goes boooom. Never a flat
+        // dead gap, never a truncated (jolting) cut.
+        //
+        // The decay spans ~78% of the folded beat, so the envelope is back
+        // in Sustain — the engine's only retrigger state — with margin for
+        // musical timing jitter; the low sustain floor IS the landing.
+        // Deliberate side effect: the detector actually fires on the
+        // subdivision grid (eighth notes), and those off-beat onsets arrive
+        // mid-Decay where the engine eats them — so only the felt beat
+        // relaunches the punch.
+        let decay_ms = (0.78 * t).clamp(80.0, 1600.0);
+        let sustain_target = 0.08; // landing floor: deep trough, retrigger-ready
+        let release_target = (0.50 * t).clamp(80.0, 1200.0);
 
         // Engine-exact centroid pre-compensation (audio.rs frequency shaping:
         // sustain *= 1 - 0.25*cn; release *= 1 + 0.4*(1-cn), with the LINEAR
@@ -634,10 +735,13 @@ impl AutoLock {
         let sustain_level = (sustain_target / (1.0 - 0.25 * cn)).clamp(0.0, 1.0);
         let release_ms = (release_target / (1.0 + 0.4 * (1.0 - cn))).clamp(0.5, 5000.0);
 
-        // Input smoothing + output slew scaled to the material
+        // Input smoothing + output slew scaled to the material. Slew is the
+        // last mush layer between the envelope and the motor — keep it just
+        // high enough to smooth quantization, never high enough to soften
+        // the hit (rising edge is 0.35x this value).
         let input_rise_ms = if f.crest >= 2.2 { 8.0 } else { 25.0 };
         let input_fall_ms = (0.35 * t).clamp(80.0, 300.0);
-        let output_slew_ms = (0.18 * t).clamp(35.0, 120.0);
+        let output_slew_ms = (0.10 * t).clamp(30.0, 70.0);
 
         LockParams {
             frequency_mode,
@@ -654,7 +758,10 @@ impl AutoLock {
             sustain_level,
             release_ms,
             attack_curve: 0.7,
-            decay_curve: 1.0,
+            // Exponential drum-decay feel: fast initial bloom-down, gentle
+            // landing. Linear (1.0) reads mechanical; this is the "organic"
+            // part of the boom, and the gentle tail is the anti-jolt.
+            decay_curve: 1.8,
             release_curve: 1.3,
             input_rise_ms,
             input_fall_ms,
@@ -693,6 +800,203 @@ mod tests {
             band_energies: bands,
             ..SpectralData::default()
         }
+    }
+
+    // ---- Offline beat-detection harness on real material ----
+    //
+    // Run: cargo test --release analyze_real_wav -- --ignored --nocapture
+    //
+    // Feeds a real WAV through the real SpectralAnalyzer -> Gate ->
+    // BeatDetector -> AutoLock estimator under three cadence models:
+    //   designed-47Hz    one fresh 2048 window per 1024-sample hop (the
+    //                    cadence the detector's frame-based statistics assume)
+    //   capture-100Hz    the actual capture-thread behavior: ~10ms poll of a
+    //                    rolling buffer, so consecutive FFT windows overlap
+    //                    ~80% and flux shrinks accordingly
+    //   live-uiDup       capture-100Hz plus the UI loop re-processing each
+    //                    stored spectral frame 2-3x (measured ~240fps)
+    // This isolates whether beat-detection failures are algorithmic or
+    // cadence-induced.
+    #[test]
+    #[ignore]
+    fn analyze_real_wav() {
+        let path = std::env::var("CHLOE_WAV")
+            .unwrap_or_else(|_| r"C:\Users\coldb\Downloads\STA.wav".to_string());
+        let Ok(bytes) = std::fs::read(&path) else {
+            eprintln!("SKIP: {path} not found");
+            return;
+        };
+        let (mono, rate) = parse_wav_mono(&bytes);
+        eprintln!(
+            "loaded {path}: {} samples @ {rate} Hz ({:.1}s)",
+            mono.len(),
+            mono.len() as f32 / rate as f32
+        );
+        run_cadence_model("designed-47Hz", &mono, rate as f32, 1024, 1);
+        run_cadence_model("capture-100Hz", &mono, rate as f32, 480, 1);
+        run_cadence_model("live-uiDup", &mono, rate as f32, 480, 0);
+    }
+
+    /// Minimal RIFF/WAVE PCM16 parser -> mono f32.
+    fn parse_wav_mono(bytes: &[u8]) -> (Vec<f32>, u32) {
+        let mut pos = 12usize;
+        let mut channels = 2usize;
+        let mut rate = 48_000u32;
+        let mut data: &[u8] = &[];
+        while pos + 8 <= bytes.len() {
+            let id = &bytes[pos..pos + 4];
+            let sz = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as usize;
+            let end = (pos + 8 + sz).min(bytes.len());
+            let body = &bytes[pos + 8..end];
+            if id == b"fmt " && body.len() >= 8 {
+                channels = u16::from_le_bytes(body[2..4].try_into().unwrap()) as usize;
+                rate = u32::from_le_bytes(body[4..8].try_into().unwrap());
+            }
+            if id == b"data" {
+                data = body;
+                break;
+            }
+            pos += 8 + sz + (sz & 1);
+        }
+        let ch = channels.max(1);
+        let mut mono = Vec::with_capacity(data.len() / (2 * ch));
+        for frame in data.chunks_exact(2 * ch) {
+            let mut acc = 0f32;
+            for c in 0..ch {
+                acc += i16::from_le_bytes([frame[2 * c], frame[2 * c + 1]]) as f32 / 32768.0;
+            }
+            mono.push(acc / ch as f32);
+        }
+        (mono, rate)
+    }
+
+    /// ui_ticks: 1 = one pipeline pass per capture frame; 0 = simulate the
+    /// live UI loop (2-3 passes per capture frame, ~240fps vs ~100Hz capture).
+    fn run_cadence_model(mode: &str, mono: &[f32], rate: f32, hop: usize, ui_ticks: usize) {
+        use crate::audio::{BeatDetector, FrequencyMode, Gate, SpectralAnalyzer};
+
+        let mut analyzer = SpectralAnalyzer::new(rate);
+        let mut gate = Gate::new();
+        let mut beat = BeatDetector::new();
+        let mut al = AutoLock::new();
+        let mut settings = Settings {
+            gate_threshold: 0.17, // field-reported user setting
+            ..Default::default()
+        };
+        al.on_button(0.0);
+
+        let main_volume = 1.15f32;
+        let normalize = |v: f32| ((v * 6.0).clamp(0.0, 1.0)).powf(0.65).clamp(0.0, 1.0);
+
+        let hop_ms = hop as f32 / rate * 1000.0;
+        let mut onset_times: Vec<f32> = Vec::new();
+        let mut last_state = format!("{:?}", al.state);
+        let mut pos = 2048usize;
+        let mut t_ms = 0.0f32;
+        let mut frame_idx = 0u64;
+
+        while pos + hop <= mono.len() {
+            pos += hop;
+            t_ms += hop_ms;
+            frame_idx += 1;
+            let sd = analyzer.analyze(&mono[pos - 2048..pos], 1);
+
+            let ticks = if ui_ticks == 0 {
+                // ~240fps UI over ~100Hz capture: alternate 2 and 3 passes
+                if frame_idx % 5 < 2 {
+                    3
+                } else {
+                    2
+                }
+            } else {
+                ui_ticks
+            };
+
+            for k in 0..ticks {
+                let tick_ms = t_ms + k as f32 * (hop_ms / ticks as f32);
+                let energy_raw = SpectralAnalyzer::extract_energy(&sd, FrequencyMode::Full, 200.0);
+                let normalized = normalize(energy_raw);
+                let energy = (normalized * main_volume).clamp(0.0, 1.0);
+                let _gate_open = gate.process(normalized, settings.gate_threshold, 0.0, 0.22);
+                let (onset, strength) = beat.process(sd.spectral_flux, tick_ms);
+                let onset_ok = onset && strength > 1.02 && energy > settings.gate_threshold * 0.40;
+                if onset_ok {
+                    onset_times.push(tick_ms);
+                }
+                al.tick(
+                    tick_ms,
+                    &sd,
+                    normalized,
+                    onset_ok,
+                    energy,
+                    false,
+                    beat.tempo_confidence,
+                    &mut settings,
+                );
+            }
+
+            let state_now = format!("{:?}", al.state);
+            if state_now != last_state {
+                eprintln!("[{mode}] t={:.1}s state -> {state_now}", t_ms / 1000.0);
+                last_state = state_now;
+            }
+        }
+
+        let mut iois: Vec<f32> = onset_times
+            .windows(2)
+            .map(|w| w[1] - w[0])
+            .filter(|d| (150.0..=2000.0).contains(d))
+            .collect();
+        iois.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let (med, iqr) = if iois.len() >= 2 {
+            (
+                percentile_sorted(&iois, 0.5),
+                percentile_sorted(&iois, 0.75) - percentile_sorted(&iois, 0.25),
+            )
+        } else {
+            (0.0, 0.0)
+        };
+        let dur_s = t_ms / 1000.0;
+        eprintln!(
+            "[{mode}] onsets={} ({:.2}/s) ioi_med={:.0}ms (={:.1} bpm) iqr={:.0}ms conf_end={:.2} tempo_int={:.0}ms",
+            onset_times.len(),
+            onset_times.len() as f32 / dur_s.max(0.1),
+            med,
+            if med > 0.0 { 60_000.0 / med } else { 0.0 },
+            iqr,
+            beat.tempo_confidence,
+            beat.tempo_interval_ms,
+        );
+        match al.estimate(0.0) {
+            Ok(f) => {
+                eprintln!(
+                    "[{mode}] estimate: ioi_med={:.0} iqr={:.0} band={} margin={:.2} crest={:.2} silence={:.2} env_p90={:.2}",
+                    f.ioi_median,
+                    f.ioi_iqr,
+                    f.best_band,
+                    f.salience_margin,
+                    f.crest,
+                    f.silence_ratio,
+                    f.envelope_p90
+                );
+                let folded = AutoLock::fold_to_perceptual_beat(f.ioi_median);
+                let p = AutoLock::map_features(&f, &settings);
+                eprintln!(
+                    "[{mode}] fitted: beat={:.0}ms (folded from {:.0}) mode={:?} target={:.0}Hz decay={:.0}ms sustain={:.2} release={:.0}ms slew={:.0}ms trig={:?}",
+                    folded,
+                    f.ioi_median,
+                    p.frequency_mode,
+                    p.target_frequency,
+                    p.decay_ms,
+                    p.sustain_level,
+                    p.release_ms,
+                    p.output_slew_ms,
+                    p.trigger_mode
+                );
+            }
+            Err(reason) => eprintln!("[{mode}] estimate: ERR {reason}"),
+        }
+        eprintln!("[{mode}] final autolock state: {:?}\n", al.state);
     }
 
     /// Feed a synthetic session: band `beat_band` pulses every `ioi_ms`,
@@ -762,9 +1066,12 @@ mod tests {
                 &mut settings,
             );
         }
+        // Bass-drum waveform: the decay spans most of the beat and LANDS
+        // (envelope in Sustain, the only retrigger state) with jitter margin
+        // before the next hit — never a flat gap, never a truncated cut.
         assert!(
-            settings.decay_ms <= 0.6 * 500.0 + 1.0,
-            "decay {} must fit inside the 500ms IOI",
+            settings.decay_ms >= 0.70 * 500.0 && settings.decay_ms <= 0.85 * 500.0,
+            "decay {} must span ~78% of the 500ms beat",
             settings.decay_ms
         );
         assert!(settings.attack_ms < 50.0, "attack must take the fast path");
@@ -772,13 +1079,15 @@ mod tests {
 
     #[test]
     fn never_touches_ceiling_fields() {
-        let mut probe = Settings::default();
-        probe.main_volume = 1.234;
-        probe.output_gain = 0.777;
-        probe.min_vibe = 0.111;
-        probe.max_vibe = 0.888;
-        probe.gate_threshold = 0.099;
-        probe.climax_intensity = 0.321;
+        let mut probe = Settings {
+            main_volume: 1.234,
+            output_gain: 0.777,
+            min_vibe: 0.111,
+            max_vibe: 0.888,
+            gate_threshold: 0.099,
+            climax_intensity: 0.321,
+            ..Default::default()
+        };
 
         let mut al = AutoLock::new();
         al.on_button(0.0);
@@ -846,6 +1155,82 @@ mod tests {
     }
 
     #[test]
+    fn retry_after_no_lock_listens_fresh_and_can_lock() {
+        let mut al = AutoLock::new();
+        let mut settings = Settings::default();
+        al.on_button(0.0);
+
+        // 16s of silence -> NO LOCK
+        let mut now = 0.0f32;
+        while now < 16_000.0 {
+            now += 20.0;
+            let bands = [(now % 13.0) * 1e-6; N_BANDS];
+            al.tick(
+                now,
+                &spectral_with_bands(bands),
+                0.0001,
+                false,
+                0.0,
+                false,
+                0.0,
+                &mut settings,
+            );
+        }
+        assert!(matches!(al.state, AutoLockState::NoLock { .. }));
+
+        // Retry: must actually LISTEN to fresh audio, not instantly re-judge
+        // the stale ring and bounce back to NoLock (the dead-button bug).
+        al.on_button(now);
+        now += 20.0;
+        al.tick(
+            now,
+            &spectral_with_bands([2e-5; N_BANDS]),
+            0.0001,
+            false,
+            0.0,
+            false,
+            0.0,
+            &mut settings,
+        );
+        assert!(
+            matches!(al.state, AutoLockState::Listening { .. }),
+            "retry must re-listen, got {:?}",
+            al.state
+        );
+
+        // Feed real beats after the retry -> must reach Locked
+        let mut next_beat = now + 100.0;
+        let end = now + 16_000.0;
+        while now < end {
+            now += 20.0;
+            let mut bands = [0.02f32; N_BANDS];
+            bands[7] = 0.02 + (now / 900.0).sin().abs() * 0.001;
+            let mut onset = false;
+            if now >= next_beat {
+                bands[1] = 0.8;
+                onset = true;
+                next_beat += 500.0;
+            }
+            let energy = bands.iter().sum::<f32>() / N_BANDS as f32;
+            al.tick(
+                now,
+                &spectral_with_bands(bands),
+                energy,
+                onset,
+                0.4,
+                false,
+                0.9,
+                &mut settings,
+            );
+        }
+        assert!(
+            al.is_locked(),
+            "retry on good material must lock, got {:?}",
+            al.state
+        );
+    }
+
+    #[test]
     fn manual_change_cancels_the_lock() {
         let (mut al, mut settings, now) = run_synthetic_session(1, 500.0, 0.8);
         assert!(al.is_locked());
@@ -897,7 +1282,7 @@ mod tests {
         f.centroid_median = 4_100.0; // cn = 1 (bright)
         let bright = AutoLock::map_features(&f, &s);
 
-        let target = (0.55f32 * 500.0).clamp(80.0, 1500.0);
+        let target = (0.50f32 * 500.0).clamp(80.0, 1200.0);
         // Dark: engine multiplies by 1.4 -> written must be target/1.4
         assert!((dark.release_ms * 1.4 - target).abs() < 0.5);
         // Bright: engine multiplies by 1.0 -> written == target
@@ -907,8 +1292,12 @@ mod tests {
     }
 
     #[test]
-    fn binary_level_capped_by_observed_output() {
-        let f = Features {
+    fn binary_level_punch_policy() {
+        // Quiet material is floored at 0.55 so hits still thump; loud
+        // material seeds from the observed p90 but is hard-capped at 0.85
+        // (headroom for velocity overshoot). The user's max/gain/multiplier
+        // ceiling binds downstream in both cases.
+        let mut f = Features {
             ioi_median: 400.0,
             ioi_iqr: 15.0,
             best_band: 1,
@@ -919,9 +1308,13 @@ mod tests {
             silence_ratio: 0.0,
         };
         let s = Settings::default();
-        let p = AutoLock::map_features(&f, &s);
-        assert_eq!(p.trigger_mode, TriggerMode::Hybrid);
-        assert!(p.binary_level <= 0.3 + 1e-6);
+        let quiet = AutoLock::map_features(&f, &s);
+        assert_eq!(quiet.trigger_mode, TriggerMode::Hybrid);
+        assert!((quiet.binary_level - 0.55).abs() < 1e-6);
+
+        f.envelope_p90 = 0.8; // loud material: 0.8 * 1.25 = 1.0 -> cap 0.85
+        let loud = AutoLock::map_features(&f, &s);
+        assert!((loud.binary_level - 0.85).abs() < 1e-6);
     }
 
     #[test]
