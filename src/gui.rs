@@ -761,7 +761,7 @@ impl GuiApp {
         let is_unknown_named =
             !stored_name.is_empty() && presets::find_preset(&stored_name).is_none();
         if stored_name.eq_ignore_ascii_case("Default") || is_unknown_named {
-            if let Some(preset) = presets::find_preset("Ride Intensity") {
+            if let Some(preset) = presets::find_preset("Bass Drum") {
                 settings.apply_preset(&preset);
             }
         }
@@ -1183,23 +1183,31 @@ impl eframe::App for GuiApp {
                     self.show_settings = true;
                 }
 
-                // AUTO-LOCK: fit the chain to the playing material
-                // (docs/AUTO_LOCK_DESIGN.md). Advanced pipeline only.
+                // FIND BOOM: listen → max-dynamic bass-drum sweet spot.
+                // Advanced pipeline only. After lock, tweak any slider —
+                // that takes ownership (or Revert / Keep).
                 if self.settings.use_advanced_processing {
                     let al_fill = match self.auto_lock.state {
                         AutoLockState::Locked { .. } => palette::GREEN,
                         AutoLockState::Listening { .. } => palette::CYAN,
                         AutoLockState::NoLock { .. } => palette::AMBER,
-                        AutoLockState::Idle => palette::BG_TERTIARY,
+                        AutoLockState::Idle => palette::ACCENT_PURPLE,
                     };
                     let al_btn = Button::new(
                         RichText::new(self.auto_lock.button_label(current_time_ms))
-                            .color(Color32::WHITE),
+                            .color(Color32::WHITE)
+                            .strong(),
                     )
                     .fill(al_fill);
-                    if ui.add(al_btn).clicked() {
+                    let al_resp = ui.add(al_btn);
+                    if al_resp.clicked() {
                         self.auto_lock.on_button(current_time_ms);
                     }
+                    al_resp.on_hover_text(
+                        "Play a track with a kick, press FIND BOOM.\n\
+                         Listens ~4–8s, locks band + gate + boom decay\n\
+                         for maximum dynamic contrast. Then tweak freely.",
+                    );
                     if self.auto_lock.is_locked() {
                         if ui.small_button("Revert").clicked() {
                             self.auto_lock.revert(&mut self.settings);
@@ -1207,6 +1215,14 @@ impl eframe::App for GuiApp {
                         if ui.small_button("Keep").clicked() {
                             self.auto_lock.keep(&mut self.settings);
                         }
+                    }
+                    if let Some(line) = self.auto_lock.report_line() {
+                        ui.label(
+                            RichText::new(line)
+                                .size(9.0)
+                                .color(palette::ACCENT_TEAL)
+                                .monospace(),
+                        );
                     }
                 }
 
@@ -1985,44 +2001,47 @@ impl eframe::App for GuiApp {
                 }
 
                 ui.horizontal(|ui| {
-                    section_label(ui, "CHLOE", palette::ACCENT_PINK);
+                    section_label(ui, "BOOM", palette::ACCENT_PINK);
                     ui.label(
-                        RichText::new("Auto rhythm macro")
+                        RichText::new("Presets · or press FIND BOOM (top) to auto-tune")
                             .size(9.0)
                             .color(palette::TEXT_DIM)
                             .monospace(),
                     );
-                    if ui.button("Ride Intensity").clicked() {
-                        if let Some(preset) = presets::find_preset("Ride Intensity")
-                        {
+                    if ui.button("Bass Drum").clicked() {
+                        if let Some(preset) = presets::find_preset("Bass Drum") {
                             self.settings.apply_preset(&preset);
                         }
                         self.settings.use_advanced_processing = true;
                         self.settings.climax_mode_enabled = false;
+                        self.auto_lock.cancel();
                         self.envelope.reset();
                         self.climax_engine.reset(current_time_ms);
                     }
-                    if ui.button("Loose").clicked() {
+                    if ui.button("Deep 90").clicked() {
                         apply_chloe_rhythm_profile(
                             &mut self.settings,
                             ChloeRhythmProfile::Loose,
                         );
+                        self.auto_lock.cancel();
                         self.envelope.reset();
                         self.climax_engine.reset(current_time_ms);
                     }
-                    if ui.button("Medium").clicked() {
+                    if ui.button("Club 125").clicked() {
                         apply_chloe_rhythm_profile(
                             &mut self.settings,
                             ChloeRhythmProfile::Medium,
                         );
+                        self.auto_lock.cancel();
                         self.envelope.reset();
                         self.climax_engine.reset(current_time_ms);
                     }
-                    if ui.button("Ultimate").clicked() {
+                    if ui.button("Hard 140").clicked() {
                         apply_chloe_rhythm_profile(
                             &mut self.settings,
                             ChloeRhythmProfile::Ultimate,
                         );
+                        self.auto_lock.cancel();
                         self.envelope.reset();
                         self.climax_engine.reset(current_time_ms);
                     }
@@ -3713,96 +3732,69 @@ fn apply_climax_profile(settings: &mut Settings, profile: ClimaxProfile) {
     settings.current_preset_name.clear();
 }
 
+/// Bass-drum body macros. Same shape as AUTO-LOCK / "Bass Drum" preset:
+/// instant peak → ~0.78× beat exponential decay → near-zero floor.
+/// Climax always off — this path is pure boom + silence.
 fn apply_chloe_rhythm_profile(settings: &mut Settings, profile: ChloeRhythmProfile) {
     settings.use_advanced_processing = true;
     settings.auto_gate_amount = 0.0;
-    settings.gate_smoothing = 0.08;
+    settings.gate_smoothing = 0.06;
     settings.trigger_mode = TriggerMode::Hybrid;
     settings.frequency_mode = FrequencyMode::LowPass;
-    settings.attack_curve = 0.42;
-    settings.decay_curve = 1.65;
-    settings.release_curve = 1.95;
+    settings.attack_ms = 20.0;
+    settings.attack_curve = 0.7;
+    settings.decay_curve = 1.8;
+    settings.release_curve = 1.3;
+    settings.threshold_knee = 0.15;
+    settings.dynamic_curve = 1.2;
+    settings.input_rise_ms = 8.0;
+    settings.min_vibe = 0.0;
+    settings.max_vibe = 1.0;
+    settings.climax_mode_enabled = false;
 
     match profile {
+        // ~90 BPM (beat ≈ 667 ms) — deep, slow, body-long decay
         ChloeRhythmProfile::Loose => {
-            settings.current_preset_name = String::from("Chloe Loose");
-            settings.main_volume = 1.45;
-            settings.target_frequency = 175.0;
-            settings.gate_threshold = 0.17;
-            settings.threshold_knee = 0.17;
-            settings.dynamic_curve = 1.35;
-            settings.binary_level = 0.64;
-            settings.hybrid_blend = 0.34;
-            settings.attack_ms = 4.5;
-            settings.decay_ms = 78.0;
-            settings.sustain_level = 0.50;
-            settings.release_ms = 95.0;
-            settings.input_rise_ms = 10.0;
-            settings.input_fall_ms = 45.0;
-            settings.output_slew_ms = 12.0;
-            settings.min_vibe = 0.03;
-            settings.max_vibe = 0.92;
-            settings.climax_mode_enabled = false;
-        }
-        ChloeRhythmProfile::Medium => {
-            settings.current_preset_name = String::from("Chloe Medium");
+            settings.current_preset_name = String::from("Deep 90");
             settings.main_volume = 1.85;
-            settings.target_frequency = 150.0;
-            settings.gate_threshold = 0.185;
-            settings.threshold_knee = 0.14;
-            settings.dynamic_curve = 1.52;
-            settings.binary_level = 0.74;
-            settings.hybrid_blend = 0.43;
-            settings.attack_ms = 2.6;
-            settings.decay_ms = 58.0;
-            settings.sustain_level = 0.42;
-            settings.release_ms = 78.0;
-            settings.input_rise_ms = 7.0;
-            settings.input_fall_ms = 28.0;
-            settings.output_slew_ms = 8.0;
-            settings.min_vibe = 0.07;
-            settings.max_vibe = 1.0;
-            settings.climax_mode_enabled = true;
-            settings.climax_pattern = ClimaxPattern::Wave;
-            settings.climax_intensity = 0.58;
-            settings.climax_build_up_ms = 75_000.0;
-            settings.climax_tease_ratio = 0.16;
-            settings.climax_tease_drop = 0.18;
-            settings.climax_surge_boost = 0.42;
-            settings.climax_pulse_depth = 0.20;
+            settings.target_frequency = 100.0;
+            settings.gate_threshold = 0.13;
+            settings.binary_level = 0.80;
+            settings.hybrid_blend = 0.55;
+            settings.decay_ms = 520.0;
+            settings.sustain_level = 0.08;
+            settings.release_ms = 330.0;
+            settings.input_fall_ms = 230.0;
+            settings.output_slew_ms = 55.0;
         }
+        // ~125 BPM (beat ≈ 480 ms) — club kick, default boom
+        ChloeRhythmProfile::Medium => {
+            settings.current_preset_name = String::from("Club 125");
+            settings.main_volume = 1.90;
+            settings.target_frequency = 120.0;
+            settings.gate_threshold = 0.14;
+            settings.binary_level = 0.82;
+            settings.hybrid_blend = 0.58;
+            settings.decay_ms = 375.0;
+            settings.sustain_level = 0.08;
+            settings.release_ms = 240.0;
+            settings.input_fall_ms = 160.0;
+            settings.output_slew_ms = 48.0;
+        }
+        // ~140 BPM (beat ≈ 429 ms) — harder hit, still a full musical boom
         ChloeRhythmProfile::Ultimate => {
-            settings.current_preset_name = String::from("Chloe Ultimate");
-            settings.main_volume = 2.10;
-            settings.target_frequency = 125.0;
+            settings.current_preset_name = String::from("Hard 140");
+            settings.main_volume = 2.15;
+            settings.target_frequency = 120.0;
             settings.gate_threshold = 0.16;
-            settings.threshold_knee = 0.14;
-            settings.dynamic_curve = 1.55;
             settings.binary_level = 0.90;
-            settings.hybrid_blend = 0.52;
-            // Faster attack = feel every beat land. Shorter decay = punchy contrast.
-            settings.attack_ms = 1.0;
-            settings.decay_ms = 45.0;
-            // Higher sustain = more body between beats (avoids feeling "empty").
-            settings.sustain_level = 0.48;
-            settings.release_ms = 65.0;
-            // Tighter response chain for maximum music sync:
-            settings.input_rise_ms = 3.5;
-            settings.input_fall_ms = 16.0;
-            settings.output_slew_ms = 3.0;
-            settings.min_vibe = 0.08;
-            settings.max_vibe = 1.0;
-            settings.climax_mode_enabled = true;
-            settings.climax_pattern = ClimaxPattern::Surge;
-            settings.climax_intensity = 0.82;
-            // Longer cycle = more anticipation = more powerful peak.
-            settings.climax_build_up_ms = 60_000.0;
-            // More pronounced tease creates stronger contrast before surge.
-            settings.climax_tease_ratio = 0.18;
-            settings.climax_tease_drop = 0.30;
-            settings.climax_surge_boost = 0.90;
-            // Lower pulse depth — let the music rhythm dominate, not the micro-pulse.
-            settings.climax_pulse_depth = 0.22;
+            settings.hybrid_blend = 0.68;
+            settings.decay_ms = 335.0;
+            settings.sustain_level = 0.06;
+            settings.release_ms = 210.0;
+            settings.input_fall_ms = 140.0;
+            settings.output_slew_ms = 42.0;
+            settings.decay_curve = 1.9;
         }
     }
 }

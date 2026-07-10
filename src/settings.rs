@@ -254,39 +254,44 @@ pub mod defaults {
     use crate::audio::ClimaxPattern;
 
     // Original
-    pub const MAIN_VOLUME: f32 = 1.15;
+    // Bass-drum default: enough headroom for kick energy without soft-clip mush.
+    pub const MAIN_VOLUME: f32 = 1.90;
     pub const LOW_PASS_FREQ: f32 = 20_000.0;
     pub const DARK_MODE: bool = true;
     pub const START_SCANNING_ON_STARTUP: bool = false;
     pub const POLLING_RATE_MS: f32 = 20.0;
     pub const USE_POLLING_RATE: bool = false;
 
-    // Trigger
-    pub const BINARY_LEVEL: f32 = 0.8;
-    pub const HYBRID_BLEND: f32 = 0.5;
-    pub const THRESHOLD_KNEE: f32 = 0.22;
-    pub const DYNAMIC_CURVE: f32 = 1.0;
-    pub const INPUT_RISE_MS: f32 = 36.0;
-    pub const INPUT_FALL_MS: f32 = 150.0;
-    pub const OUTPUT_SLEW_MS: f32 = 85.0;
+    // Trigger — Hybrid: fixed kick thump + a little dynamics
+    pub const BINARY_LEVEL: f32 = 0.82;
+    pub const HYBRID_BLEND: f32 = 0.58;
+    pub const THRESHOLD_KNEE: f32 = 0.15;
+    pub const DYNAMIC_CURVE: f32 = 1.2;
+    pub const INPUT_RISE_MS: f32 = 8.0;
+    pub const INPUT_FALL_MS: f32 = 160.0;
+    // Fall path is 1.0× this value — keep low so the boom can actually land.
+    // Rise is 0.35× (~17 ms), so motor spin-up owns the attack.
+    pub const OUTPUT_SLEW_MS: f32 = 48.0;
     pub const TRIM_MS: f32 = 0.0;
 
-    // Frequency
-    pub const TARGET_FREQUENCY: f32 = 200.0;
+    // Frequency — kick / sub only (Hz)
+    pub const TARGET_FREQUENCY: f32 = 120.0;
 
-    // ADSR - neutral defaults for smooth intensity following
-    pub const ATTACK_MS: f32 = 30.0;
-    pub const DECAY_MS: f32 = 160.0;
-    pub const SUSTAIN_LEVEL: f32 = 0.9;
-    pub const RELEASE_MS: f32 = 320.0;
-    pub const ATTACK_CURVE: f32 = 1.0; // Linear attack
-    pub const DECAY_CURVE: f32 = 1.0; // Linear decay
-    pub const RELEASE_CURVE: f32 = 1.15; // Slightly eased release tail
+    // ADSR — bass-drum recipe at ~125 BPM (beat ≈ 480 ms):
+    // instant peak → one continuous exp decay (~78% of beat) → near-zero floor.
+    // AUTO-LOCK uses the same shape, fitted to the actual tempo.
+    pub const ATTACK_MS: f32 = 20.0;
+    pub const DECAY_MS: f32 = 375.0;
+    pub const SUSTAIN_LEVEL: f32 = 0.08;
+    pub const RELEASE_MS: f32 = 240.0;
+    pub const ATTACK_CURVE: f32 = 0.7;
+    pub const DECAY_CURVE: f32 = 1.8; // fast bloom-down, organic landing
+    pub const RELEASE_CURVE: f32 = 1.3;
 
-    // Gate
-    pub const GATE_THRESHOLD: f32 = 0.07;
+    // Gate — open on kick, ignore hats/room
+    pub const GATE_THRESHOLD: f32 = 0.14;
     pub const AUTO_GATE_AMOUNT: f32 = 0.0;
-    pub const GATE_SMOOTHING: f32 = 0.22;
+    pub const GATE_SMOOTHING: f32 = 0.06;
 
     // Output range
     pub const MIN_VIBE: f32 = 0.0;
@@ -385,7 +390,7 @@ impl Default for Settings {
             device_settings: HashMap::new(),
             save_device_settings: false,
 
-            trigger_mode: TriggerMode::Dynamic,
+            trigger_mode: TriggerMode::Hybrid,
             binary_level: defaults::BINARY_LEVEL,
             hybrid_blend: defaults::HYBRID_BLEND,
             threshold_knee: defaults::THRESHOLD_KNEE,
@@ -395,7 +400,7 @@ impl Default for Settings {
             output_slew_ms: defaults::OUTPUT_SLEW_MS,
             trim_ms: defaults::TRIM_MS,
 
-            frequency_mode: FrequencyMode::Full,
+            frequency_mode: FrequencyMode::LowPass,
             target_frequency: defaults::TARGET_FREQUENCY,
 
             attack_ms: defaults::ATTACK_MS,
@@ -429,7 +434,7 @@ impl Default for Settings {
             decay_rate_per_sec: defaults::DECAY_RATE_PER_SEC,
 
             use_advanced_processing: defaults::USE_ADVANCED_PROCESSING,
-            current_preset_name: String::from("Ride Intensity"),
+            current_preset_name: String::from("Bass Drum"),
         }
     }
 }
@@ -526,7 +531,7 @@ impl Settings {
             .unwrap_or(defaults::USE_ADVANCED_PROCESSING);
 
         let current_preset_name: String = get_value(storage, names::CURRENT_PRESET_NAME)
-            .unwrap_or_else(|| String::from("Ride Intensity"));
+            .unwrap_or_else(|| String::from("Bass Drum"));
 
         Self {
             main_volume,

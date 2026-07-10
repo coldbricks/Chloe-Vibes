@@ -1,14 +1,17 @@
 // ==========================================================================
-// auto_lock.rs -- AUTO-LOCK: supervising estimator-controller (Phase 1)
+// auto_lock.rs -- FIND BOOM (AUTO-LOCK): max-dynamic bass-drum tuner
 //
-// One button that fits the signal chain to the playing material: the most
-// rhythmic drive band, the punchiest trigger shape, and an envelope whose
-// decay fits the tempo. Reads the signals the engine already publishes each
-// frame and writes a WHITELISTED subset of existing Settings fields through
-// a short glide. The engine itself is untouched, so Rust/Kotlin parity is
-// preserved by construction, and the write struct simply lacks every field
-// Auto-Lock must never touch: volume, output gain, output floor/ceiling,
-// gate, climax, trim.
+// One button that listens to the playing material and locks the sweet spot:
+//   kick-punch band, gate that opens on hits / closes in the trough,
+//   Hybrid trigger at near-ceiling punch, and a boom envelope whose decay
+//   spans ~78% of the felt beat into a near-zero floor.
+//
+// Goal: maximum *dynamic* output (contrast), not maximum continuous level.
+// After lock, the user owns the knobs — any manual tweak cancels the lock
+// and keeps the tuned values as the new starting point (or Revert).
+//
+// Whitelist: band/trigger/envelope/slew/gate. NEVER volume, output gain,
+// min/max vibe, climax intensity, or trim (user consent ceiling).
 //
 // Full design + skeptic-verdict rationale: docs/AUTO_LOCK_DESIGN.md
 // ==========================================================================
@@ -46,10 +49,10 @@ const VALID_ENERGY: f32 = 0.002;
 // The write whitelist
 // ---------------------------------------------------------------------------
 
-/// Every Settings field Auto-Lock is allowed to write — and ONLY those.
-/// main_volume, output_gain, min_vibe, max_vibe, gate_*, climax_*, trim_ms
-/// are deliberately absent: the supervisor cannot raise delivered intensity
-/// above what the user configured.
+/// Every Settings field FIND BOOM is allowed to write — and ONLY those.
+/// main_volume, output_gain, min_vibe, max_vibe, climax intensity/cycle,
+/// and trim_ms are deliberately absent: the supervisor cannot raise the
+/// user's consent ceiling, only reshape the boom inside it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LockParams {
     frequency_mode: FrequencyMode,
@@ -69,6 +72,9 @@ pub struct LockParams {
     input_rise_ms: f32,
     input_fall_ms: f32,
     output_slew_ms: f32,
+    /// Kick-open / trough-close threshold (pre-volume energy domain).
+    gate_threshold: f32,
+    gate_smoothing: f32,
 }
 
 impl LockParams {
@@ -91,10 +97,13 @@ impl LockParams {
             input_rise_ms: s.input_rise_ms,
             input_fall_ms: s.input_fall_ms,
             output_slew_ms: s.output_slew_ms,
+            gate_threshold: s.gate_threshold,
+            gate_smoothing: s.gate_smoothing,
         }
     }
 
-    /// Write these values into Settings. Does not touch current_preset_name.
+    /// Write these values into Settings. Forces climax off (boom path).
+    /// Does not touch current_preset_name.
     pub fn apply(&self, s: &mut Settings) {
         s.frequency_mode = self.frequency_mode;
         s.target_frequency = self.target_frequency;
@@ -113,6 +122,10 @@ impl LockParams {
         s.input_rise_ms = self.input_rise_ms;
         s.input_fall_ms = self.input_fall_ms;
         s.output_slew_ms = self.output_slew_ms;
+        s.gate_threshold = self.gate_threshold;
+        s.gate_smoothing = self.gate_smoothing;
+        s.auto_gate_amount = 0.0; // manual threshold we just fitted
+        s.climax_mode_enabled = false;
     }
 
     fn diverged_from(&self, s: &Settings) -> bool {
@@ -134,6 +147,9 @@ impl LockParams {
             || (self.input_rise_ms - s.input_rise_ms).abs() > EPS
             || (self.input_fall_ms - s.input_fall_ms).abs() > EPS
             || (self.output_slew_ms - s.output_slew_ms).abs() > EPS
+            || (self.gate_threshold - s.gate_threshold).abs() > EPS
+            || (self.gate_smoothing - s.gate_smoothing).abs() > EPS
+            || s.climax_mode_enabled
     }
 
     fn lerp(a: &Self, b: &Self, t: f32) -> Self {
@@ -157,8 +173,22 @@ impl LockParams {
             input_rise_ms: l(a.input_rise_ms, b.input_rise_ms),
             input_fall_ms: l(a.input_fall_ms, b.input_fall_ms),
             output_slew_ms: l(a.output_slew_ms, b.output_slew_ms),
+            gate_threshold: l(a.gate_threshold, b.gate_threshold),
+            gate_smoothing: l(a.gate_smoothing, b.gate_smoothing),
         }
     }
+}
+
+/// Human-readable readout of the last successful lock (for the UI).
+#[derive(Clone, Debug)]
+pub struct LockReport {
+    pub score: f32,
+    pub bpm: f32,
+    pub beat_ms: f32,
+    pub band_label: &'static str,
+    pub decay_ms: f32,
+    pub gate_threshold: f32,
+    pub binary_level: f32,
 }
 
 // ---------------------------------------------------------------------------
@@ -205,6 +235,8 @@ pub struct AutoLock {
     /// same stale ring and bounced straight back to NO LOCK — the button
     /// appeared dead.
     listen_from_ms: f32,
+    /// Last successful lock details for the UI readout.
+    pub last_report: Option<LockReport>,
 }
 
 impl AutoLock {
@@ -218,6 +250,7 @@ impl AutoLock {
             glide: None,
             expected: None,
             listen_from_ms: 0.0,
+            last_report: None,
         }
     }
 
@@ -245,11 +278,12 @@ impl AutoLock {
             snap.apply(settings);
             settings.sanitize();
         }
+        self.last_report = None;
         self.cancel();
     }
 
     /// Keep the locked values as the new normal (explicit consent — this is
-    /// the only way a lock outlives the session).
+    /// the only way a lock outlives the session without the snapshot guard).
     pub fn keep(&mut self, _settings: &mut Settings) {
         self.cancel();
     }
@@ -260,6 +294,7 @@ impl AutoLock {
             AutoLockState::Idle | AutoLockState::NoLock { .. } => {
                 // Fresh listen: only audio arriving from now on counts.
                 self.listen_from_ms = now_ms;
+                self.last_report = None;
                 self.state = AutoLockState::Listening { started_ms: now_ms };
             }
             AutoLockState::Listening { .. } => {
@@ -278,15 +313,15 @@ impl AutoLock {
 
     pub fn button_label(&self, now_ms: f32) -> String {
         match self.state {
-            AutoLockState::Idle => "AUTO-LOCK".to_string(),
+            AutoLockState::Idle => "FIND BOOM".to_string(),
             AutoLockState::Listening { started_ms } => {
                 format!(
-                    "LISTENING {:.0}s",
+                    "TUNING {:.0}s…",
                     ((now_ms - started_ms) / 1000.0).max(0.0)
                 )
             }
             AutoLockState::Locked { score } => {
-                format!("LOCKED {:.0}%", (score * 100.0).clamp(0.0, 99.0))
+                format!("BOOM {:.0}%", (score * 100.0).clamp(0.0, 99.0))
             }
             AutoLockState::NoLock { reason } => format!("NO LOCK — {reason}"),
         }
@@ -294,6 +329,20 @@ impl AutoLock {
 
     pub fn is_locked(&self) -> bool {
         matches!(self.state, AutoLockState::Locked { .. })
+    }
+
+    /// One-line summary after a successful lock, e.g.
+    /// "124 BPM · Bass · decay 375ms · gate 0.12".
+    pub fn report_line(&self) -> Option<String> {
+        let r = self.last_report.as_ref()?;
+        Some(format!(
+            "{:.0} BPM · {} · decay {:.0}ms · gate {:.2} · punch {:.0}%",
+            r.bpm,
+            r.band_label,
+            r.decay_ms,
+            r.gate_threshold,
+            (r.binary_level * 100.0).clamp(0.0, 100.0)
+        ))
     }
 
     // -----------------------------------------------------------------------
@@ -336,10 +385,16 @@ impl AutoLock {
                 let valid_ms = self.valid_window_ms();
                 let elapsed = now_ms - started_ms;
                 let ring_full = valid_ms >= RING_WINDOW_MS - 500.0;
-                if ring_full || elapsed >= LISTEN_BUDGET_MS {
+                // Early commit: once we have the minimum valid window and a
+                // rock-solid engine tempo lock, don't make the user wait out
+                // the full 8s ring — the boom shape is already knowable.
+                let early_ok = valid_ms >= LISTEN_MIN_VALID_MS
+                    && elapsed >= LISTEN_MIN_VALID_MS
+                    && engine_tempo_confidence >= 0.70;
+                if ring_full || elapsed >= LISTEN_BUDGET_MS || early_ok {
                     if valid_ms >= LISTEN_MIN_VALID_MS {
                         self.try_commit(now_ms, engine_tempo_confidence, settings);
-                    } else {
+                    } else if elapsed >= LISTEN_BUDGET_MS {
                         self.state = AutoLockState::NoLock {
                             reason: "not enough audio",
                         };
@@ -435,6 +490,13 @@ impl AutoLock {
         let features = match self.estimate(self.listen_from_ms) {
             Ok(f) => f,
             Err(reason) => {
+                // Early-commit probes can fail before enough onsets land;
+                // stay listening unless the budget is exhausted.
+                if let AutoLockState::Listening { started_ms } = self.state {
+                    if now_ms - started_ms < LISTEN_BUDGET_MS {
+                        return;
+                    }
+                }
                 self.state = AutoLockState::NoLock { reason };
                 return;
             }
@@ -449,9 +511,19 @@ impl AutoLock {
         };
         let conf = engine_conf.max(own_conf);
         let margin_norm = ((features.salience_margin - 1.0) / 1.5).clamp(0.0, 1.0);
-        let score = 0.55 * conf + 0.30 * margin_norm + 0.15 * (1.0 - features.silence_ratio);
+        // Crest rewards material with real hit/trough contrast (the boom fuel).
+        let crest_norm = ((features.crest - 1.0) / 5.0).clamp(0.0, 1.0);
+        let score = 0.45 * conf
+            + 0.25 * margin_norm
+            + 0.15 * (1.0 - features.silence_ratio)
+            + 0.15 * crest_norm;
 
         if conf < 0.35 || score < MIN_LOCK_SCORE {
+            if let AutoLockState::Listening { started_ms } = self.state {
+                if now_ms - started_ms < LISTEN_BUDGET_MS {
+                    return; // keep listening; early probe wasn't ready
+                }
+            }
             self.state = AutoLockState::NoLock {
                 reason: "no steady rhythm",
             };
@@ -470,13 +542,30 @@ impl AutoLock {
         // Enums switch immediately; floats glide from current values.
         settings.frequency_mode = target.frequency_mode;
         settings.trigger_mode = target.trigger_mode;
-        settings.current_preset_name = String::new();
+        settings.climax_mode_enabled = false;
+        settings.current_preset_name = String::from("Auto Boom");
         settings.sanitize();
         self.expected = Some(LockParams::capture(settings));
         self.glide = Some(Glide {
             started_ms: now_ms,
             from,
             to: target,
+        });
+
+        let beat_ms = Self::fold_to_perceptual_beat(features.ioi_median);
+        let bpm = if beat_ms > 1.0 {
+            60_000.0 / beat_ms
+        } else {
+            0.0
+        };
+        self.last_report = Some(LockReport {
+            score,
+            bpm,
+            beat_ms,
+            band_label: band_label(features.best_band),
+            decay_ms: target.decay_ms,
+            gate_threshold: target.gate_threshold,
+            binary_level: target.binary_level,
         });
         self.state = AutoLockState::Locked { score };
     }
@@ -635,10 +724,43 @@ impl AutoLock {
         centroids.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let centroid_median = percentile_sorted(&centroids, 0.5);
 
-        // Observed dynamic envelope output cap for binary_level
+        // Observed dynamic envelope output (diagnostic / legacy; punch no
+        // longer seeds from this — it depends on whatever preset was active
+        // during the listen and creates a chicken-and-egg soft lock).
         let mut envs: Vec<f32> = frames.iter().map(|f| f.envelope_output).collect();
         envs.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let envelope_p90 = percentile_sorted(&envs, 0.90);
+
+        // Gate fit: pre-volume energy on hits vs between hits. Threshold sits
+        // just above the trough so kicks open the gate and silence closes it
+        // — the single biggest lever for dynamic contrast.
+        let mut hit_e: Vec<f32> = Vec::new();
+        let mut floor_e: Vec<f32> = Vec::new();
+        for f in &frames {
+            if !f.valid {
+                continue;
+            }
+            let on_hit = onsets
+                .iter()
+                .any(|&o| f.t_ms >= o && f.t_ms - o <= ONSET_ALIGN_MS);
+            if on_hit {
+                hit_e.push(f.pre_volume_energy);
+            } else {
+                floor_e.push(f.pre_volume_energy);
+            }
+        }
+        hit_e.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        floor_e.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let energy_hit = if hit_e.is_empty() {
+            percentile_sorted(&energies, 0.90)
+        } else {
+            percentile_sorted(&hit_e, 0.50)
+        };
+        let energy_floor = if floor_e.is_empty() {
+            percentile_sorted(&energies, 0.20)
+        } else {
+            percentile_sorted(&floor_e, 0.50)
+        };
 
         Ok(Features {
             ioi_median,
@@ -649,6 +771,8 @@ impl AutoLock {
             centroid_median,
             envelope_p90,
             silence_ratio,
+            energy_hit,
+            energy_floor,
         })
     }
 
@@ -671,15 +795,14 @@ impl AutoLock {
         t
     }
 
-    /// Feature -> parameter mapping. All numbers land inside sanitize()
-    /// ranges; intensity-bearing fields are capped by observed output.
+    /// Feature -> parameter mapping. Always produces the bass-drum boom
+    /// shape; crest / band / gate decide *how hard* and *where*, never
+    /// whether we boom. Intensity fields stay under the user's ceiling.
     fn map_features(f: &Features, settings: &Settings) -> LockParams {
         let t = Self::fold_to_perceptual_beat(f.ioi_median);
 
-        // Frequency focus, only with a clear winner. For low-band winners use
-        // the tightest LowPass that covers the winning band: extract_energy
-        // normalizes by band count, so LowPass at the Sub edge is pure
-        // kick energy — the field-proven recipe for a hard beat lock.
+        // Frequency focus. Clear winner → tight band. Ambiguous but punchy /
+        // low-band → still kick-lock (Full smears hats into the boom).
         let (frequency_mode, target_frequency) = if f.salience_margin >= SALIENCE_MARGIN {
             match f.best_band {
                 0 => (FrequencyMode::LowPass, BAND_EDGES[1]), // sub only
@@ -690,58 +813,58 @@ impl AutoLock {
                 ),
                 b => (FrequencyMode::HighPass, BAND_EDGES[b]),
             }
+        } else if f.crest >= 2.0 || f.best_band <= 1 {
+            (FrequencyMode::LowPass, BAND_EDGES[2])
         } else {
             (FrequencyMode::Full, settings.target_frequency)
         };
 
-        // Trigger shape from material punchiness
-        let (trigger_mode, hybrid_blend, dynamic_curve) = if f.crest >= 4.0 {
-            (TriggerMode::Hybrid, 0.75, 1.0)
-        } else if f.crest >= 2.2 {
-            (TriggerMode::Hybrid, 0.55, 1.2)
+        // Trigger: max dynamic delivery. Kick-band or punchy crest → Hybrid
+        // with a strong binary thump. Flat material stays Dynamic on the same
+        // boom envelope.
+        let kick_band = f.best_band <= 1;
+        let (trigger_mode, hybrid_blend, dynamic_curve) = if kick_band || f.crest >= 2.0 {
+            let blend = if f.crest >= 4.0 {
+                0.72
+            } else if f.crest >= 2.5 {
+                0.62
+            } else {
+                0.55
+            };
+            (TriggerMode::Hybrid, blend, 1.15)
+        } else if f.crest >= 1.5 {
+            (TriggerMode::Hybrid, 0.45, 1.35)
         } else {
-            // Compressed material: stay dynamic, expand contrast via curve
-            (TriggerMode::Dynamic, settings.hybrid_blend, 1.6)
+            (TriggerMode::Dynamic, settings.hybrid_blend, 1.7)
         };
 
-        // PUNCH delivery: each hit should land near the top of the USER'S
-        // configured range — max_vibe, output_gain, and device multipliers
-        // still bound everything downstream, so the consent ceiling is
-        // untouched. The observed p90 seeds the level, the 0.55 floor
-        // guarantees the binary component actually thumps, and 0.85 leaves
-        // headroom for the engine's velocity overshoot to ride above it.
-        let binary_level = (f.envelope_p90 * 1.25).max(0.55).clamp(0.0, 0.85);
+        // Punch from MATERIAL crest + kick boost — not live envelope_p90
+        // (that chicken-and-egged soft locks under a pad preset).
+        // Cap 0.88 leaves overshoot headroom; floor 0.70 always thumps.
+        let crest_n = ((f.crest - 1.0) / 5.0).clamp(0.0, 1.0);
+        let band_boost = if kick_band { 0.06 } else { 0.0 };
+        let binary_level = (0.72 + 0.12 * crest_n + band_boost).clamp(0.70, 0.88);
 
-        // THE TARGET WAVEFORM (field brief): punch up instantly, ONE
-        // continuous musical decay down, and the decay LANDS exactly where
-        // the next beat begins — a metronome that goes boooom. Never a flat
-        // dead gap, never a truncated (jolting) cut.
-        //
-        // The decay spans ~78% of the folded beat, so the envelope is back
-        // in Sustain — the engine's only retrigger state — with margin for
-        // musical timing jitter; the low sustain floor IS the landing.
-        // Deliberate side effect: the detector actually fires on the
-        // subdivision grid (eighth notes), and those off-beat onsets arrive
-        // mid-Decay where the engine eats them — so only the felt beat
-        // relaunches the punch.
+        // Bass-drum body: instant peak → ~78% of beat exp decay → near-zero floor.
         let decay_ms = (0.78 * t).clamp(80.0, 1600.0);
-        let sustain_target = 0.08; // landing floor: deep trough, retrigger-ready
+        let sustain_target = 0.08;
         let release_target = (0.50 * t).clamp(80.0, 1200.0);
 
-        // Engine-exact centroid pre-compensation (audio.rs frequency shaping:
-        // sustain *= 1 - 0.25*cn; release *= 1 + 0.4*(1-cn), with the LINEAR
-        // norm cn = clamp((centroid-100)/4000, 0, 1) — not a log scale).
+        // Engine-exact centroid pre-compensation (audio.rs linear cn formula).
         let cn = ((f.centroid_median - 100.0) / 4000.0).clamp(0.0, 1.0);
         let sustain_level = (sustain_target / (1.0 - 0.25 * cn)).clamp(0.0, 1.0);
         let release_ms = (release_target / (1.0 + 0.4 * (1.0 - cn))).clamp(0.5, 5000.0);
 
-        // Input smoothing + output slew scaled to the material. Slew is the
-        // last mush layer between the envelope and the motor — keep it just
-        // high enough to smooth quantization, never high enough to soften
-        // the hit (rising edge is 0.35x this value).
-        let input_rise_ms = if f.crest >= 2.2 { 8.0 } else { 25.0 };
+        // Gate just above the between-hit floor so kicks open and troughs close.
+        let span = (f.energy_hit - f.energy_floor).max(0.0);
+        let mut gate_threshold = f.energy_floor + span * 0.22;
+        let cap = (f.energy_hit * 0.55).max(0.02);
+        gate_threshold = gate_threshold.clamp(0.02, cap).clamp(0.02, 0.45);
+        let gate_smoothing = if f.crest >= 2.5 { 0.04 } else { 0.08 };
+
+        let input_rise_ms = if f.crest >= 2.2 { 8.0 } else { 18.0 };
         let input_fall_ms = (0.35 * t).clamp(80.0, 300.0);
-        let output_slew_ms = (0.10 * t).clamp(30.0, 70.0);
+        let output_slew_ms = (0.10 * t).clamp(30.0, 55.0);
 
         LockParams {
             frequency_mode,
@@ -751,21 +874,18 @@ impl AutoLock {
             hybrid_blend,
             threshold_knee: 0.15,
             dynamic_curve,
-            // Anything < 50ms takes the engine's instant-peak fast path;
-            // 20ms is honest — finer "tuning" here would be a placebo.
             attack_ms: 20.0,
             decay_ms,
             sustain_level,
             release_ms,
             attack_curve: 0.7,
-            // Exponential drum-decay feel: fast initial bloom-down, gentle
-            // landing. Linear (1.0) reads mechanical; this is the "organic"
-            // part of the boom, and the gentle tail is the anti-jolt.
             decay_curve: 1.8,
             release_curve: 1.3,
             input_rise_ms,
             input_fall_ms,
             output_slew_ms,
+            gate_threshold,
+            gate_smoothing,
         }
     }
 }
@@ -779,6 +899,21 @@ struct Features {
     centroid_median: f32,
     envelope_p90: f32,
     silence_ratio: f32,
+    energy_hit: f32,
+    energy_floor: f32,
+}
+
+fn band_label(band: usize) -> &'static str {
+    match band {
+        0 => "Sub",
+        1 => "Bass",
+        2 => "Lo-Mid",
+        3 => "Mid",
+        4 => "Hi-Mid",
+        5 => "Pres",
+        6 => "Brill",
+        _ => "Air",
+    }
 }
 
 /// Percentile of an ascending-sorted, non-empty slice (nearest-rank).
@@ -1084,8 +1219,8 @@ mod tests {
             output_gain: 0.777,
             min_vibe: 0.111,
             max_vibe: 0.888,
-            gate_threshold: 0.099,
             climax_intensity: 0.321,
+            climax_mode_enabled: true,
             ..Default::default()
         };
 
@@ -1117,12 +1252,15 @@ mod tests {
             );
         }
         assert!(al.is_locked());
+        // Consent ceiling: volume / gain / range / climax intensity untouched.
         assert_eq!(probe.main_volume, 1.234);
         assert_eq!(probe.output_gain, 0.777);
         assert_eq!(probe.min_vibe, 0.111);
         assert_eq!(probe.max_vibe, 0.888);
-        assert_eq!(probe.gate_threshold, 0.099);
         assert_eq!(probe.climax_intensity, 0.321);
+        // Boom path forces climax off; gate is fitted (not frozen).
+        assert!(!probe.climax_mode_enabled);
+        assert!(probe.gate_threshold > 0.0);
     }
 
     #[test]
@@ -1276,6 +1414,8 @@ mod tests {
             centroid_median: 100.0, // cn = 0 (dark)
             envelope_p90: 0.5,
             silence_ratio: 0.0,
+            energy_hit: 0.5,
+            energy_floor: 0.05,
         };
         let s = Settings::default();
         let dark = AutoLock::map_features(&f, &s);
@@ -1293,33 +1433,49 @@ mod tests {
 
     #[test]
     fn binary_level_punch_policy() {
-        // Quiet material is floored at 0.55 so hits still thump; loud
-        // material seeds from the observed p90 but is hard-capped at 0.85
-        // (headroom for velocity overshoot). The user's max/gain/multiplier
-        // ceiling binds downstream in both cases.
+        // Punch comes from crest + kick-band, not envelope_p90. Floor 0.70,
+        // cap 0.88 (overshoot headroom). User max/gain/multiplier still bind.
         let mut f = Features {
             ioi_median: 400.0,
             ioi_iqr: 15.0,
-            best_band: 1,
+            best_band: 1, // kick band
             salience_margin: 2.0,
-            crest: 5.0, // punchy -> Hybrid uses binary_level
+            crest: 1.5, // mild
             centroid_median: 1000.0,
-            envelope_p90: 0.3, // quiet material
+            envelope_p90: 0.1, // irrelevant now
             silence_ratio: 0.0,
+            energy_hit: 0.4,
+            energy_floor: 0.05,
         };
         let s = Settings::default();
-        let quiet = AutoLock::map_features(&f, &s);
-        assert_eq!(quiet.trigger_mode, TriggerMode::Hybrid);
-        assert!((quiet.binary_level - 0.55).abs() < 1e-6);
+        let mild = AutoLock::map_features(&f, &s);
+        assert_eq!(mild.trigger_mode, TriggerMode::Hybrid);
+        assert!(
+            mild.binary_level >= 0.70 && mild.binary_level <= 0.88,
+            "binary {}",
+            mild.binary_level
+        );
 
-        f.envelope_p90 = 0.8; // loud material: 0.8 * 1.25 = 1.0 -> cap 0.85
+        f.crest = 6.0; // very punchy → near cap
         let loud = AutoLock::map_features(&f, &s);
-        assert!((loud.binary_level - 0.85).abs() < 1e-6);
+        assert!(
+            (loud.binary_level - 0.88).abs() < 1e-3,
+            "binary {}",
+            loud.binary_level
+        );
+        // Gate sits between floor and hit
+        assert!(loud.gate_threshold > f.energy_floor);
+        assert!(loud.gate_threshold < f.energy_hit);
+        // Always boom body
+        assert!(loud.sustain_level < 0.2);
+        assert!(loud.attack_ms < 50.0);
+        assert!((loud.decay_curve - 1.8).abs() < 1e-3);
     }
 
     #[test]
-    fn weak_salience_margin_stays_full_spectrum() {
-        // Two bands pulse together -> no clear winner -> Full
+    fn weak_salience_with_kick_still_boom_locks() {
+        // Bass + presence pulse together → no clear winner, but kick energy
+        // + crest still LowPass (Full would smear hats into the boom).
         let mut al = AutoLock::new();
         let mut settings = Settings::default();
         al.on_button(0.0);
@@ -1349,6 +1505,9 @@ mod tests {
             );
         }
         assert!(al.is_locked(), "state = {:?}", al.state);
-        assert_eq!(settings.frequency_mode, FrequencyMode::Full);
+        assert_eq!(settings.frequency_mode, FrequencyMode::LowPass);
+        // Boom body always
+        assert!(settings.sustain_level < 0.2);
+        assert!(settings.decay_ms > 200.0);
     }
 }

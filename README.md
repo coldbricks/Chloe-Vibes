@@ -215,16 +215,17 @@ A preset is a complete snapshot of every signal parameter. Presets are organized
 
 | Client | Factory presets | Climax-enabled |
 |---|---|---|
-| Windows (desktop) | 29 | 3 (Slow Tease, Ride the Beat, Break Me) |
-| Android | 32 | 5 (the above, plus Chloe Medium, Chloe Ultimate) |
+| Windows (desktop) | 30 | 3 (Slow Tease, Ride the Beat, Break Me) |
+| Android | 33 | 3 (same three; Chloe macros are climax-off boom variants) |
 
-Desktop category counts: INIT 2, DRUMS 5, MUSICAL 6, BASS 6, FX 10. The Android catalog contains the same 29 presets plus the three Chloe rhythm-profile presets (Loose, Medium, Ultimate) as BASS-category entries. On the desktop client the same three Chloe profiles are applied through one-click rhythm-profile controls rather than catalog entries; this accounts for the entire difference between the 29-entry and 32-entry catalogs.
+Desktop category counts: INIT 3, DRUMS 5, MUSICAL 6, BASS 6, FX 10. The Android catalog adds the three Chloe tempo macros (Deep 90 / Club 125 / Hard 140) as BASS-category entries. Desktop exposes the same macros as one-click **BOOM** buttons.
 
 Selected presets:
 
 | Preset | Category | Description |
 |---|---|---|
-| Ride Intensity | INIT | Neutral loudness follower. Default on launch. |
+| **Bass Drum** | INIT | **Default.** Kick-only natural BOOM — instant peak, ~375 ms exp decay (125 BPM), near-zero floor. |
+| Ride Intensity | INIT | Pad / continuous loudness follower (not the boom path). |
 | Hi-Hat Tingle | FX | High-pass, treble-reactive. Present on both clients. |
 | Slow Tease | Experience | 120 s edging cycle, Wave pattern. |
 | Ride the Beat | Experience | 60 s music-locked escalation, Surge pattern. |

@@ -100,34 +100,34 @@ import kotlin.math.pow
 
 class MainScreenState {
     // Preset
-    var selectedPresetName by mutableStateOf("Ride Intensity")
+    var selectedPresetName by mutableStateOf("Bass Drum")
     var selectedCategory by mutableStateOf(PresetCategory.Init)
 
-    // Input
-    var mainVolume by mutableFloatStateOf(1.15f)
-    var frequencyMode by mutableStateOf(FrequencyMode.Full)
-    var targetFrequency by mutableFloatStateOf(200f)
+    // Input — bass-drum boom defaults
+    var mainVolume by mutableFloatStateOf(1.90f)
+    var frequencyMode by mutableStateOf(FrequencyMode.LowPass)
+    var targetFrequency by mutableFloatStateOf(120f)
 
     // Gate
-    var gateThreshold by mutableFloatStateOf(0.07f)
+    var gateThreshold by mutableFloatStateOf(0.14f)
     var autoGateAmount by mutableFloatStateOf(0f)
-    var gateSmoothing by mutableFloatStateOf(0.22f)
-    var thresholdKnee by mutableFloatStateOf(0.22f)
+    var gateSmoothing by mutableFloatStateOf(0.06f)
+    var thresholdKnee by mutableFloatStateOf(0.15f)
 
     // Trigger
-    var triggerMode by mutableStateOf(TriggerMode.Dynamic)
-    var binaryLevel by mutableFloatStateOf(0.8f)
-    var hybridBlend by mutableFloatStateOf(0.5f)
-    var dynamicCurve by mutableFloatStateOf(1f)
+    var triggerMode by mutableStateOf(TriggerMode.Hybrid)
+    var binaryLevel by mutableFloatStateOf(0.82f)
+    var hybridBlend by mutableFloatStateOf(0.58f)
+    var dynamicCurve by mutableFloatStateOf(1.2f)
 
-    // ADSR
-    var attackMs by mutableFloatStateOf(30f)
-    var decayMs by mutableFloatStateOf(160f)
-    var sustainLevel by mutableFloatStateOf(0.9f)
-    var releaseMs by mutableFloatStateOf(320f)
-    var attackCurve by mutableFloatStateOf(1f)
-    var decayCurve by mutableFloatStateOf(1f)
-    var releaseCurve by mutableFloatStateOf(1.15f)
+    // ADSR — instant peak → long exp decay → near-zero floor (~125 BPM)
+    var attackMs by mutableFloatStateOf(20f)
+    var decayMs by mutableFloatStateOf(375f)
+    var sustainLevel by mutableFloatStateOf(0.08f)
+    var releaseMs by mutableFloatStateOf(240f)
+    var attackCurve by mutableFloatStateOf(0.7f)
+    var decayCurve by mutableFloatStateOf(1.8f)
+    var releaseCurve by mutableFloatStateOf(1.3f)
 
     // Output
     var minVibe by mutableFloatStateOf(0f)

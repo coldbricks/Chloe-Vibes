@@ -105,7 +105,7 @@ class MainActivity : ComponentActivity() {
         }
 
         // Apply default preset
-        val defaultPreset = findPreset("Ride Intensity")
+        val defaultPreset = findPreset("Bass Drum")
         if (defaultPreset != null) {
             uiState.applyPreset(defaultPreset)
             audioCaptureManager.applyPreset(defaultPreset)
