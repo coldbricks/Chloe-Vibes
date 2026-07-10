@@ -9,6 +9,14 @@
 </p>
 
 <p align="center">
+  <sub>
+    <b>Sister app:</b>
+    <a href="https://github.com/coldbricks/ChloeVR"><b>ChloeVR</b></a>
+    — native XR cinema + 6DOF dancer stage (embeds this engine’s beat DNA)
+  </sub>
+</p>
+
+<p align="center">
   <img src="https://img.shields.io/badge/Windows-Rust_·_egui-2A3890?style=for-the-badge&logo=windows&logoColor=2A3890&labelColor=A0A1A5" alt="Windows, Rust + egui" />
   <img src="https://img.shields.io/badge/Android-Kotlin_·_Compose-2A3890?style=for-the-badge&logo=android&logoColor=2A3890&labelColor=A0A1A5" alt="Android, Kotlin + Compose" />
   <img src="https://img.shields.io/badge/Lovense-BLE-2A3890?style=for-the-badge&labelColor=A0A1A5" alt="Lovense BLE" />
