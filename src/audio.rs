@@ -564,6 +564,32 @@ impl EnvelopeProcessor {
         }
     }
 
+    /// Sustain at or below this is treated as a pluck/boom floor: after Decay
+    /// the envelope releases to rest instead of holding a continuous hum.
+    /// Residual audio often keeps the gate open between kicks; organ-style
+    /// Sustain would glue the motor on forever. ~0.15 is above flagship boom
+    /// floors (0.06–0.08) and well below pad/ride sustain (0.5–0.9).
+    const PLUCK_SUSTAIN: f32 = 0.15;
+
+    /// After Decay completes: either hold Sustain (organ/pad) or fall through
+    /// Release to true rest (pluck/boom).
+    fn enter_post_decay(&mut self, sustain_level: f32, current_time_ms: f32) {
+        self.value = sustain_level;
+        if sustain_level <= Self::PLUCK_SUSTAIN {
+            if sustain_level <= 0.001 {
+                self.value = 0.0;
+                self.state = EnvelopeState::Idle;
+                self.magnitude = 0.0;
+            } else {
+                self.state = EnvelopeState::Release;
+                self.start_time_ms = current_time_ms;
+                self.phase_start_value = sustain_level;
+            }
+        } else {
+            self.state = EnvelopeState::Sustain;
+        }
+    }
+
     /// Trigger the envelope (gate just opened or strong onset detected).
     pub fn trigger(&mut self, magnitude: f32, current_time_ms: f32, velocity: f32, attack_ms: f32) {
         // Enforce minimum retrigger interval
@@ -669,8 +695,7 @@ impl EnvelopeProcessor {
             }
             EnvelopeState::Decay => {
                 if decay_ms <= 0.5 {
-                    self.value = sustain_level;
-                    self.state = EnvelopeState::Sustain;
+                    self.enter_post_decay(sustain_level, current_time_ms);
                 } else {
                     let progress = (elapsed / decay_ms).clamp(0.0, 1.0);
                     let decay_factor = apply_curve(1.0 - progress, decay_curve);
@@ -678,8 +703,7 @@ impl EnvelopeProcessor {
                         sustain_level + (self.phase_start_value - sustain_level) * decay_factor;
 
                     if progress >= 1.0 {
-                        self.value = sustain_level;
-                        self.state = EnvelopeState::Sustain;
+                        self.enter_post_decay(sustain_level, current_time_ms);
                     }
                 }
             }
@@ -823,10 +847,22 @@ impl EnvelopeProcessor {
         let gate_just_opened = gate_open && !self.last_gate_open;
         let gate_just_closed = !gate_open && self.last_gate_open;
 
-        // Onset retrigger: retrigger on onsets above a moderate threshold.
-        // 1.05x catches most real beats; the retrigger cooldown (35ms) prevents flutter.
+        // Onset retrigger: fire on real beats in any post-attack state (and
+        // Idle). Pluck envelopes leave Sustain quickly and rest in Idle while
+        // residual energy still holds the gate open — without Idle/Release
+        // onset arming, later kicks would be dropped until the gate chattered.
+        // Retrigger cooldown (min_retrigger_ms) prevents flutter.
         let is_onset_trigger =
-            is_onset && onset_strength > 1.05 && gate_open && self.state == EnvelopeState::Sustain;
+            is_onset && onset_strength > 1.05 && gate_open && self.state != EnvelopeState::Attack;
+
+        // Continuous (pad/organ) re-arm: only Dynamic, or Hybrid that is mostly
+        // dynamic, AND only when sustain is organ-like. Percussive / boom paths
+        // must NOT re-arm just because the gate is still open — that was the
+        // Domi "once it starts it never returns to 0" bug (Idle→trigger loop
+        // on residual bass energy).
+        let continuous_hold = sustain_level > Self::PLUCK_SUSTAIN
+            && (matches!(trigger_mode, TriggerMode::Dynamic)
+                || (matches!(trigger_mode, TriggerMode::Hybrid) && hybrid_blend < 0.45));
 
         // Trigger logic
         if gate_just_opened || is_onset_trigger {
@@ -836,9 +872,14 @@ impl EnvelopeProcessor {
                 1.0
             };
             self.trigger(magnitude.max(0.03), current_time_ms, velocity, attack_ms);
-        } else if gate_open && self.state == EnvelopeState::Idle {
-            // Gate open but envelope idle — retrigger
-            self.trigger(magnitude.max(0.03), current_time_ms, 1.0, attack_ms);
+        } else if gate_open
+            && self.state == EnvelopeState::Idle
+            && continuous_hold
+            && magnitude > 0.05
+        {
+            // Pad/organ: re-enter while the gate is held. Require real magnitude
+            // so noise-floor energy cannot force a 3% hum.
+            self.trigger(magnitude, current_time_ms, 1.0, attack_ms);
         } else if gate_just_closed {
             self.release(current_time_ms);
         }
@@ -1560,6 +1601,91 @@ mod tests {
         // Short attack (< 50ms) should skip directly to Decay
         env.trigger(1.0, 100.0, 0.0, 30.0);
         assert_eq!(env.state, EnvelopeState::Decay);
+    }
+
+    #[test]
+    fn envelope_pluck_sustain_releases_instead_of_holding() {
+        let mut env = EnvelopeProcessor::new();
+        // Boom floor (0.08): after decay, must fall through release — not hum.
+        // t=100 avoids the min-retrigger guard (last_trigger starts at 0).
+        env.trigger(1.0, 100.0, 1.0, 20.0);
+        assert_eq!(env.state, EnvelopeState::Decay);
+        let _ = env.process(400.0, 20.0, 200.0, 0.08, 150.0, 1.0, 1.0, 1.0);
+        assert_eq!(
+            env.state,
+            EnvelopeState::Release,
+            "low sustain should auto-release (pluck/boom), not hold Sustain"
+        );
+    }
+
+    #[test]
+    fn envelope_organ_sustain_holds() {
+        let mut env = EnvelopeProcessor::new();
+        env.trigger(1.0, 100.0, 1.0, 20.0);
+        let _ = env.process(400.0, 20.0, 200.0, 0.7, 150.0, 1.0, 1.0, 1.0);
+        assert_eq!(
+            env.state,
+            EnvelopeState::Sustain,
+            "high sustain should hold while gate is open"
+        );
+    }
+
+    #[test]
+    fn envelope_binary_does_not_idle_rearm_on_residual_gate() {
+        let mut env = EnvelopeProcessor::new();
+        // Fire once, let pluck envelope finish while gate stays open.
+        let _ = env.drive(
+            true,
+            0.5,
+            true,
+            1.2,
+            0.0,
+            TriggerMode::Binary,
+            0.1,
+            0.1,
+            1.0,
+            0.8,
+            0.5,
+            20.0,
+            100.0,
+            0.08,
+            80.0,
+            1.0,
+            1.0,
+            1.0,
+            200.0,
+        );
+        // Advance well past decay+release with gate still open, no new onset.
+        for i in 1..40 {
+            let t = i as f32 * 20.0;
+            let _ = env.drive(
+                true,
+                0.3, // residual energy, gate held
+                false,
+                0.0,
+                t,
+                TriggerMode::Binary,
+                0.1,
+                0.1,
+                1.0,
+                0.8,
+                0.5,
+                20.0,
+                100.0,
+                0.08,
+                80.0,
+                1.0,
+                1.0,
+                1.0,
+                200.0,
+            );
+        }
+        assert_eq!(
+            env.state,
+            EnvelopeState::Idle,
+            "residual gate-open must not re-arm a pluck envelope (Domi hang fix)"
+        );
+        assert!(env.value < 0.001, "motor path value must rest at zero");
     }
 
     // --- BeatDetector ---

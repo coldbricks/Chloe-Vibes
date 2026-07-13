@@ -79,13 +79,93 @@ enum ConnectionState {
 }
 
 // ---------------------------------------------------------------------------
-// Device structs (unchanged from original)
+// Device structs
 // ---------------------------------------------------------------------------
 
 struct Device {
     name: String,
     props: Arc<Mutex<DeviceProps>>,
     task: tokio::task::JoinHandle<()>,
+}
+
+/// Toy class for motor feel. Linear 0–1 commands do not map to equal body
+/// sensation: ERM wands (Domi) crush soft dynamics and hang above rest;
+/// compact insertables feel weaker and need a slightly higher rest floor.
+/// Goal: music on genitals — punch on hits, true quiet between them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MotorKind {
+    /// Domi / wand-style big ERM
+    Wand,
+    /// Lush / Ferri / Gush / Hush-style compact
+    Compact,
+    /// Edge / Nora / dual-focus insertables
+    DualBody,
+    Generic,
+}
+
+impl MotorKind {
+    fn from_device_name(name: &str) -> Self {
+        let n = name.to_ascii_lowercase();
+        if n.contains("domi")
+            || n.contains("wand")
+            || n.contains("magic wand")
+            || n.contains("hyphy")
+        {
+            Self::Wand
+        } else if n.contains("edge")
+            || n.contains("nora")
+            || n.contains("dolce")
+            || n.contains("gemini")
+            || n.contains("osci")
+        {
+            Self::DualBody
+        } else if n.contains("lush")
+            || n.contains("ferri")
+            || n.contains("gush")
+            || n.contains("hush")
+            || n.contains("ambi")
+            || n.contains("diamo")
+            || n.contains("exomoon")
+            || n.contains("calor")
+            || n.contains("flexer")
+            || n.contains("max ")
+            || n.contains("max2")
+        {
+            Self::Compact
+        } else {
+            Self::Generic
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Wand => "wand feel",
+            Self::Compact => "compact feel",
+            Self::DualBody => "dual-body feel",
+            Self::Generic => "generic feel",
+        }
+    }
+
+    /// Below this shaped input the motor is commanded fully off.
+    fn rest_floor(self) -> f32 {
+        match self {
+            Self::Wand => 0.018,
+            Self::Compact => 0.028,
+            Self::DualBody => 0.022,
+            Self::Generic => 0.02,
+        }
+    }
+
+    /// Power curve after rest remap. >1 keeps quiet quieter so Domi 0–20
+    /// steps don't turn musical softs into a permanent hum.
+    fn feel_gamma(self) -> f32 {
+        match self {
+            Self::Wand => 1.55,
+            Self::Compact => 1.35,
+            Self::DualBody => 1.45,
+            Self::Generic => 1.4,
+        }
+    }
 }
 
 /// Values-only snapshot of a dropped device's tuning, restored on reconnect
@@ -124,6 +204,7 @@ struct DeviceProps {
     max: f32,
     vibrators: Vec<VibratorProps>,
     oscillators: Vec<OscillatorProps>,
+    motor_kind: MotorKind,
 }
 
 struct BatteryState {
@@ -235,6 +316,7 @@ impl DeviceProps {
                     .collect();
                 (false, 1.0, 0.0, 1.0, vibrators, oscillators)
             };
+        let motor_kind = MotorKind::from_device_name(device.name());
         Self {
             is_enabled: false,
             battery_state: BatteryState::new(runtime, device),
@@ -243,18 +325,37 @@ impl DeviceProps {
             max,
             vibrators,
             oscillators,
+            motor_kind,
         }
     }
 }
 
 impl DeviceProps {
+    /// Shape pipeline level → device command for this motor class.
+    fn shape_for_motor(&self, input: f32) -> f32 {
+        let x = input.clamp(0.0, 1.0);
+        let rest = self.motor_kind.rest_floor();
+        if x <= rest {
+            return 0.0;
+        }
+        // Stretch rest..1 → 0..1 so soft musical content can still sit under
+        // the rest floor and truly stop the motor.
+        let n = ((x - rest) / (1.0 - rest).max(1e-6)).clamp(0.0, 1.0);
+        n.powf(self.motor_kind.feel_gamma())
+    }
+
     fn calculate_visual_output(&self, input: f32) -> (f32, bool) {
-        let power = (input * self.multiplier).clamp(0.0, self.max);
-        (power, power < self.min)
+        let shaped = self.shape_for_motor(input);
+        let power = (shaped * self.multiplier).clamp(0.0, self.max);
+        (power, power < self.min && power > 0.0)
     }
 
     fn calculate_output(&self, input: f32) -> f32 {
-        (input * self.multiplier)
+        let shaped = self.shape_for_motor(input);
+        if shaped <= 0.0 {
+            return 0.0;
+        }
+        (shaped * self.multiplier)
             .clamp(0.0, self.max)
             .min_cutoff(self.min)
     }
@@ -1495,6 +1596,12 @@ impl eframe::App for GuiApp {
                 };
                 self.vibration_level +=
                     (trimmed_intensity - self.vibration_level) * output_alpha;
+                // Hard snap to rest when the target is silence. Exponential
+                // slew never quite reaches 0; Domi 0-20 quantization + residual
+                // error left a permanent level-1 hum after the first hit.
+                if trimmed_intensity <= 0.001 && self.vibration_level < 0.03 {
+                    self.vibration_level = 0.0;
+                }
                 self.vibration_level = self.vibration_level.clamp(0.0, 1.0);
 
                 // Debug diagnostic: one pipeline snapshot per ~second, for
@@ -1641,6 +1748,9 @@ impl eframe::App for GuiApp {
                 smoothing_alpha(delta_time, m2_down_ms)
             };
             self.motor2_level += (motor2_target - self.motor2_level) * motor2_alpha;
+            if motor2_target <= 0.001 && self.motor2_level < 0.03 {
+                self.motor2_level = 0.0;
+            }
             self.motor2_level = self.motor2_level.clamp(0.0, 1.0);
             self.processed_output_2.store(self.motor2_level);
 
@@ -2055,19 +2165,31 @@ impl eframe::App for GuiApp {
 
                 ui.horizontal(|ui| {
                     section_label(ui, "INPUT", palette::TEXT_DIM);
-                    let mut vol_pct = self.settings.main_volume * 100.0;
+                    // Cubic taper: linear 0–500% crammed useful volume into a
+                    // tiny left edge (tiny mouse moves = huge feel jumps).
+                    let vol_max = 5.0_f32;
+                    let mut vol_t = (self.settings.main_volume / vol_max)
+                        .clamp(0.0, 1.0)
+                        .powf(1.0 / 3.0);
                     let slider = ui.add(
-                        Slider::new(&mut vol_pct, 0.0..=500.0)
-                            .suffix("%")
-                            .text("Volume"),
+                        Slider::new(&mut vol_t, 0.0..=1.0).text("Volume"),
                     );
                     if slider.changed() {
-                        self.settings.main_volume = vol_pct / 100.0;
+                        self.settings.main_volume = vol_t.powi(3) * vol_max;
                         mark_custom(&mut self.settings);
                     }
                     if slider.double_clicked() {
                         self.settings.main_volume = defaults::MAIN_VOLUME;
                     }
+                    ui.label(
+                        RichText::new(format!(
+                            "{:.0}%",
+                            self.settings.main_volume * 100.0
+                        ))
+                        .size(10.0)
+                        .color(palette::TEXT_DIM)
+                        .monospace(),
+                    );
                 });
 
                 ui.horizontal(|ui| {
@@ -2157,42 +2279,11 @@ impl eframe::App for GuiApp {
                     }
                 });
 
+                // Input Rise/Fall UI removed: those knobs only fed the meter /
+                // motor2 silence check, not the motor path (placebo). Frozen
+                // defaults still smooth the energy meter internally.
                 ui.horizontal(|ui| {
-                    section_label(ui, "RESP", palette::TEXT_DIM);
-
-                    let rise = ui.add(
-                        Slider::new(&mut self.settings.input_rise_ms, 1.0..=160.0)
-                            .logarithmic(true)
-                            .suffix("ms")
-                            .text("Rise"),
-                    );
-                    let rise = rise.on_hover_text(
-                        "Detector rise speed (pre-gate).\n\
-                         Lower = tighter detection. Higher = smoother gate opening.",
-                    );
-                    if rise.changed() {
-                        mark_custom(&mut self.settings);
-                    }
-                    if rise.double_clicked() {
-                        self.settings.input_rise_ms = defaults::INPUT_RISE_MS;
-                    }
-
-                    let fall = ui.add(
-                        Slider::new(&mut self.settings.input_fall_ms, 1.0..=300.0)
-                            .logarithmic(true)
-                            .suffix("ms")
-                            .text("Fall"),
-                    );
-                    let fall = fall.on_hover_text(
-                        "Detector fall speed (pre-gate).\n\
-                         Lower = less trailing gate hold. Higher = smoother hold.",
-                    );
-                    if fall.changed() {
-                        mark_custom(&mut self.settings);
-                    }
-                    if fall.double_clicked() {
-                        self.settings.input_fall_ms = defaults::INPUT_FALL_MS;
-                    }
+                    section_label(ui, "TIMING", palette::TEXT_DIM);
 
                     let slew = ui.add(
                         Slider::new(&mut self.settings.output_slew_ms, 1.0..=220.0)
@@ -2201,8 +2292,8 @@ impl eframe::App for GuiApp {
                             .text("Slew"),
                     );
                     let slew = slew.on_hover_text(
-                        "Post-envelope output slew.\n\
-                         Lower = snappier; higher = smoother fall transitions.",
+                        "How soft the motor ramps between levels.\n\
+                         Lower = snappier hits. Higher = smoother falls.",
                     );
                     if slew.changed() {
                         mark_custom(&mut self.settings);
@@ -2217,7 +2308,7 @@ impl eframe::App for GuiApp {
                             .text("Trim"),
                     );
                     let trim = trim.on_hover_text(
-                        "Lead/lag haptics vs audio. Positive = delay. Negative = advance (limited).",
+                        "Lead/lag vs audio. +delay / −advance.",
                     );
                     if trim.changed() {
                         mark_custom(&mut self.settings);
@@ -2225,7 +2316,6 @@ impl eframe::App for GuiApp {
                     if trim.double_clicked() {
                         self.settings.trim_ms = defaults::TRIM_MS;
                     }
-
                 });
 
                 ui.add_space(2.0);
@@ -2265,8 +2355,7 @@ impl eframe::App for GuiApp {
                     );
                     let slider = slider.on_hover_text(
                         "How loud audio must be to trigger vibration.\n\
-                         The dashed line on the Energy Gate shows this level.\n\
-                         Higher = only loud sounds. Lower = reacts to quiet sounds too.",
+                         Dashed line on Energy Gate. Higher = only loud hits.",
                     );
                     if slider.changed() {
                         mark_custom(&mut self.settings);
@@ -2274,25 +2363,6 @@ impl eframe::App for GuiApp {
                     if slider.double_clicked() {
                         self.settings.gate_threshold =
                             defaults::GATE_THRESHOLD;
-                    }
-
-                    let knee_slider = ui.add(
-                        Slider::new(
-                            &mut self.settings.threshold_knee,
-                            0.0..=0.35,
-                        )
-                        .fixed_decimals(2)
-                        .text("Knee"),
-                    );
-                    let knee_slider = knee_slider.on_hover_text(
-                        "Softens the threshold edge.\n\
-                         Higher = smoother transition and less all-or-nothing behavior.",
-                    );
-                    if knee_slider.changed() {
-                        mark_custom(&mut self.settings);
-                    }
-                    if knee_slider.double_clicked() {
-                        self.settings.threshold_knee = defaults::THRESHOLD_KNEE;
                     }
                 });
 
@@ -2419,9 +2489,10 @@ impl eframe::App for GuiApp {
                 // displayed prominently with clear single-letter labels
                 // matching the visual preview above.
 
+                // Two rows so each log slider has room — single-row A/D/S/R
+                // was unusable (1px ≈ huge ms jumps).
                 ui.horizontal(|ui| {
                     section_label(ui, "ENVELOPE", palette::ACCENT_TEAL);
-
                     ui.label(
                         RichText::new("A")
                             .size(11.0)
@@ -2430,17 +2501,10 @@ impl eframe::App for GuiApp {
                             .monospace(),
                     );
                     let slider = ui.add(
-                        Slider::new(
-                            &mut self.settings.attack_ms,
-                            0.0..=500.0,
-                        )
-                        .logarithmic(true)
-                        .suffix("ms"),
-                    );
-                    let slider = slider.on_hover_text(
-                        "ATTACK — How fast vibration ramps up.\n\
-                         0 = instant hit (drum-like).\n\
-                         High = slow fade-in (pad-like).",
+                        Slider::new(&mut self.settings.attack_ms, 0.5..=500.0)
+                            .logarithmic(true)
+                            .suffix("ms")
+                            .text("Attack"),
                     );
                     if slider.changed() {
                         mark_custom(&mut self.settings);
@@ -2457,17 +2521,13 @@ impl eframe::App for GuiApp {
                             .monospace(),
                     );
                     let slider = ui.add(
-                        Slider::new(
-                            &mut self.settings.decay_ms,
-                            0.0..=1000.0,
-                        )
-                        .logarithmic(true)
-                        .suffix("ms"),
+                        Slider::new(&mut self.settings.decay_ms, 1.0..=1000.0)
+                            .logarithmic(true)
+                            .suffix("ms")
+                            .text("Decay"),
                     );
                     let slider = slider.on_hover_text(
-                        "DECAY — How fast it drops from peak to sustain.\n\
-                         Short = punchy, percussive.\n\
-                         Long = gradual, natural.",
+                        "Drop from peak toward rest/sustain. Long = musical boom body.",
                     );
                     if slider.changed() {
                         mark_custom(&mut self.settings);
@@ -2475,7 +2535,9 @@ impl eframe::App for GuiApp {
                     if slider.double_clicked() {
                         self.settings.decay_ms = defaults::DECAY_MS;
                     }
-
+                });
+                ui.horizontal(|ui| {
+                    section_label(ui, "       ", palette::TEXT_DIM);
                     ui.label(
                         RichText::new("S")
                             .size(11.0)
@@ -2484,16 +2546,13 @@ impl eframe::App for GuiApp {
                             .monospace(),
                     );
                     let slider = ui.add(
-                        Slider::new(
-                            &mut self.settings.sustain_level,
-                            0.0..=1.0,
-                        )
-                        .fixed_decimals(2),
+                        Slider::new(&mut self.settings.sustain_level, 0.0..=1.0)
+                            .fixed_decimals(2)
+                            .text("Sustain"),
                     );
                     let slider = slider.on_hover_text(
-                        "SUSTAIN — Level held while audio stays above gate.\n\
-                         0 = pluck/stab (no sustain).\n\
-                         1.0 = organ/pad (full sustain).",
+                        "≤0.15 = boom/pluck (falls to silence between hits).\n\
+                         Higher = pad/organ hold while audio stays open.",
                     );
                     if slider.changed() {
                         mark_custom(&mut self.settings);
@@ -2510,17 +2569,10 @@ impl eframe::App for GuiApp {
                             .monospace(),
                     );
                     let slider = ui.add(
-                        Slider::new(
-                            &mut self.settings.release_ms,
-                            0.0..=2000.0,
-                        )
-                        .logarithmic(true)
-                        .suffix("ms"),
-                    );
-                    let slider = slider.on_hover_text(
-                        "RELEASE — How fast vibration fades after audio stops.\n\
-                         Short = stops instantly.\n\
-                         Long = lingering fade-out (reverb-like).",
+                        Slider::new(&mut self.settings.release_ms, 1.0..=2000.0)
+                            .logarithmic(true)
+                            .suffix("ms")
+                            .text("Release"),
                     );
                     if slider.changed() {
                         mark_custom(&mut self.settings);
@@ -2530,38 +2582,29 @@ impl eframe::App for GuiApp {
                     }
                 });
 
-                // --- Envelope Curves (collapsible — power users only) ---
-                ui.collapsing("Envelope Curves (advanced)", |ui| {
+                ui.collapsing("Advanced curves", |ui| {
                     ui.horizontal(|ui| {
                         let s1 = ui.add(
-                            Slider::new(
-                                &mut self.settings.attack_curve,
-                                0.1..=4.0,
-                            )
-                            .fixed_decimals(1)
-                            .text("A curve"),
+                            Slider::new(&mut self.settings.attack_curve, 0.1..=4.0)
+                                .fixed_decimals(1)
+                                .text("A"),
                         );
-                        let s1 = s1.on_hover_text("< 1 = logarithmic (fast start).\n> 1 = exponential (slow start).\n1 = linear.");
-
                         let s2 = ui.add(
-                            Slider::new(
-                                &mut self.settings.decay_curve,
-                                0.1..=4.0,
-                            )
-                            .fixed_decimals(1)
-                            .text("D curve"),
+                            Slider::new(&mut self.settings.decay_curve, 0.1..=4.0)
+                                .fixed_decimals(1)
+                                .text("D"),
                         );
-
                         let s3 = ui.add(
-                            Slider::new(
-                                &mut self.settings.release_curve,
-                                0.1..=4.0,
-                            )
-                            .fixed_decimals(1)
-                            .text("R curve"),
+                            Slider::new(&mut self.settings.release_curve, 0.1..=4.0)
+                                .fixed_decimals(1)
+                                .text("R"),
                         );
-
-                        if s1.changed() || s2.changed() || s3.changed() {
+                        let knee = ui.add(
+                            Slider::new(&mut self.settings.threshold_knee, 0.0..=0.35)
+                                .fixed_decimals(2)
+                                .text("Knee"),
+                        );
+                        if s1.changed() || s2.changed() || s3.changed() || knee.changed() {
                             mark_custom(&mut self.settings);
                         }
                     });
@@ -2825,21 +2868,28 @@ impl eframe::App for GuiApp {
                         self.settings.max_vibe = defaults::MAX_VIBE;
                     }
 
-                    let slider = ui.add(
-                        Slider::new(&mut self.settings.output_gain, 0.0..=2.0)
-                            .fixed_decimals(2)
-                            .text("Output Gain"),
-                    );
+                    // Mild power taper so 1.0 isn't jammed mid-travel of 0–2.
+                    let gain_max = 2.0_f32;
+                    let mut gain_t = (self.settings.output_gain / gain_max)
+                        .clamp(0.0, 1.0)
+                        .powf(1.0 / 2.0);
+                    let slider = ui.add(Slider::new(&mut gain_t, 0.0..=1.0).text("Gain"));
                     let slider = slider.on_hover_text(
-                        "Final-stage multiplier applied after range mapping.\n\
-                         1.0 = unity. Turn up for more headroom, down for safety.",
+                        "Final multiplier after range map. 1.0 = unity.",
                     );
                     if slider.changed() {
+                        self.settings.output_gain = gain_t.powi(2) * gain_max;
                         mark_custom(&mut self.settings);
                     }
                     if slider.double_clicked() {
                         self.settings.output_gain = defaults::OUTPUT_GAIN;
                     }
+                    ui.label(
+                        RichText::new(format!("{:.2}", self.settings.output_gain))
+                            .size(10.0)
+                            .color(palette::TEXT_DIM)
+                            .monospace(),
+                    );
                 });
             } else {
                 // --- Legacy pipeline UI ---
@@ -3054,8 +3104,15 @@ impl eframe::App for GuiApp {
                                         // A disabled device drives zero, so a
                                         // toggle at a steady level registers
                                         // as a change (and a hard stop).
+                                        // Quantize near-rest to exact 0 so the
+                                        // device actually stops (no 1% hang).
                                         let speed = if guard.is_enabled {
-                                            guard.calculate_output(vibration_level)
+                                            let s = guard.calculate_output(vibration_level);
+                                            if s < 0.005 {
+                                                0.0
+                                            } else {
+                                                s
+                                            }
                                         } else {
                                             0.0
                                         };
@@ -3067,7 +3124,12 @@ impl eframe::App for GuiApp {
                                         //   b) this is a hard stop (going to zero), OR
                                         //   c) any enable toggle changed
                                         let speed2 = if guard.is_enabled {
-                                            guard.calculate_output(vibration_level_2)
+                                            let s = guard.calculate_output(vibration_level_2);
+                                            if s < 0.005 {
+                                                0.0
+                                            } else {
+                                                s
+                                            }
                                         } else {
                                             0.0
                                         };
@@ -3944,11 +4006,19 @@ fn device_widget(
     runtime: &Runtime,
 ) {
     ui.group(|ui| {
-        if cfg!(debug_assertions) {
-            ui.label(format!("({}) {}", device.index(), device.name()));
-        } else {
-            ui.label(device.name());
-        }
+        ui.horizontal(|ui| {
+            if cfg!(debug_assertions) {
+                ui.label(format!("({}) {}", device.index(), device.name()));
+            } else {
+                ui.label(device.name());
+            }
+            ui.label(
+                RichText::new(props.motor_kind.label())
+                    .size(9.0)
+                    .color(palette::TEXT_DIM)
+                    .italics(),
+            );
+        });
 
         if let Some(bat) = props.battery_state.get_level() {
             ui.label(format!("Battery: {}%", bat * 100.0));
@@ -3990,20 +4060,20 @@ fn device_widget(
                     ui.add(ProgressBar::new(speed));
                 });
                 ui.horizontal_wrapped(|ui| {
-                    ui.label("Multiplier: ");
-                    // Logarithmic: linearly, the whole useful zone (0-2x) sat
-                    // in the first 10% of travel of the 0-20x range.
+                    ui.label("Strength: ");
+                    // Log from 0.05 — linear 0–20 crammed usable range into a
+                    // few pixels; 20× is a panic ceiling almost nobody needs.
                     let slider =
-                        ui.add(Slider::new(&mut props.multiplier, 0.0..=20.0).logarithmic(true));
+                        ui.add(Slider::new(&mut props.multiplier, 0.05..=10.0).logarithmic(true));
                     if slider.double_clicked() {
                         props.multiplier = 1.0;
                     }
-                    ui.label("Minimum (cut-off): ");
+                    ui.label("Cut-off: ");
                     let slider = ui.add(Slider::new(&mut props.min, 0.0..=1.0).fixed_decimals(2));
                     if slider.double_clicked() {
                         props.min = 0.0;
                     }
-                    ui.label("Maximum: ");
+                    ui.label("Cap: ");
                     let slider = ui.add(Slider::new(&mut props.max, 0.0..=1.0).fixed_decimals(2));
                     if slider.double_clicked() {
                         props.max = 1.0;

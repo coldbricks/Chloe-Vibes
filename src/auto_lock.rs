@@ -69,8 +69,6 @@ pub struct LockParams {
     attack_curve: f32,
     decay_curve: f32,
     release_curve: f32,
-    input_rise_ms: f32,
-    input_fall_ms: f32,
     output_slew_ms: f32,
     /// Kick-open / trough-close threshold (pre-volume energy domain).
     gate_threshold: f32,
@@ -94,8 +92,6 @@ impl LockParams {
             attack_curve: s.attack_curve,
             decay_curve: s.decay_curve,
             release_curve: s.release_curve,
-            input_rise_ms: s.input_rise_ms,
-            input_fall_ms: s.input_fall_ms,
             output_slew_ms: s.output_slew_ms,
             gate_threshold: s.gate_threshold,
             gate_smoothing: s.gate_smoothing,
@@ -119,8 +115,7 @@ impl LockParams {
         s.attack_curve = self.attack_curve;
         s.decay_curve = self.decay_curve;
         s.release_curve = self.release_curve;
-        s.input_rise_ms = self.input_rise_ms;
-        s.input_fall_ms = self.input_fall_ms;
+        // input_rise/fall deliberately not written — dead in the motor path.
         s.output_slew_ms = self.output_slew_ms;
         s.gate_threshold = self.gate_threshold;
         s.gate_smoothing = self.gate_smoothing;
@@ -144,8 +139,6 @@ impl LockParams {
             || (self.attack_curve - s.attack_curve).abs() > EPS
             || (self.decay_curve - s.decay_curve).abs() > EPS
             || (self.release_curve - s.release_curve).abs() > EPS
-            || (self.input_rise_ms - s.input_rise_ms).abs() > EPS
-            || (self.input_fall_ms - s.input_fall_ms).abs() > EPS
             || (self.output_slew_ms - s.output_slew_ms).abs() > EPS
             || (self.gate_threshold - s.gate_threshold).abs() > EPS
             || (self.gate_smoothing - s.gate_smoothing).abs() > EPS
@@ -170,8 +163,6 @@ impl LockParams {
             attack_curve: l(a.attack_curve, b.attack_curve),
             decay_curve: l(a.decay_curve, b.decay_curve),
             release_curve: l(a.release_curve, b.release_curve),
-            input_rise_ms: l(a.input_rise_ms, b.input_rise_ms),
-            input_fall_ms: l(a.input_fall_ms, b.input_fall_ms),
             output_slew_ms: l(a.output_slew_ms, b.output_slew_ms),
             gate_threshold: l(a.gate_threshold, b.gate_threshold),
             gate_smoothing: l(a.gate_smoothing, b.gate_smoothing),
@@ -182,9 +173,7 @@ impl LockParams {
 /// Human-readable readout of the last successful lock (for the UI).
 #[derive(Clone, Debug)]
 pub struct LockReport {
-    pub score: f32,
     pub bpm: f32,
-    pub beat_ms: f32,
     pub band_label: &'static str,
     pub decay_ms: f32,
     pub gate_threshold: f32,
@@ -208,7 +197,6 @@ struct FrameSample {
     band_energies: [f32; N_BANDS],
     pre_volume_energy: f32,
     centroid: f32,
-    envelope_output: f32,
     valid: bool,
 }
 
@@ -315,10 +303,7 @@ impl AutoLock {
         match self.state {
             AutoLockState::Idle => "FIND BOOM".to_string(),
             AutoLockState::Listening { started_ms } => {
-                format!(
-                    "TUNING {:.0}s…",
-                    ((now_ms - started_ms) / 1000.0).max(0.0)
-                )
+                format!("TUNING {:.0}s…", ((now_ms - started_ms) / 1000.0).max(0.0))
             }
             AutoLockState::Locked { score } => {
                 format!("BOOM {:.0}%", (score * 100.0).clamp(0.0, 99.0))
@@ -356,7 +341,7 @@ impl AutoLock {
         spectral: &SpectralData,
         pre_volume_energy: f32,
         onset_ok: bool,
-        envelope_output: f32,
+        _envelope_output: f32,
         using_rms_fallback: bool,
         engine_tempo_confidence: f32,
         settings: &mut Settings,
@@ -366,7 +351,6 @@ impl AutoLock {
             spectral,
             pre_volume_energy,
             onset_ok,
-            envelope_output,
             using_rms_fallback,
         );
 
@@ -412,7 +396,6 @@ impl AutoLock {
         spectral: &SpectralData,
         pre_volume_energy: f32,
         onset_ok: bool,
-        envelope_output: f32,
         using_rms_fallback: bool,
     ) {
         // Merged-onset record (predictive pre-fire + detected onset arrive as
@@ -449,7 +432,6 @@ impl AutoLock {
             band_energies,
             pre_volume_energy,
             centroid: spectral.spectral_centroid,
-            envelope_output,
             valid: !using_rms_fallback && pre_volume_energy > VALID_ENERGY,
         });
 
@@ -559,9 +541,7 @@ impl AutoLock {
             0.0
         };
         self.last_report = Some(LockReport {
-            score,
             bpm,
-            beat_ms,
             band_label: band_label(features.best_band),
             decay_ms: target.decay_ms,
             gate_threshold: target.gate_threshold,
@@ -724,13 +704,6 @@ impl AutoLock {
         centroids.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let centroid_median = percentile_sorted(&centroids, 0.5);
 
-        // Observed dynamic envelope output (diagnostic / legacy; punch no
-        // longer seeds from this — it depends on whatever preset was active
-        // during the listen and creates a chicken-and-egg soft lock).
-        let mut envs: Vec<f32> = frames.iter().map(|f| f.envelope_output).collect();
-        envs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let envelope_p90 = percentile_sorted(&envs, 0.90);
-
         // Gate fit: pre-volume energy on hits vs between hits. Threshold sits
         // just above the trough so kicks open the gate and silence closes it
         // — the single biggest lever for dynamic contrast.
@@ -769,7 +742,6 @@ impl AutoLock {
             salience_margin,
             crest,
             centroid_median,
-            envelope_p90,
             silence_ratio,
             energy_hit,
             energy_floor,
@@ -838,8 +810,7 @@ impl AutoLock {
             (TriggerMode::Dynamic, settings.hybrid_blend, 1.7)
         };
 
-        // Punch from MATERIAL crest + kick boost — not live envelope_p90
-        // (that chicken-and-egged soft locks under a pad preset).
+        // Punch from MATERIAL crest + kick boost.
         // Cap 0.88 leaves overshoot headroom; floor 0.70 always thumps.
         let crest_n = ((f.crest - 1.0) / 5.0).clamp(0.0, 1.0);
         let band_boost = if kick_band { 0.06 } else { 0.0 };
@@ -862,8 +833,6 @@ impl AutoLock {
         gate_threshold = gate_threshold.clamp(0.02, cap).clamp(0.02, 0.45);
         let gate_smoothing = if f.crest >= 2.5 { 0.04 } else { 0.08 };
 
-        let input_rise_ms = if f.crest >= 2.2 { 8.0 } else { 18.0 };
-        let input_fall_ms = (0.35 * t).clamp(80.0, 300.0);
         let output_slew_ms = (0.10 * t).clamp(30.0, 55.0);
 
         LockParams {
@@ -881,8 +850,6 @@ impl AutoLock {
             attack_curve: 0.7,
             decay_curve: 1.8,
             release_curve: 1.3,
-            input_rise_ms,
-            input_fall_ms,
             output_slew_ms,
             gate_threshold,
             gate_smoothing,
@@ -897,7 +864,6 @@ struct Features {
     salience_margin: f32,
     crest: f32,
     centroid_median: f32,
-    envelope_p90: f32,
     silence_ratio: f32,
     energy_hit: f32,
     energy_floor: f32,
@@ -1105,14 +1071,13 @@ mod tests {
         match al.estimate(0.0) {
             Ok(f) => {
                 eprintln!(
-                    "[{mode}] estimate: ioi_med={:.0} iqr={:.0} band={} margin={:.2} crest={:.2} silence={:.2} env_p90={:.2}",
+                    "[{mode}] estimate: ioi_med={:.0} iqr={:.0} band={} margin={:.2} crest={:.2} silence={:.2}",
                     f.ioi_median,
                     f.ioi_iqr,
                     f.best_band,
                     f.salience_margin,
                     f.crest,
                     f.silence_ratio,
-                    f.envelope_p90
                 );
                 let folded = AutoLock::fold_to_perceptual_beat(f.ioi_median);
                 let p = AutoLock::map_features(&f, &settings);
@@ -1412,7 +1377,6 @@ mod tests {
             salience_margin: 2.0,
             crest: 3.0,
             centroid_median: 100.0, // cn = 0 (dark)
-            envelope_p90: 0.5,
             silence_ratio: 0.0,
             energy_hit: 0.5,
             energy_floor: 0.05,
@@ -1433,7 +1397,7 @@ mod tests {
 
     #[test]
     fn binary_level_punch_policy() {
-        // Punch comes from crest + kick-band, not envelope_p90. Floor 0.70,
+        // Punch comes from crest + kick-band. Floor 0.70,
         // cap 0.88 (overshoot headroom). User max/gain/multiplier still bind.
         let mut f = Features {
             ioi_median: 400.0,
@@ -1442,7 +1406,6 @@ mod tests {
             salience_margin: 2.0,
             crest: 1.5, // mild
             centroid_median: 1000.0,
-            envelope_p90: 0.1, // irrelevant now
             silence_ratio: 0.0,
             energy_hit: 0.4,
             energy_floor: 0.05,

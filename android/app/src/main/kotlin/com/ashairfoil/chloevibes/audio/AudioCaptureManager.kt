@@ -833,5 +833,12 @@ private fun smoothOutput(
     val downMs = slewMs.coerceAtLeast(1f)
     val timeMs = if (target >= current) upMs else downMs
     val alpha = smoothingAlpha(deltaTimeS, timeMs)
-    return (current + (target - current) * alpha).coerceIn(0f, 1f)
+    var next = (current + (target - current) * alpha).coerceIn(0f, 1f)
+    // Hard snap to rest when the target is silence. Exponential slew never
+    // quite reaches 0; Domi 0-20 steps + dither residual left a permanent
+    // level-1 hum after the first hit. Mirrors gui.rs output stage.
+    if (target <= 0.001f && next < 0.03f) {
+        next = 0f
+    }
+    return next
 }

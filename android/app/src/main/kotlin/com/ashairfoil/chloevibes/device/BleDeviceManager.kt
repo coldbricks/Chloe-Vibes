@@ -25,6 +25,7 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import java.util.UUID
+import kotlin.math.pow
 import kotlin.math.roundToInt
 
 // ---------------------------------------------------------------------------
@@ -682,9 +683,27 @@ class BleDeviceManager(private val context: Context) {
         lastRequestedMotor2Level = -1
     }
 
-    /** Whether connected device supports dual motors (Domi 2, Nora, etc). */
+    /** Whether connected device supports dual motors (Edge, etc). */
     @Volatile var isDualMotor: Boolean = false
         private set
+
+    // Device-class feel: linear 0–1 → ERM is not equal body sensation.
+    // Wands (Domi) crush softs and hang above rest; compact toys need a
+    // higher rest floor. Goal: music on genitals — punch + true quiet.
+    @Volatile private var motorRestFloor: Float = 0.02f
+    @Volatile private var motorFeelGamma: Float = 1.4f
+
+    /**
+     * Map pipeline level through device rest-floor + power curve before
+     * Domi-style 0–20 quantization.
+     */
+    private fun shapeForMotor(level: Float): Float {
+        val x = level.coerceIn(0f, 1f)
+        val rest = motorRestFloor
+        if (x <= rest) return 0f
+        val n = ((x - rest) / (1f - rest).coerceAtLeast(1e-6f)).coerceIn(0f, 1f)
+        return n.toDouble().pow(motorFeelGamma.toDouble()).toFloat()
+    }
 
     /**
      * Set vibration intensity (0.0 - 1.0).
@@ -693,10 +712,19 @@ class BleDeviceManager(private val context: Context) {
      */
     fun setIntensity(level: Float) {
         if (connectionState != ConnectionState.Ready) return
-        val continuous = level.coerceIn(0f, 1f) * 20f
-        val withError = continuous + ditherErrorMain
-        val quantized = withError.roundToInt().coerceIn(0, 20)
-        ditherErrorMain = withError - quantized.toFloat()
+        val continuous = shapeForMotor(level) * 20f
+        // Below half a Domi step: hard zero. Noise-shaped dither error from
+        // prior frames can round a near-silent target up to level 1 and leave
+        // the motor humming after the envelope has fully rested.
+        val quantized = if (continuous < 0.5f) {
+            ditherErrorMain = 0f
+            0
+        } else {
+            val withError = continuous + ditherErrorMain
+            val q = withError.roundToInt().coerceIn(0, 20)
+            ditherErrorMain = withError - q.toFloat()
+            q
+        }
         val held = holdMainPeak(quantized)
         if (held == lastRequestedMainLevel) return
         lastRequestedMainLevel = held
@@ -715,15 +743,27 @@ class BleDeviceManager(private val context: Context) {
     fun setDualIntensity(motor1: Float, motor2: Float) {
         if (connectionState != ConnectionState.Ready) return
         if (isDualMotor) {
-            val cont1 = motor1.coerceIn(0f, 1f) * 20f
-            val with1 = cont1 + ditherErrorMotor1
-            val q1 = with1.roundToInt().coerceIn(0, 20)
-            ditherErrorMotor1 = with1 - q1.toFloat()
+            val cont1 = shapeForMotor(motor1) * 20f
+            val q1 = if (cont1 < 0.5f) {
+                ditherErrorMotor1 = 0f
+                0
+            } else {
+                val with1 = cont1 + ditherErrorMotor1
+                val q = with1.roundToInt().coerceIn(0, 20)
+                ditherErrorMotor1 = with1 - q.toFloat()
+                q
+            }
 
-            val cont2 = motor2.coerceIn(0f, 1f) * 20f
-            val with2 = cont2 + ditherErrorMotor2
-            val q2 = with2.roundToInt().coerceIn(0, 20)
-            ditherErrorMotor2 = with2 - q2.toFloat()
+            val cont2 = shapeForMotor(motor2) * 20f
+            val q2 = if (cont2 < 0.5f) {
+                ditherErrorMotor2 = 0f
+                0
+            } else {
+                val with2 = cont2 + ditherErrorMotor2
+                val q = with2.roundToInt().coerceIn(0, 20)
+                ditherErrorMotor2 = with2 - q.toFloat()
+                q
+            }
 
             val held1 = holdMotor1Peak(q1)
             val held2 = holdMotor2Peak(q2)
@@ -843,6 +883,29 @@ class BleDeviceManager(private val context: Context) {
     private fun applyDeviceType(identifier: String) {
         val dual = identifier in DUAL_VIBRATE_IDENTIFIERS
         isDualMotor = dual
-        Log.d("ChloeVibes", "Lovense DeviceType id=$identifier -> dualMotor=$dual")
+        // Feel profiles by Lovense DeviceType code (protocol research).
+        // W = Domi/wand ERM; S = Lush; P = Edge; ED = Gush; Z = Hush; ...
+        when (identifier) {
+            "W", "H" -> { // Domi / wand-class
+                motorRestFloor = 0.018f
+                motorFeelGamma = 1.55f
+            }
+            "P", "J", "N", "OC" -> { // Edge / dual-body class
+                motorRestFloor = 0.022f
+                motorFeelGamma = 1.45f
+            }
+            "S", "ED", "Z", "B", "C", "EA" -> { // Lush / Gush / Hush / compact
+                motorRestFloor = 0.028f
+                motorFeelGamma = 1.35f
+            }
+            else -> {
+                motorRestFloor = 0.02f
+                motorFeelGamma = 1.4f
+            }
+        }
+        Log.d(
+            "ChloeVibes",
+            "Lovense DeviceType id=$identifier dualMotor=$dual rest=$motorRestFloor gamma=$motorFeelGamma"
+        )
     }
 }

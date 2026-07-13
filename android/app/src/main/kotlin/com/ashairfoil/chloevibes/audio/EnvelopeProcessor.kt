@@ -37,6 +37,15 @@ enum class EnvelopeState {
  */
 class EnvelopeProcessor {
 
+    companion object {
+        /**
+         * Sustain at or below this is a pluck/boom floor: after Decay the
+         * envelope releases to rest instead of holding a continuous hum.
+         * Mirrors Rust EnvelopeProcessor::PLUCK_SUSTAIN.
+         */
+        const val PLUCK_SUSTAIN: Float = 0.15f
+    }
+
     var state: EnvelopeState = EnvelopeState.Idle
         private set
 
@@ -70,6 +79,27 @@ class EnvelopeProcessor {
 
     /** Remaining micro-pause frames (0 = not pausing). */
     private var microPauseFrames: Int = 0
+
+    /**
+     * After Decay completes: hold Sustain (organ/pad) or fall through Release
+     * to true rest (pluck/boom). Mirrors Rust EnvelopeProcessor::enter_post_decay.
+     */
+    private fun enterPostDecay(sustainLevel: Float, currentTimeMs: Float) {
+        value = sustainLevel
+        if (sustainLevel <= PLUCK_SUSTAIN) {
+            if (sustainLevel <= 0.001f) {
+                value = 0f
+                state = EnvelopeState.Idle
+                magnitude = 0f
+            } else {
+                state = EnvelopeState.Release
+                startTimeMs = currentTimeMs
+                phaseStartValue = sustainLevel
+            }
+        } else {
+            state = EnvelopeState.Sustain
+        }
+    }
 
     /** Trigger the envelope (gate just opened or strong onset detected). */
     fun trigger(magnitude: Float, currentTimeMs: Float, velocity: Float, attackMs: Float = 30f) {
@@ -168,16 +198,14 @@ class EnvelopeProcessor {
 
             EnvelopeState.Decay -> {
                 if (decayMs <= 0.5f) {
-                    value = sustainLevel
-                    state = EnvelopeState.Sustain
+                    enterPostDecay(sustainLevel, currentTimeMs)
                 } else {
                     val progress = (elapsed / decayMs).coerceIn(0f, 1f)
                     val decayFactor = applyCurve(1f - progress, decayCurve)
                     value = sustainLevel + (phaseStartValue - sustainLevel) * decayFactor
 
                     if (progress >= 1f) {
-                        value = sustainLevel
-                        state = EnvelopeState.Sustain
+                        enterPostDecay(sustainLevel, currentTimeMs)
                     }
                 }
             }
@@ -313,9 +341,17 @@ class EnvelopeProcessor {
         val gateJustOpened = gateOpen && !lastGateOpen
         val gateJustClosed = !gateOpen && lastGateOpen
 
-        // Onset retrigger: retrigger on onsets above threshold during sustain
+        // Onset retrigger in any post-attack state (and Idle). Pluck envelopes
+        // rest in Idle while residual energy holds the gate open — without
+        // Idle/Release onset arming, later kicks are dropped.
         val isOnsetTrigger = isOnset && onsetStrength > 1.05f &&
-                gateOpen && state == EnvelopeState.Sustain
+                gateOpen && state != EnvelopeState.Attack
+
+        // Continuous (pad/organ) re-arm only — never for boom/pluck paths.
+        // Idle→trigger on residual gate-open was gluing Domi at permanent hum.
+        val continuousHold = sustainLevel > PLUCK_SUSTAIN &&
+                (triggerMode == TriggerMode.Dynamic ||
+                    (triggerMode == TriggerMode.Hybrid && hybridBlend < 0.45f))
 
         // Trigger logic
         if (gateJustOpened || isOnsetTrigger) {
@@ -325,9 +361,9 @@ class EnvelopeProcessor {
                 1f
             }
             trigger(mag.coerceAtLeast(0.03f), currentTimeMs, velocity, attackMs)
-        } else if (gateOpen && state == EnvelopeState.Idle) {
-            // Gate open but envelope idle -- retrigger
-            trigger(mag.coerceAtLeast(0.03f), currentTimeMs, 1f, attackMs)
+        } else if (gateOpen && state == EnvelopeState.Idle && continuousHold && mag > 0.05f) {
+            // Pad/organ: re-enter while gate held. Require real magnitude.
+            trigger(mag, currentTimeMs, 1f, attackMs)
         } else if (gateJustClosed) {
             release(currentTimeMs)
         }

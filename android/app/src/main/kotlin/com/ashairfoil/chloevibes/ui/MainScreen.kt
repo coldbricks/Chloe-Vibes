@@ -334,16 +334,25 @@ fun MainScreen(
 
         // ENVELOPE section (color-coded ADSR)
         SectionHeader("ENVELOPE")
-        LabeledSlider("Attack", state.attackMs, 0.5f, 500f, "%.0f ms", ChloeColors.Attack) {
+        LabeledSlider(
+            "Attack", state.attackMs, 0.5f, 500f, "%.0f ms", ChloeColors.Attack,
+            logarithmic = true
+        ) {
             state.attackMs = it; state.selectedPresetName = "Custom"; onParameterChanged()
         }
-        LabeledSlider("Decay", state.decayMs, 1f, 500f, "%.0f ms", ChloeColors.Decay) {
+        LabeledSlider(
+            "Decay", state.decayMs, 1f, 1000f, "%.0f ms", ChloeColors.Decay,
+            logarithmic = true
+        ) {
             state.decayMs = it; state.selectedPresetName = "Custom"; onParameterChanged()
         }
         LabeledSlider("Sustain", state.sustainLevel, 0f, 1f, "%.2f", ChloeColors.Sustain) {
             state.sustainLevel = it; state.selectedPresetName = "Custom"; onParameterChanged()
         }
-        LabeledSlider("Release", state.releaseMs, 1f, 2000f, "%.0f ms", ChloeColors.Release) {
+        LabeledSlider(
+            "Release", state.releaseMs, 1f, 2000f, "%.0f ms", ChloeColors.Release,
+            logarithmic = true
+        ) {
             state.releaseMs = it; state.selectedPresetName = "Custom"; onParameterChanged()
         }
 
