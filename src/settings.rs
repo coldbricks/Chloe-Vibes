@@ -230,7 +230,8 @@ impl Settings {
         self.output_gain = self.output_gain.clamp(0.0, 5.0);
         self.input_rise_ms = self.input_rise_ms.clamp(1.0, 1000.0);
         self.input_fall_ms = self.input_fall_ms.clamp(1.0, 1000.0);
-        self.output_slew_ms = self.output_slew_ms.clamp(0.0, 500.0);
+        // Floor at 1ms: log-scale UI sliders panic/assert on 0.
+        self.output_slew_ms = self.output_slew_ms.clamp(1.0, 500.0);
         self.trim_ms = self.trim_ms.clamp(-500.0, 500.0);
         self.target_frequency = self.target_frequency.clamp(20.0, 20000.0);
         self.climax_intensity = self.climax_intensity.clamp(0.0, 1.0);

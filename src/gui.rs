@@ -59,13 +59,29 @@ pub struct Gui {
 }
 
 pub fn gui(args: Gui) {
-    let native_options = eframe::NativeOptions::default();
-    eframe::run_native(
+    let native_options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1100.0, 900.0])
+            .with_min_inner_size([640.0, 480.0]),
+        ..Default::default()
+    };
+    if let Err(e) = eframe::run_native(
         "Chloe Vibes",
         native_options,
         Box::new(|ctx| Ok(Box::new(GuiApp::new(args.server_addr, ctx)))),
-    )
-    .unwrap();
+    ) {
+        eprintln!("eframe exited with error: {e}");
+        let log_dir = std::env::var("APPDATA")
+            .map(|d| std::path::PathBuf::from(d).join("chloe-vibes"))
+            .unwrap_or_else(|_| std::env::temp_dir().join("chloe-vibes"));
+        let _ = std::fs::create_dir_all(&log_dir);
+        let msg = format!("eframe error: {e}\n");
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_dir.join("crash.log"))
+            .and_then(|mut f| std::io::Write::write_all(&mut f, msg.as_bytes()));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -570,14 +586,22 @@ fn panic_stop_devices() {
     }
 }
 
-// Stop devices on shutdown
+// Stop devices on shutdown. Never panic in Drop — a Drop panic on Windows
+// (subsystem windows) looks like a silent "app just vanished" crash.
 impl Drop for GuiApp {
     fn drop(&mut self) {
-        if let Some(client) = &self.client {
-            if let Err(e) = self.runtime.block_on(client.stop_all_devices()) {
-                eprintln!("Error stopping devices: {e:?}");
-            }
+        let Some(client) = self.client.take() else {
+            return;
+        };
+        // block_on in Drop can re-enter / poison the runtime if something is
+        // already panicking. Best-effort only; panic-stop hook covers hard fails.
+        if std::thread::panicking() {
+            return;
         }
+        let stop = client.stop_all_devices();
+        let _ = self
+            .runtime
+            .block_on(async { tokio::time::timeout(Duration::from_millis(800), stop).await });
     }
 }
 
@@ -599,27 +623,32 @@ fn capture_thread(
     use_advanced: Arc<AtomicBool>,
     capture_status: Arc<Mutex<String>>,
 ) -> ! {
+    // WASAPI loopback buffer. Duration::ZERO made the third-party crate
+    // unwrap-panic on Initialize (WinError 0x88890008 / unsupported format)
+    // on some devices — looked like "app dies while scanning for the toy".
+    const CAPTURE_BUFFER: Duration = Duration::from_millis(80);
+
     loop {
         set_capture_status(&capture_status, "audio: initializing");
 
-        // This audio-capture crate can panic internally on init failure.
-        // Catch it so the thread keeps retrying instead of dying silently.
-        let mut capture = match std::panic::catch_unwind(|| AudioCapture::init(Duration::ZERO)) {
+        // This audio-capture crate unwraps WinErrors (panics) on init/read.
+        // Catch so the UI + BLE stay alive; we just retry audio.
+        let mut capture = match std::panic::catch_unwind(|| AudioCapture::init(CAPTURE_BUFFER)) {
             Ok(Ok(capture)) => capture,
             Ok(Err(e)) => {
                 eprintln!("Audio init failed: {e}");
                 set_capture_status(&capture_status, format!("audio: init failed ({e})"));
                 sound_power.store(0.0);
                 spectral_shared.store(SpectralData::default());
-                std::thread::sleep(Duration::from_millis(750));
+                std::thread::sleep(Duration::from_millis(1500));
                 continue;
             }
             Err(_) => {
-                eprintln!("Audio init panicked; retrying with safe defaults");
-                set_capture_status(&capture_status, "audio: init panicked");
+                eprintln!("Audio init panicked; retrying (device busy/format blip)");
+                set_capture_status(&capture_status, "audio: waiting for playback device…");
                 sound_power.store(0.0);
                 spectral_shared.store(SpectralData::default());
-                std::thread::sleep(Duration::from_millis(750));
+                std::thread::sleep(Duration::from_millis(1500));
                 continue;
             }
         };
@@ -694,21 +723,34 @@ fn capture_thread(
             std::thread::sleep(sleep_duration);
 
             let mut frames_read_this_tick: usize = 0;
-            let read_result = capture.read_samples::<(), _>(|samples, _| {
-                buf.extend(samples.iter().copied());
-                frames_read_this_tick += samples.len() / channels;
-                let len = buf.len();
-                if len > buffer_size {
-                    buf.drain(0..(len - buffer_size));
+            // read_samples can also panic on device invalidate — catch it.
+            let read_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                capture.read_samples::<(), _>(|samples, _| {
+                    buf.extend(samples.iter().copied());
+                    frames_read_this_tick += samples.len() / channels;
+                    let len = buf.len();
+                    if len > buffer_size {
+                        buf.drain(0..(len - buffer_size));
+                    }
+                    Ok(())
+                })
+            }));
+            match read_result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    eprintln!("Audio read failed, reinitializing capture: {e:?}");
+                    set_capture_status(&capture_status, format!("audio: read error ({e:?})"));
+                    sound_power.store(0.0);
+                    spectral_shared.store(SpectralData::default());
+                    break;
                 }
-                Ok(())
-            });
-            if let Err(e) = read_result {
-                eprintln!("Audio read failed, reinitializing capture: {e:?}");
-                set_capture_status(&capture_status, format!("audio: read error ({e:?})"));
-                sound_power.store(0.0);
-                spectral_shared.store(SpectralData::default());
-                break;
+                Err(_) => {
+                    eprintln!("Audio read panicked; reinitializing capture");
+                    set_capture_status(&capture_status, "audio: device blip — reinitializing…");
+                    sound_power.store(0.0);
+                    spectral_shared.store(SpectralData::default());
+                    break;
+                }
             }
             total_frames_read += frames_read_this_tick as u64;
 
@@ -855,6 +897,9 @@ impl GuiApp {
 
         let mut settings = ctx.storage.map(Settings::load).unwrap_or_default();
         settings.sanitize();
+        // Desktop WASAPI is already low-latency; a leftover trim/delay from
+        // older sessions only makes people think they need "timing" knobs.
+        settings.trim_ms = 0.0;
         // Recover from a stored preset name that no longer maps to a real preset:
         // legacy "Default" files, or a preset renamed/removed across versions.
         // An empty name means "custom" (user-edited) and must be left untouched.
@@ -1148,11 +1193,15 @@ impl eframe::App for GuiApp {
                         register_panic_stop(self.runtime.handle().clone(), client.clone());
                         self.client = Some(client);
                         self.connection_state = ConnectionState::Connected;
-                        if self.settings.start_scanning_on_startup {
-                            if let Some(client) = &self.client {
-                                self.runtime.spawn(client.start_scanning());
-                                self.is_scanning = true;
-                            }
+                        // Always start looking for toys on connect. Manual
+                        // toggle still works after; waiting on a checkbox that
+                        // defaults false made it feel like "search then died".
+                        if let Some(client) = &self.client {
+                            let c = client.clone();
+                            self.runtime.spawn(async move {
+                                let _ = c.start_scanning().await;
+                            });
+                            self.is_scanning = true;
                         }
                     }
                     Ok(Err(e)) => {
@@ -2279,61 +2328,20 @@ impl eframe::App for GuiApp {
                     }
                 });
 
-                // Input Rise/Fall UI removed: those knobs only fed the meter /
-                // motor2 silence check, not the motor path (placebo). Frozen
-                // defaults still smooth the energy meter internally.
-                ui.horizontal(|ui| {
-                    section_label(ui, "TIMING", palette::TEXT_DIM);
-
-                    let slew = ui.add(
-                        Slider::new(&mut self.settings.output_slew_ms, 1.0..=220.0)
-                            .logarithmic(true)
-                            .suffix("ms")
-                            .text("Slew"),
-                    );
-                    let slew = slew.on_hover_text(
-                        "How soft the motor ramps between levels.\n\
-                         Lower = snappier hits. Higher = smoother falls.",
-                    );
-                    if slew.changed() {
-                        mark_custom(&mut self.settings);
-                    }
-                    if slew.double_clicked() {
-                        self.settings.output_slew_ms = defaults::OUTPUT_SLEW_MS;
-                    }
-
-                    let trim = ui.add(
-                        Slider::new(&mut self.settings.trim_ms, -250.0..=250.0)
-                            .suffix("ms")
-                            .text("Trim"),
-                    );
-                    let trim = trim.on_hover_text(
-                        "Lead/lag vs audio. +delay / −advance.",
-                    );
-                    if trim.changed() {
-                        mark_custom(&mut self.settings);
-                    }
-                    if trim.double_clicked() {
-                        self.settings.trim_ms = defaults::TRIM_MS;
-                    }
-                });
+                // Desktop WASAPI path is already low-latency — no delay/trim
+                // on the main surface. Expert knobs live under OVERRIDE below.
 
                 ui.add_space(2.0);
 
                 // ==========================================================
-                // NOISE GATE — When does the vibrator activate?
+                // THRESHOLD — when does vibration fire?
                 // ==========================================================
-                //
-                // Simplified: just the threshold slider. Auto-sense and
-                // smoothing are gone — they added confusion, not value.
-                // The dashed line on the energy gate visualization shows
-                // exactly where this threshold sits.
 
                 ui.horizontal(|ui| {
                     section_label(ui, "THRESHOLD", palette::ACCENT_PINK);
 
                     // Gate status indicator
-                    let gate_text = if self.gate_is_open { "OPEN" } else { "CLOSED" };
+                    let gate_text = if self.gate_is_open { "ON" } else { "OFF" };
                     let gate_color = if self.gate_is_open {
                         palette::ACCENT_TEAL
                     } else {
@@ -2354,8 +2362,8 @@ impl eframe::App for GuiApp {
                         .fixed_decimals(2),
                     );
                     let slider = slider.on_hover_text(
-                        "How loud audio must be to trigger vibration.\n\
-                         Dashed line on Energy Gate. Higher = only loud hits.",
+                        "How loud the music must be to vibrate.\n\
+                         Higher = only big hits. Lower = reacts to quieter audio.",
                     );
                     if slider.changed() {
                         mark_custom(&mut self.settings);
@@ -2369,142 +2377,19 @@ impl eframe::App for GuiApp {
                 ui.add_space(2.0);
 
                 // ==========================================================
-                // TRIGGER MODE — How does audio energy become intensity?
+                // ADSR ENVELOPE — the shape of each vibration pulse
                 // ==========================================================
 
-                ui.horizontal(|ui| {
-                    section_label(ui, "TRIGGER", palette::TEXT_DIM);
-                    ComboBox::from_id_salt("trigger_mode")
-                        .selected_text(match self.settings.trigger_mode {
-                            TriggerMode::Dynamic => "Dynamic",
-                            TriggerMode::Binary => "Binary (On/Off)",
-                            TriggerMode::Hybrid => "Hybrid",
-                        })
-                        .show_ui(ui, |ui| {
-                            let changed = false
-                                | ui.selectable_value(
-                                    &mut self.settings.trigger_mode,
-                                    TriggerMode::Dynamic,
-                                    "Dynamic — louder = stronger vibration",
-                                )
-                                .changed()
-                                | ui.selectable_value(
-                                    &mut self.settings.trigger_mode,
-                                    TriggerMode::Binary,
-                                    "Binary — fixed level when gate opens",
-                                )
-                                .changed()
-                                | ui.selectable_value(
-                                    &mut self.settings.trigger_mode,
-                                    TriggerMode::Hybrid,
-                                    "Hybrid — blend of dynamic + binary",
-                                )
-                                .changed();
-                            if changed {
-                                mark_custom(&mut self.settings);
-                            }
-                        });
-
-                    match self.settings.trigger_mode {
-                        TriggerMode::Binary => {
-                            let slider = ui.add(
-                                Slider::new(
-                                    &mut self.settings.binary_level,
-                                    0.0..=1.0,
-                                )
-                                .fixed_decimals(2)
-                                .text("Level"),
-                            );
-                            let slider = slider.on_hover_text(
-                                "Fixed output intensity when the gate is open.",
-                            );
-                            if slider.changed() {
-                                mark_custom(&mut self.settings);
-                            }
-                        }
-                        TriggerMode::Hybrid => {
-                            let slider = ui.add(
-                                Slider::new(
-                                    &mut self.settings.binary_level,
-                                    0.0..=1.0,
-                                )
-                                .fixed_decimals(2)
-                                .text("Level"),
-                            );
-                            if slider.changed() {
-                                mark_custom(&mut self.settings);
-                            }
-                            let slider = ui.add(
-                                Slider::new(
-                                    &mut self.settings.hybrid_blend,
-                                    0.0..=1.0,
-                                )
-                                .fixed_decimals(2)
-                                .text("Blend"),
-                            );
-                            let slider = slider.on_hover_text(
-                                "0 = fully dynamic (louder = more).\n\
-                                 1 = fully binary (fixed level).",
-                            );
-                            if slider.changed() {
-                                mark_custom(&mut self.settings);
-                            }
-                        }
-                        _ => {}
-                    }
-
-                    if matches!(
-                        self.settings.trigger_mode,
-                        TriggerMode::Dynamic | TriggerMode::Hybrid
-                    ) {
-                        let curve_slider = ui.add(
-                            Slider::new(
-                                &mut self.settings.dynamic_curve,
-                                0.4..=2.4,
-                            )
-                            .fixed_decimals(2)
-                            .text("Range"),
-                        );
-                        let curve_slider = curve_slider.on_hover_text(
-                            "Dynamic response curve.\n\
-                             Lower = punchier/compressed.\n\
-                             Higher = expanded range and smoother buildup.",
-                        );
-                        if curve_slider.changed() {
-                            mark_custom(&mut self.settings);
-                        }
-                        if curve_slider.double_clicked() {
-                            self.settings.dynamic_curve = defaults::DYNAMIC_CURVE;
-                        }
-                    }
-                });
-
-                ui.add_space(2.0);
-
-                // ==========================================================
-                // ADSR ENVELOPE — The shape of each vibration pulse
-                // ==========================================================
-                //
-                // This is the heart of the synth. The ADSR controls are
-                // displayed prominently with clear single-letter labels
-                // matching the visual preview above.
-
-                // Two rows so each log slider has room — single-row A/D/S/R
-                // was unusable (1px ≈ huge ms jumps).
                 ui.horizontal(|ui| {
                     section_label(ui, "ENVELOPE", palette::ACCENT_TEAL);
-                    ui.label(
-                        RichText::new("A")
-                            .size(11.0)
-                            .color(palette::ACCENT_TEAL)
-                            .strong()
-                            .monospace(),
-                    );
                     let slider = ui.add(
                         Slider::new(&mut self.settings.attack_ms, 0.5..=500.0)
                             .logarithmic(true)
                             .suffix("ms")
                             .text("Attack"),
+                    );
+                    let slider = slider.on_hover_text(
+                        "How fast vibration ramps up. Near 0 = instant punch.",
                     );
                     if slider.changed() {
                         mark_custom(&mut self.settings);
@@ -2513,13 +2398,6 @@ impl eframe::App for GuiApp {
                         self.settings.attack_ms = defaults::ATTACK_MS;
                     }
 
-                    ui.label(
-                        RichText::new("D")
-                            .size(11.0)
-                            .color(palette::ACCENT_PURPLE)
-                            .strong()
-                            .monospace(),
-                    );
                     let slider = ui.add(
                         Slider::new(&mut self.settings.decay_ms, 1.0..=1000.0)
                             .logarithmic(true)
@@ -2527,7 +2405,7 @@ impl eframe::App for GuiApp {
                             .text("Decay"),
                     );
                     let slider = slider.on_hover_text(
-                        "Drop from peak toward rest/sustain. Long = musical boom body.",
+                        "How long the boom lasts after the peak.",
                     );
                     if slider.changed() {
                         mark_custom(&mut self.settings);
@@ -2537,22 +2415,15 @@ impl eframe::App for GuiApp {
                     }
                 });
                 ui.horizontal(|ui| {
-                    section_label(ui, "       ", palette::TEXT_DIM);
-                    ui.label(
-                        RichText::new("S")
-                            .size(11.0)
-                            .color(palette::ACCENT_AMBER)
-                            .strong()
-                            .monospace(),
-                    );
+                    section_label(ui, "    ", palette::TEXT_DIM);
                     let slider = ui.add(
                         Slider::new(&mut self.settings.sustain_level, 0.0..=1.0)
                             .fixed_decimals(2)
                             .text("Sustain"),
                     );
                     let slider = slider.on_hover_text(
-                        "≤0.15 = boom/pluck (falls to silence between hits).\n\
-                         Higher = pad/organ hold while audio stays open.",
+                        "Low (~0.1) = silence between hits (boom).\n\
+                         High = continuous ride while music is loud.",
                     );
                     if slider.changed() {
                         mark_custom(&mut self.settings);
@@ -2561,18 +2432,14 @@ impl eframe::App for GuiApp {
                         self.settings.sustain_level = defaults::SUSTAIN_LEVEL;
                     }
 
-                    ui.label(
-                        RichText::new("R")
-                            .size(11.0)
-                            .color(Color32::from_rgb(200, 100, 100))
-                            .strong()
-                            .monospace(),
-                    );
                     let slider = ui.add(
                         Slider::new(&mut self.settings.release_ms, 1.0..=2000.0)
                             .logarithmic(true)
                             .suffix("ms")
                             .text("Release"),
+                    );
+                    let slider = slider.on_hover_text(
+                        "How fast it dies when the hit/music stops.",
                     );
                     if slider.changed() {
                         mark_custom(&mut self.settings);
@@ -2582,32 +2449,223 @@ impl eframe::App for GuiApp {
                     }
                 });
 
-                ui.collapsing("Advanced curves", |ui| {
-                    ui.horizontal(|ui| {
-                        let s1 = ui.add(
-                            Slider::new(&mut self.settings.attack_curve, 0.1..=4.0)
+                ui.add_space(2.0);
+
+                // ==========================================================
+                // OVERRIDE — expert only (defaults from FIND BOOM / presets)
+                // ==========================================================
+                // Plain string header — RichText headers have glitched collapse
+                // state recovery on some egui versions.
+                ui.collapsing("OVERRIDE (expert — leave closed)", |ui| {
+                        ui.label(
+                            RichText::new(
+                                "FIND BOOM / presets already set these. Only open if you need to hand-tune.",
+                            )
+                            .size(10.0)
+                            .color(palette::TEXT_DIM),
+                        );
+                        ui.add_space(4.0);
+
+                        // Trigger mode + punch extras
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new("Trigger")
+                                    .size(10.0)
+                                    .color(palette::TEXT_DIM)
+                                    .monospace(),
+                            );
+                            ComboBox::from_id_salt("trigger_mode")
+                                .selected_text(match self.settings.trigger_mode {
+                                    TriggerMode::Dynamic => "Follow loudness",
+                                    TriggerMode::Binary => "On/Off punch",
+                                    TriggerMode::Hybrid => "Hybrid punch",
+                                })
+                                .show_ui(ui, |ui| {
+                                    let changed = false
+                                        | ui.selectable_value(
+                                            &mut self.settings.trigger_mode,
+                                            TriggerMode::Dynamic,
+                                            "Follow loudness",
+                                        )
+                                        .changed()
+                                        | ui.selectable_value(
+                                            &mut self.settings.trigger_mode,
+                                            TriggerMode::Binary,
+                                            "On/Off punch",
+                                        )
+                                        .changed()
+                                        | ui.selectable_value(
+                                            &mut self.settings.trigger_mode,
+                                            TriggerMode::Hybrid,
+                                            "Hybrid punch",
+                                        )
+                                        .changed();
+                                    if changed {
+                                        mark_custom(&mut self.settings);
+                                    }
+                                });
+
+                            if matches!(
+                                self.settings.trigger_mode,
+                                TriggerMode::Binary | TriggerMode::Hybrid
+                            ) {
+                                let slider = ui.add(
+                                    Slider::new(
+                                        &mut self.settings.binary_level,
+                                        0.0..=1.0,
+                                    )
+                                    .fixed_decimals(2)
+                                    .text("Punch"),
+                                );
+                                if slider.changed() {
+                                    mark_custom(&mut self.settings);
+                                }
+                            }
+                            if matches!(self.settings.trigger_mode, TriggerMode::Hybrid) {
+                                let slider = ui.add(
+                                    Slider::new(
+                                        &mut self.settings.hybrid_blend,
+                                        0.0..=1.0,
+                                    )
+                                    .fixed_decimals(2)
+                                    .text("Punch mix"),
+                                );
+                                if slider.changed() {
+                                    mark_custom(&mut self.settings);
+                                }
+                            }
+                            if matches!(
+                                self.settings.trigger_mode,
+                                TriggerMode::Dynamic | TriggerMode::Hybrid
+                            ) {
+                                let slider = ui.add(
+                                    Slider::new(
+                                        &mut self.settings.dynamic_curve,
+                                        0.4..=2.4,
+                                    )
+                                    .fixed_decimals(2)
+                                    .text("Curve"),
+                                );
+                                if slider.changed() {
+                                    mark_custom(&mut self.settings);
+                                }
+                            }
+                        });
+
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new("Smooth")
+                                    .size(10.0)
+                                    .color(palette::TEXT_DIM)
+                                    .monospace(),
+                            );
+                            self.settings.output_slew_ms =
+                                self.settings.output_slew_ms.clamp(1.0, 220.0);
+                            let slew = ui.add(
+                                Slider::new(
+                                    &mut self.settings.output_slew_ms,
+                                    1.0..=220.0,
+                                )
+                                .logarithmic(true)
+                                .suffix("ms")
+                                .text("Motor ramp"),
+                            );
+                            let slew = slew.on_hover_text(
+                                "Softens steps between motor levels.\n\
+                                 Lower = snappier. Leave alone unless it feels harsh.",
+                            );
+                            if slew.changed() {
+                                mark_custom(&mut self.settings);
+                            }
+                            if slew.double_clicked() {
+                                self.settings.output_slew_ms = defaults::OUTPUT_SLEW_MS;
+                            }
+
+                            let knee = ui.add(
+                                Slider::new(
+                                    &mut self.settings.threshold_knee,
+                                    0.0..=0.35,
+                                )
+                                .fixed_decimals(2)
+                                .text("Edge soft"),
+                            );
+                            if knee.changed() {
+                                mark_custom(&mut self.settings);
+                            }
+                        });
+
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new("Curves")
+                                    .size(10.0)
+                                    .color(palette::TEXT_DIM)
+                                    .monospace(),
+                            );
+                            let s1 = ui.add(
+                                Slider::new(
+                                    &mut self.settings.attack_curve,
+                                    0.1..=4.0,
+                                )
                                 .fixed_decimals(1)
                                 .text("A"),
-                        );
-                        let s2 = ui.add(
-                            Slider::new(&mut self.settings.decay_curve, 0.1..=4.0)
+                            );
+                            let s2 = ui.add(
+                                Slider::new(
+                                    &mut self.settings.decay_curve,
+                                    0.1..=4.0,
+                                )
                                 .fixed_decimals(1)
                                 .text("D"),
-                        );
-                        let s3 = ui.add(
-                            Slider::new(&mut self.settings.release_curve, 0.1..=4.0)
+                            );
+                            let s3 = ui.add(
+                                Slider::new(
+                                    &mut self.settings.release_curve,
+                                    0.1..=4.0,
+                                )
                                 .fixed_decimals(1)
                                 .text("R"),
-                        );
-                        let knee = ui.add(
-                            Slider::new(&mut self.settings.threshold_knee, 0.0..=0.35)
-                                .fixed_decimals(2)
-                                .text("Knee"),
-                        );
-                        if s1.changed() || s2.changed() || s3.changed() || knee.changed() {
-                            mark_custom(&mut self.settings);
-                        }
-                    });
+                            );
+                            if s1.changed() || s2.changed() || s3.changed() {
+                                mark_custom(&mut self.settings);
+                            }
+                        });
+
+                        // Windows loopback is already tight — trim stays 0 unless
+                        // someone is on a weird path and needs a nudge.
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new("Rare")
+                                    .size(10.0)
+                                    .color(palette::TEXT_DIM)
+                                    .monospace(),
+                            );
+                            let trim = ui.add(
+                                Slider::new(
+                                    &mut self.settings.trim_ms,
+                                    -250.0..=250.0,
+                                )
+                                .suffix("ms")
+                                .text("Sync nudge"),
+                            );
+                            let trim = trim.on_hover_text(
+                                "Not needed on desktop (already low latency).\n\
+                                 Only if haptics feel early/late vs the music.",
+                            );
+                            if trim.changed() {
+                                mark_custom(&mut self.settings);
+                            }
+                            if trim.double_clicked() {
+                                self.settings.trim_ms = 0.0;
+                            }
+                            if ui
+                                .button("Reset sync")
+                                .on_hover_text("Force sync nudge to 0 (desktop default)")
+                                .clicked()
+                            {
+                                self.settings.trim_ms = 0.0;
+                                mark_custom(&mut self.settings);
+                            }
+                        });
                 });
 
                 ui.add_space(2.0);
@@ -3290,15 +3348,15 @@ impl eframe::App for GuiApp {
                         };
                         self.devices.insert(device_index, device);
                     }
-                    let device =
-                        self.devices.get_mut(&device_index).unwrap();
-                    device_widget(
-                        ui,
-                        bp_device,
-                        &mut device.props.lock().unwrap_or_else(|e| e.into_inner()),
-                        self.vibration_level,
-                        &self.runtime,
-                    );
+                    if let Some(device) = self.devices.get_mut(&device_index) {
+                        device_widget(
+                            ui,
+                            bp_device,
+                            &mut device.props.lock().unwrap_or_else(|e| e.into_inner()),
+                            self.vibration_level,
+                            &self.runtime,
+                        );
+                    }
                 }
             }
         });
@@ -4061,8 +4119,8 @@ fn device_widget(
                 });
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Strength: ");
-                    // Log from 0.05 — linear 0–20 crammed usable range into a
-                    // few pixels; 20× is a panic ceiling almost nobody needs.
+                    // Log scale must stay > 0 (egui panics on log(0)).
+                    props.multiplier = props.multiplier.clamp(0.05, 10.0);
                     let slider =
                         ui.add(Slider::new(&mut props.multiplier, 0.05..=10.0).logarithmic(true));
                     if slider.double_clicked() {
@@ -4120,7 +4178,9 @@ fn vibrator_widget(ui: &mut Ui, index: usize, vibe: &mut VibratorProps) {
             vibe.is_enabled = !vibe.is_enabled;
         }
         ui.label("Multiplier: ");
-        let slider = ui.add(Slider::new(&mut vibe.multiplier, 0.0..=5.0).logarithmic(true));
+        // NEVER log-scale from 0 — panics every frame when Vibrators panel is open.
+        vibe.multiplier = vibe.multiplier.clamp(0.05, 5.0);
+        let slider = ui.add(Slider::new(&mut vibe.multiplier, 0.05..=5.0).logarithmic(true));
         if slider.double_clicked() {
             vibe.multiplier = 1.0;
         }
@@ -4151,7 +4211,9 @@ fn oscillator_widget(ui: &mut Ui, index: usize, osc: &mut OscillatorProps) {
             osc.is_enabled = !osc.is_enabled;
         }
         ui.label("Multiplier: ");
-        let slider = ui.add(Slider::new(&mut osc.multiplier, 0.0..=5.0).logarithmic(true));
+        // NEVER log-scale from 0 — panics every frame when Oscillators panel is open.
+        osc.multiplier = osc.multiplier.clamp(0.05, 5.0);
+        let slider = ui.add(Slider::new(&mut osc.multiplier, 0.05..=5.0).logarithmic(true));
         if slider.double_clicked() {
             osc.multiplier = 1.0;
         }
