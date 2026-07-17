@@ -1081,14 +1081,14 @@ impl eframe::App for GuiApp {
         };
         if self.settings.use_dark_mode {
             let cr = CornerRadius::same(3);
-            let hairline = Stroke::new(1.0, palette::HAIRLINE);
+            let hairline = Stroke::new(1.0_f32, palette::HAIRLINE);
 
             visuals.panel_fill = palette::BG_PRIMARY;
             visuals.window_fill = palette::BG_SECONDARY;
             visuals.extreme_bg_color = palette::WELL;
             visuals.faint_bg_color = palette::BG_SECONDARY;
             visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(56, 190, 235, 70);
-            visuals.selection.stroke = Stroke::new(1.0, palette::CYAN);
+            visuals.selection.stroke = Stroke::new(1.0_f32, palette::CYAN);
             visuals.hyperlink_color = palette::CYAN;
             visuals.warn_fg_color = palette::AMBER;
             visuals.error_fg_color = palette::RED;
@@ -1098,29 +1098,29 @@ impl eframe::App for GuiApp {
             // Labels, separators, frames
             w.noninteractive.bg_fill = palette::BG_SECONDARY;
             w.noninteractive.bg_stroke = hairline;
-            w.noninteractive.fg_stroke = Stroke::new(1.0, palette::TEXT_PRIMARY);
+            w.noninteractive.fg_stroke = Stroke::new(1.0_f32, palette::TEXT_PRIMARY);
             w.noninteractive.corner_radius = cr;
             // Buttons / inputs at rest sit on bezel grey with a hairline edge
             w.inactive.bg_fill = palette::BG_TERTIARY;
             w.inactive.bg_stroke = hairline;
-            w.inactive.fg_stroke = Stroke::new(1.0, palette::TEXT_PRIMARY);
+            w.inactive.fg_stroke = Stroke::new(1.0_f32, palette::TEXT_PRIMARY);
             w.inactive.corner_radius = cr;
             // Hovered: restrained lift + cyan hairline, no bright flash
             w.hovered.bg_fill = palette::EDGE_HIGHLIGHT;
-            w.hovered.bg_stroke = Stroke::new(1.0, palette::CYAN);
-            w.hovered.fg_stroke = Stroke::new(1.0, palette::TEXT_PRIMARY);
+            w.hovered.bg_stroke = Stroke::new(1.0_f32, palette::CYAN);
+            w.hovered.fg_stroke = Stroke::new(1.0_f32, palette::TEXT_PRIMARY);
             w.hovered.corner_radius = cr;
             w.hovered.expansion = 1.0;
             // Active / pressed: cyan body, dark text
             w.active.bg_fill = palette::CYAN;
-            w.active.bg_stroke = Stroke::new(1.0, palette::CYAN);
-            w.active.fg_stroke = Stroke::new(1.0, palette::BG_PRIMARY);
+            w.active.bg_stroke = Stroke::new(1.0_f32, palette::CYAN);
+            w.active.fg_stroke = Stroke::new(1.0_f32, palette::BG_PRIMARY);
             w.active.corner_radius = cr;
             w.active.expansion = 1.0;
             // Open combo/menus
             w.open.bg_fill = palette::BG_TERTIARY;
-            w.open.bg_stroke = Stroke::new(1.0, palette::CYAN);
-            w.open.fg_stroke = Stroke::new(1.0, palette::TEXT_PRIMARY);
+            w.open.bg_stroke = Stroke::new(1.0_f32, palette::CYAN);
+            w.open.fg_stroke = Stroke::new(1.0_f32, palette::TEXT_PRIMARY);
             w.open.corner_radius = cr;
         }
         ctx.set_visuals(visuals);
@@ -1322,7 +1322,7 @@ impl eframe::App for GuiApp {
                 }
                 if let Ok(status) = self.capture_status.lock() {
                     ui.label(
-                        RichText::new(format!("Audio: {}", &*status))
+                        RichText::new(format!("Audio: {}", *status))
                             .size(9.0)
                             .color(palette::TEXT_DIM)
                             .monospace(),
@@ -1908,8 +1908,7 @@ impl eframe::App for GuiApp {
                 } else {
                     palette::BG_SECONDARY
                 })
-                .stroke(Stroke::new(
-                    0.5,
+                .stroke(Stroke::new(0.5_f32,
                     if legacy_active {
                         palette::ACCENT_PURPLE
                     } else {
@@ -1942,8 +1941,7 @@ impl eframe::App for GuiApp {
                 } else {
                     palette::BG_SECONDARY
                 })
-                .stroke(Stroke::new(
-                    0.5,
+                .stroke(Stroke::new(0.5_f32,
                     if advanced_active {
                         palette::ACCENT_PURPLE
                     } else {
@@ -2141,8 +2139,7 @@ impl eframe::App for GuiApp {
                                 } else {
                                     palette::BG_SECONDARY
                                 })
-                                .stroke(Stroke::new(
-                                    0.5,
+                                .stroke(Stroke::new(0.5_f32,
                                     if is_active {
                                         palette::ACCENT_PURPLE
                                     } else {
@@ -3389,7 +3386,7 @@ fn draw_adsr_envelope(
     painter.rect_stroke(
         rect,
         4.0,
-        Stroke::new(1.0, palette::HAIRLINE),
+        Stroke::new(1.0_f32, palette::HAIRLINE),
         StrokeKind::Inside,
     );
 
@@ -3405,7 +3402,7 @@ fn draw_adsr_envelope(
         let y = origin.y - draw_h * (i as f32 / 4.0);
         painter.line_segment(
             [pos2(origin.x, y), pos2(origin.x + draw_w, y)],
-            Stroke::new(0.5, palette::GRID_LINE),
+            Stroke::new(0.5_f32, palette::GRID_LINE),
         );
     }
 
@@ -3487,7 +3484,7 @@ fn draw_adsr_envelope(
 
     // Single restrained azure curve, no glow.
     if points.len() >= 2 {
-        painter.add(Shape::line(points, Stroke::new(1.5, palette::CYAN)));
+        painter.add(Shape::line(points, Stroke::new(1.5_f32, palette::CYAN)));
     }
 
     // Phase separator lines
@@ -3499,7 +3496,7 @@ fn draw_adsr_envelope(
     for &px in &phase_xs {
         painter.line_segment(
             [pos2(px, origin.y), pos2(px, origin.y - draw_h)],
-            Stroke::new(0.5, Color32::from_rgba_premultiplied(255, 255, 255, 20)),
+            Stroke::new(0.5_f32, Color32::from_rgba_premultiplied(255, 255, 255, 20)),
         );
     }
 
@@ -3624,7 +3621,7 @@ fn draw_output_history(
     painter.rect_stroke(
         rect,
         4.0,
-        Stroke::new(1.0, border_color),
+        Stroke::new(1.0_f32, border_color),
         StrokeKind::Inside,
     );
 
@@ -3639,7 +3636,7 @@ fn draw_output_history(
         let y = rect.min.y + padding + draw_h * (1.0 - i as f32 / 3.0);
         painter.line_segment(
             [pos2(rect.min.x + padding, y), pos2(rect.max.x - padding, y)],
-            Stroke::new(0.5, palette::GRID_LINE),
+            Stroke::new(0.5_f32, palette::GRID_LINE),
         );
     }
 
@@ -3660,7 +3657,7 @@ fn draw_output_history(
         let seg_end = (x + dash_len).min(x_end);
         painter.line_segment(
             [pos2(x, thresh_y), pos2(seg_end, thresh_y)],
-            Stroke::new(1.5, thresh_color),
+            Stroke::new(1.5_f32, thresh_color),
         );
         x = seg_end + gap_len;
     }
@@ -3701,7 +3698,10 @@ fn draw_output_history(
     }
 
     if line_points.len() >= 2 {
-        painter.add(Shape::line(line_points, Stroke::new(1.5, palette::GREEN)));
+        painter.add(Shape::line(
+            line_points,
+            Stroke::new(1.5_f32, palette::GREEN),
+        ));
     }
 }
 
@@ -3721,7 +3721,7 @@ fn draw_spectrum_bars(
     painter.rect_stroke(
         rect,
         4.0,
-        Stroke::new(1.0, border_color),
+        Stroke::new(1.0_f32, border_color),
         StrokeKind::Inside,
     );
 
