@@ -163,23 +163,27 @@ impl MotorKind {
     }
 
     /// Below this shaped input the motor is commanded fully off.
+    /// Prefer true-zero rest: Domi/wand ERMs hang on residual softs, so the
+    /// floor is slightly higher than a pure linear map would suggest. Do not
+    /// lower these without Domi A/B — residual gate re-arm hang returns.
     fn rest_floor(self) -> f32 {
         match self {
-            Self::Wand => 0.018,
-            Self::Compact => 0.028,
-            Self::DualBody => 0.022,
-            Self::Generic => 0.02,
+            Self::Wand => 0.026,
+            Self::Compact => 0.032,
+            Self::DualBody => 0.026,
+            Self::Generic => 0.024,
         }
     }
 
     /// Power curve after rest remap. >1 keeps quiet quieter so Domi 0–20
-    /// steps don't turn musical softs into a permanent hum.
+    /// steps don't turn musical softs into a permanent hum; higher wand
+    /// gamma preserves punch contrast once past the rest floor.
     fn feel_gamma(self) -> f32 {
         match self {
-            Self::Wand => 1.55,
-            Self::Compact => 1.35,
-            Self::DualBody => 1.45,
-            Self::Generic => 1.4,
+            Self::Wand => 1.68,
+            Self::Compact => 1.40,
+            Self::DualBody => 1.55,
+            Self::Generic => 1.48,
         }
     }
 }
@@ -904,6 +908,19 @@ impl GuiApp {
         // legacy "Default" files, or a preset renamed/removed across versions.
         // An empty name means "custom" (user-edited) and must be left untouched.
         let stored_name = settings.current_preset_name.clone();
+        // Legacy Android/desktop Chloe tempo macro names → catalog Deep 90 / Club 125 / Hard 140.
+        let migrated_name = match stored_name.as_str() {
+            n if n.eq_ignore_ascii_case("Chloe Loose") => Some("Deep 90"),
+            n if n.eq_ignore_ascii_case("Chloe Medium") => Some("Club 125"),
+            n if n.eq_ignore_ascii_case("Chloe Ultimate") => Some("Hard 140"),
+            _ => None,
+        };
+        if let Some(new_name) = migrated_name {
+            if let Some(preset) = presets::find_preset(new_name) {
+                settings.apply_preset(&preset);
+            }
+        }
+        let stored_name = settings.current_preset_name.clone();
         let is_unknown_named =
             !stored_name.is_empty() && presets::find_preset(&stored_name).is_none();
         if stored_name.eq_ignore_ascii_case("Default") || is_unknown_named {
@@ -1469,15 +1486,9 @@ impl eframe::App for GuiApp {
                 self.raw_energy = stable_energy;
                 self.using_rms_fallback = using_rms_fallback;
 
-                // 4. Beat detection (for onset retrigger)
-                //
-                // Process the detector ONCE per fresh capture frame. The UI
-                // repaints far faster than the capture thread produces frames
-                // (~240fps vs ~90Hz), and re-feeding duplicate flux values
-                // compresses the detector's 43-frame statistics window
-                // several-fold — measured on real music as ~6x inflation of
-                // inter-onset jitter (IQR 21ms -> 130ms), which starves tempo
-                // confidence and Auto-Lock.
+                // Fresh-frame guard: UI repaints far faster than capture
+                // (~240fps vs ~90Hz). Re-feeding duplicate flux compresses the
+                // detector's 43-frame window (~6x onset jitter on real music).
                 let spectral_sig = {
                     let mut sig = self.last_spectral.spectral_flux.to_bits() as u64;
                     for b in &self.last_spectral.band_energies {
@@ -1488,6 +1499,20 @@ impl eframe::App for GuiApp {
                 let fresh_spectral = spectral_sig != self.last_spectral_sig;
                 self.last_spectral_sig = spectral_sig;
 
+                // 4. Gate FIRST (frozen chain: Spectral → Gate → Beat → …).
+                // Uses raw pre-volume energy so threshold is volume-independent
+                // (Android parity). Same fresh-frame rule: close smoothing is
+                // per-call, so duplicate ticks closed several times too fast.
+                if fresh_spectral {
+                    self.gate_is_open = self.gate.process(
+                        raw_energy_for_gate,
+                        self.settings.gate_threshold,
+                        self.settings.auto_gate_amount,
+                        self.settings.gate_smoothing,
+                    );
+                }
+
+                // 5. Beat detection + prefire (current-frame gate for prefire)
                 let (detected_onset, onset_strength) = if fresh_spectral {
                     let (onset, strength) = self
                         .beat_detector
@@ -1498,48 +1523,28 @@ impl eframe::App for GuiApp {
                     (false, self.last_onset_strength)
                 };
 
-                // Predictive onset: when tempo is locked, pre-trigger ~2 device
-                // write intervals early so the attack command arrives on-beat
-                // instead of late. False positives feel like syncopation;
-                // late delivery feels like lag.
-                let is_onset = if !detected_onset
-                    && self.beat_detector.tempo_confidence > 0.6
-                {
-                    let predicted = self.beat_detector.predicted_next_onset_ms;
-                    if predicted > 0.0 {
-                        let lead_time_ms = 76.0; // ~2 BLE/device write intervals
-                        let time_to_predicted = predicted - current_time_ms;
-                        time_to_predicted >= 0.0
-                            && time_to_predicted <= lead_time_ms
-                            && self.gate_is_open
+                // Predictive onset: tempo-locked pre-trigger so attack lands
+                // on-beat. take_prefire injects strength floor + one-shot latch.
+                // Uses THIS frame's gate (not stale prior-frame).
+                let (is_onset, onset_strength) = if !detected_onset && self.gate_is_open {
+                    if let Some(pre_str) = self.beat_detector.take_prefire(current_time_ms) {
+                        (true, pre_str)
                     } else {
-                        false
+                        (false, onset_strength)
                     }
                 } else {
-                    detected_onset
+                    (detected_onset, onset_strength)
                 };
 
+                // Single onset threshold 1.05 (matches envelope drive; kills
+                // the old 1.02–1.05 dead band that ate weak real onsets).
                 let onset_ok = is_onset
-                    && onset_strength > 1.02
+                    && onset_strength > 1.05
                     && energy > self.settings.gate_threshold * 0.40;
 
                 #[cfg(debug_assertions)]
                 if onset_ok {
                     DIAG_ONSETS.fetch_add(1, Ordering::Relaxed);
-                }
-
-                // 5. Gate (uses raw pre-volume energy so threshold is
-                // volume-independent, matching Android behavior). Same
-                // fresh-frame rule: the gate's close smoothing is per-call,
-                // so duplicate calls made it close several times faster than
-                // the slider says.
-                if fresh_spectral {
-                    self.gate_is_open = self.gate.process(
-                        raw_energy_for_gate,
-                        self.settings.gate_threshold,
-                        self.settings.auto_gate_amount,
-                        self.settings.gate_smoothing,
-                    );
                 }
 
                 // 6. Envelope ADSR (the big upgrade)
@@ -1595,19 +1600,22 @@ impl eframe::App for GuiApp {
                 };
 
                 // 8. Apply output range (min_vibe / max_vibe) + output gain via
-                // the shared, parity-tested output mapping. is_silent forces a
-                // true zero (energy negligible, gate shut, envelope idle) so a
-                // brief silence pumps back to rest; the climax engine is
-                // intentionally NOT reset so minutes of build-up survive.
+                // the shared, parity-tested output mapping. Silence-class
+                // (energy/gate/Idle OR envelope/climax silence_event) forces
+                // true zero through map_output so min_vibe cannot re-enter rests.
+                // Climax engine is NOT reset so minutes of build-up survive.
                 let is_silent = energy < 0.005
                     && !self.gate_is_open
                     && self.envelope.state == audio::EnvelopeState::Idle;
+                let silence_class_pre = is_silent
+                    || self.envelope.silence_event
+                    || self.climax_engine.silence_event;
                 let final_intensity = audio::map_output(
                     shaped_output,
                     self.settings.min_vibe,
                     self.settings.max_vibe,
                     self.settings.output_gain,
-                    is_silent,
+                    silence_class_pre,
                 );
 
                 // Apply timing trim (delay/advance) via small ring buffer
@@ -1636,20 +1644,35 @@ impl eframe::App for GuiApp {
                     final_intensity
                 };
 
-                let output_up_ms = (self.settings.output_slew_ms * 0.35).max(1.0);
-                let output_down_ms = self.settings.output_slew_ms.max(1.0);
-                let output_alpha = if trimmed_intensity >= self.vibration_level {
-                    smoothing_alpha(delta_time, output_up_ms)
-                } else {
-                    smoothing_alpha(delta_time, output_down_ms)
-                };
-                self.vibration_level +=
-                    (trimmed_intensity - self.vibration_level) * output_alpha;
-                // Hard snap to rest when the target is silence. Exponential
-                // slew never quite reaches 0; Domi 0-20 quantization + residual
-                // error left a permanent level-1 hum after the first hit.
-                if trimmed_intensity <= 0.001 && self.vibration_level < 0.03 {
+                // Silence-class events (envelope micro-pauses) and true rest
+                // targets hard-snap past the slew so the motor actually stops.
+                // Large upward jumps take a snappier rise so kick punch is not
+                // eaten by the 0.35× rise ratio on every frame.
+                let silence_class = self.envelope.silence_event
+                    || self.climax_engine.silence_event
+                    || trimmed_intensity <= 0.001;
+                if silence_class {
                     self.vibration_level = 0.0;
+                } else {
+                    let jump_up = trimmed_intensity - self.vibration_level;
+                    let output_up_ms = if jump_up > 0.25 {
+                        // Transient punch: ~8ms command rise (motor spin owns rest)
+                        (self.settings.output_slew_ms * 0.15).clamp(1.0, 12.0)
+                    } else {
+                        (self.settings.output_slew_ms * 0.35).max(1.0)
+                    };
+                    let output_down_ms = self.settings.output_slew_ms.max(1.0);
+                    let output_alpha = if trimmed_intensity >= self.vibration_level {
+                        smoothing_alpha(delta_time, output_up_ms)
+                    } else {
+                        smoothing_alpha(delta_time, output_down_ms)
+                    };
+                    self.vibration_level +=
+                        (trimmed_intensity - self.vibration_level) * output_alpha;
+                    // Hard snap residual near-zero (exponential asymptote).
+                    if trimmed_intensity <= 0.001 && self.vibration_level < 0.03 {
+                        self.vibration_level = 0.0;
+                    }
                 }
                 self.vibration_level = self.vibration_level.clamp(0.0, 1.0);
 
@@ -1765,40 +1788,59 @@ impl eframe::App for GuiApp {
             // Store processed output for device tasks
             self.processed_output.store(self.vibration_level);
 
-            // Secondary motor (motor 2) is driven by the HIGH-frequency content
-            // of the live audio. Motor 1 carries the full body vibe; on a
-            // dual-motor device this puts bass/body on motor 1 and treble/detail
-            // on motor 2 -- tuned by the audio itself, not the climax engine.
-            // NOTE: motor2 scales the already-mapped motor1 level directly (no
-            // second map_output), so both motors live in the same output space.
+            // Secondary motor (motor 2):
+            // - Climax ON → ClimaxEngine.motor2_output (spatial anti-phase arc)
+            //   mapped through the same min/max/gain as motor 1.
+            // - Climax OFF → treble spectral shadow of motor 1 (bass/body vs
+            //   sizzle), legacy dual-motor music path.
             let is_silent = self.raw_energy < 0.005
                 && !self.gate_is_open
                 && self.envelope.state == audio::EnvelopeState::Idle;
-            let motor2_target = if is_silent {
+            let m2_silence = is_silent
+                || self.envelope.silence_event
+                || self.climax_engine.silence_event;
+            let motor2_target = if m2_silence {
                 0.0
+            } else if self.settings.climax_mode_enabled {
+                audio::map_output(
+                    self.climax_engine.motor2_output,
+                    self.settings.min_vibe,
+                    self.settings.max_vibe,
+                    self.settings.output_gain,
+                    false,
+                )
             } else {
                 // Treble fraction = high bands (Hi-Mid..Air) / total band energy.
-                // Bands 0..4 = Sub/Bass/Lo-Mid/Mid, bands 4..8 = Hi-Mid/Pres/Brill/Air.
                 let be = &self.last_spectral.band_energies;
                 let low_e = be[0] + be[1] + be[2] + be[3];
                 let high_e = be[4] + be[5] + be[6] + be[7];
                 let total = low_e + high_e;
                 let treble_frac = if total > 1e-9 { high_e / total } else { 0.0 };
-                // Gain so even modest treble lifts motor 2; clamp keeps it sane.
                 let treble_weight = (treble_frac * 3.0).clamp(0.0, 1.0);
                 (self.vibration_level * treble_weight).clamp(0.0, 1.0)
             };
-            // Apply same slew smoothing as motor1 so both motors have matching latency
-            let m2_up_ms = (self.settings.output_slew_ms * 0.35).max(1.0);
-            let m2_down_ms = self.settings.output_slew_ms.max(1.0);
-            let motor2_alpha = if motor2_target >= self.motor2_level {
-                smoothing_alpha(delta_time, m2_up_ms)
-            } else {
-                smoothing_alpha(delta_time, m2_down_ms)
-            };
-            self.motor2_level += (motor2_target - self.motor2_level) * motor2_alpha;
-            if motor2_target <= 0.001 && self.motor2_level < 0.03 {
+            if motor2_target <= 0.001
+                || self.envelope.silence_event
+                || self.climax_engine.silence_event
+            {
                 self.motor2_level = 0.0;
+            } else {
+                let jump_up = motor2_target - self.motor2_level;
+                let m2_up_ms = if jump_up > 0.25 {
+                    (self.settings.output_slew_ms * 0.15).clamp(1.0, 12.0)
+                } else {
+                    (self.settings.output_slew_ms * 0.35).max(1.0)
+                };
+                let m2_down_ms = self.settings.output_slew_ms.max(1.0);
+                let motor2_alpha = if motor2_target >= self.motor2_level {
+                    smoothing_alpha(delta_time, m2_up_ms)
+                } else {
+                    smoothing_alpha(delta_time, m2_down_ms)
+                };
+                self.motor2_level += (motor2_target - self.motor2_level) * motor2_alpha;
+                if motor2_target <= 0.001 && self.motor2_level < 0.03 {
+                    self.motor2_level = 0.0;
+                }
             }
             self.motor2_level = self.motor2_level.clamp(0.0, 1.0);
             self.processed_output_2.store(self.motor2_level);
@@ -3161,9 +3203,13 @@ impl eframe::App for GuiApp {
                                         // as a change (and a hard stop).
                                         // Quantize near-rest to exact 0 so the
                                         // device actually stops (no 1% hang).
+                                        // Slightly above one Domi step (1/20)
+                                        // after motor shaping so residual softs
+                                        // cannot re-arm a level-1 hum.
+                                        let near_rest = 0.008_f32;
                                         let speed = if guard.is_enabled {
                                             let s = guard.calculate_output(vibration_level);
-                                            if s < 0.005 {
+                                            if s < near_rest {
                                                 0.0
                                             } else {
                                                 s
@@ -3180,7 +3226,7 @@ impl eframe::App for GuiApp {
                                         //   c) any enable toggle changed
                                         let speed2 = if guard.is_enabled {
                                             let s = guard.calculate_output(vibration_level_2);
-                                            if s < 0.005 {
+                                            if s < near_rest {
                                                 0.0
                                             } else {
                                                 s
@@ -3191,8 +3237,8 @@ impl eframe::App for GuiApp {
                                         let speed2_f64 = speed2 as f64;
                                         let change = (speed_f64 - last_sent).abs();
                                         let change_m2 = (speed2_f64 - last_sent_m2).abs();
-                                        let is_hard_stop = speed_f64 < 0.005
-                                            && last_sent >= 0.005;
+                                        let is_hard_stop = speed_f64 < 0.008
+                                            && last_sent >= 0.008;
                                         let mut enable_sig: u64 = guard.is_enabled as u64;
                                         for v in &guard.vibrators {
                                             enable_sig = (enable_sig << 1) | v.is_enabled as u64;
@@ -3899,7 +3945,8 @@ fn apply_chloe_rhythm_profile(settings: &mut Settings, profile: ChloeRhythmProfi
             settings.sustain_level = 0.08;
             settings.release_ms = 240.0;
             settings.input_fall_ms = 160.0;
-            settings.output_slew_ms = 48.0;
+            // Match Bass Drum / WAVE-001 trough honesty (was 48 ms — softer).
+            settings.output_slew_ms = 42.0;
         }
         // ~140 BPM (beat ≈ 429 ms) — harder hit, still a full musical boom
         ChloeRhythmProfile::Ultimate => {

@@ -74,11 +74,24 @@ class EnvelopeProcessor {
     /** Time of last trigger (ms). */
     private var lastTriggerTimeMs: Float = 0f
 
+    /** Velocity of last trigger (gate-edge → real-onset upgrade). */
+    private var lastTriggerVelocity: Float = 0f
+
     /** Stochastic micro-pause: next pause timestamp (ms). */
     private var nextMicroPauseMs: Float = 0f
 
-    /** Remaining micro-pause frames (0 = not pausing). */
-    private var microPauseFrames: Int = 0
+    /** End time of the active micro-pause (ms); 0 = not pausing. Time-based. */
+    private var microPauseUntilMs: Float = 0f
+
+    /**
+     * True this frame when the envelope forced a silence-class zero
+     * (micro-pause). Downstream slew / peak-hold must hard-snap to rest.
+     */
+    var silenceEvent: Boolean = false
+        private set
+
+    /** Last time updateMagnitude ran (ms) for time-based sustain smoothing. */
+    private var lastMagUpdateMs: Float = 0f
 
     /**
      * After Decay completes: hold Sustain (organ/pad) or fall through Release
@@ -91,6 +104,8 @@ class EnvelopeProcessor {
                 value = 0f
                 state = EnvelopeState.Idle
                 magnitude = 0f
+                // Boom floor at zero: silence-class so slew/peak-hold hard-snap.
+                silenceEvent = true
             } else {
                 state = EnvelopeState.Release
                 startTimeMs = currentTimeMs
@@ -103,20 +118,30 @@ class EnvelopeProcessor {
 
     /** Trigger the envelope (gate just opened or strong onset detected). */
     fun trigger(magnitude: Float, currentTimeMs: Float, velocity: Float, attackMs: Float = 30f) {
-        // Enforce minimum retrigger interval
-        if (currentTimeMs - lastTriggerTimeMs < minRetriggerMs) return
+        // Enforce minimum retrigger interval — allow real onset to upgrade a
+        // gate-edge thump (velocity=1) that fired a few ms earlier.
+        if (currentTimeMs - lastTriggerTimeMs < minRetriggerMs) {
+            val upgrade = velocity > 1.05f &&
+                velocity > lastTriggerVelocity + 0.08f &&
+                state != EnvelopeState.Idle
+            if (!upgrade) return
+        }
 
-        val scaledMagnitude = magnitude * (0.5f + 0.5f * velocity)
-        this.magnitude = scaledMagnitude.coerceIn(0f, 1.5f)
+        // Magnitude tracks body level; velocity > 1 lives in attackTarget
+        // overshoot so process() headroom is not double-scaled then clipped.
+        val velForMag = velocity.coerceAtMost(1.0f)
+        val scaledMagnitude = magnitude * (0.5f + 0.5f * velForMag)
+        this.magnitude = scaledMagnitude.coerceIn(0f, 1.0f)
 
         // Velocity overshoot: strong onsets briefly exceed normal peak.
         // A hard drum hit should momentarily push past the normal ceiling,
         // creating a visceral "punch" sensation.
         attackTarget = if (velocity > 1.0f) {
-            (1.0f + 0.15f * (velocity - 1.0f)).coerceAtMost(1.2f)
+            (1.0f + 0.30f * (velocity - 1.0f)).coerceAtMost(1.28f)
         } else {
             1.0f
         }
+        lastTriggerVelocity = velocity
 
         // For short attacks (< 50ms), skip directly to peak.
         // Motor spin-up (~20ms) provides the physical ramp — sending peak
@@ -132,9 +157,10 @@ class EnvelopeProcessor {
             phaseStartValue = value.coerceAtLeast(0.4f)
         }
 
-        // Reset micro-pause on retrigger
-        microPauseFrames = 0
-        nextMicroPauseMs = 0f
+        // Abort an active micro-pause on retrigger, but keep the scheduled
+        // next rest so pad/continuous material still gets anti-adaptation zeros.
+        microPauseUntilMs = 0f
+        silenceEvent = false
         lastTriggerTimeMs = currentTimeMs
     }
 
@@ -149,12 +175,19 @@ class EnvelopeProcessor {
 
     /**
      * Update the sustain magnitude (for dynamic modes where energy
-     * changes while gate is held open).
+     * changes while gate is held open). Time-based so frame rate cannot
+     * make the hold smoother/faster than designed.
      */
-    fun updateMagnitude(newMagnitude: Float) {
+    fun updateMagnitude(newMagnitude: Float, currentTimeMs: Float) {
         if (state == EnvelopeState.Sustain) {
-            // Asymmetric smoothing: fast rise (feel the hit), slower fall (natural decay)
-            val alpha = if (newMagnitude > magnitude) 0.30f else 0.15f
+            val dtS = if (lastMagUpdateMs > 0f) {
+                ((currentTimeMs - lastMagUpdateMs) / 1000f).coerceIn(0f, 0.05f)
+            } else {
+                1f / 60f
+            }
+            lastMagUpdateMs = currentTimeMs
+            val tau = if (newMagnitude > magnitude) 0.050f else 0.110f
+            val alpha = (1f - kotlin.math.exp(-dtS / tau))
             magnitude = magnitude * (1f - alpha) + newMagnitude * alpha
         }
     }
@@ -173,6 +206,7 @@ class EnvelopeProcessor {
         releaseCurve: Float
     ): Float {
         val elapsed = currentTimeMs - startTimeMs
+        silenceEvent = false
 
         when (state) {
             EnvelopeState.Attack -> {
@@ -211,25 +245,26 @@ class EnvelopeProcessor {
             }
 
             EnvelopeState.Sustain -> {
-                // Stochastic micro-pauses: drops to true zero for 3-6 frames
-                // (48-96ms). Long enough for the motor to actually stop,
-                // creating a real nerve reset. True zero ensures the motor
-                // fully decelerates — partial intensity keeps nerves adapted.
-                if (microPauseFrames > 0) {
-                    microPauseFrames--
-                    value = 0f // True zero — motor must stop
-                } else if (nextMicroPauseMs > 0f && currentTimeMs >= nextMicroPauseMs) {
-                    // 3-6 frames at 60Hz = 48-96ms (motor needs ~20ms to stop)
-                    microPauseFrames = 3 + ((currentTimeMs * 7.13f).toInt() and 0x3)
-                    // Next pause in 2-8 seconds (deterministic pseudo-random)
-                    val pseudoRand = ((currentTimeMs * 13.37f).toInt() and 0xFFFF).toFloat() / 65535f
-                    nextMicroPauseMs = currentTimeMs + 2000f + pseudoRand * 6000f
+                // Stochastic micro-pauses: true zero for 90–120 ms (time-based).
+                // silenceEvent flags the output stage to bypass slew/peak-hold.
+                if (microPauseUntilMs > 0f && currentTimeMs < microPauseUntilMs) {
                     value = 0f
+                    silenceEvent = true
+                } else if (nextMicroPauseMs > 0f && currentTimeMs >= nextMicroPauseMs) {
+                    // 90–120 ms pause — floor raised so rest completes on hardware
+                    val pseudoRand = ((currentTimeMs * 7.13f).toInt() and 0xFFFF).toFloat() / 65535f
+                    val pauseMs = 90f + pseudoRand * 30f
+                    microPauseUntilMs = currentTimeMs + pauseMs
+                    val gapRand = ((currentTimeMs * 13.37f).toInt() and 0xFFFF).toFloat() / 65535f
+                    nextMicroPauseMs = currentTimeMs + 2000f + gapRand * 6000f
+                    value = 0f
+                    silenceEvent = true
                 } else {
-                    // Initialize micro-pause timer on first sustain frame
+                    microPauseUntilMs = 0f
+                    // First rest sooner (0.8–2.5 s) so pads get a zero early
                     if (nextMicroPauseMs <= 0f) {
                         val pseudoRand = ((currentTimeMs * 13.37f).toInt() and 0xFFFF).toFloat() / 65535f
-                        nextMicroPauseMs = currentTimeMs + 2000f + pseudoRand * 6000f
+                        nextMicroPauseMs = currentTimeMs + 800f + pseudoRand * 1700f
                     }
 
                     // Multi-layer modulation to prevent neural adaptation.
@@ -261,6 +296,7 @@ class EnvelopeProcessor {
                     value = 0f
                     state = EnvelopeState.Idle
                     magnitude = 0f
+                    silenceEvent = true
                 } else {
                     val progress = (elapsed / releaseMs).coerceIn(0f, 1f)
                     val releaseFactor = applyCurve(1f - progress, releaseCurve)
@@ -270,19 +306,25 @@ class EnvelopeProcessor {
                         value = 0f
                         state = EnvelopeState.Idle
                         magnitude = 0f
+                        // Pluck/boom true-rest: hard-snap past slew so troughs empty.
+                        silenceEvent = true
                     }
                 }
             }
 
             EnvelopeState.Idle -> {
                 value = (value * 0.95f).coerceAtLeast(0f) // Gentle fade
-                if (value < 0.001f) value = 0f
+                if (value < 0.001f) {
+                    value = 0f
+                    silenceEvent = true
+                }
                 magnitude = 0f
             }
         }
 
-        // Apply magnitude scaling
-        return (value * magnitude).coerceIn(0f, 1f)
+        // Magnitude scales body level; attackTarget overshoot may exceed 1.0.
+        // Cap at 1.20 so Auto-Lock binary headroom becomes real punch.
+        return (value * magnitude).coerceIn(0f, 1.20f)
     }
 
     /**
@@ -347,9 +389,10 @@ class EnvelopeProcessor {
         val isOnsetTrigger = isOnset && onsetStrength > 1.05f &&
                 gateOpen && state != EnvelopeState.Attack
 
-        // Continuous (pad/organ) re-arm only — never for boom/pluck paths.
-        // Idle→trigger on residual gate-open was gluing Domi at permanent hum.
-        val continuousHold = sustainLevel > PLUCK_SUSTAIN &&
+        // Continuous (pad/organ) re-arm only — use centroid-adjusted sustain
+        // (same threshold enterPostDecay uses) so near-boundary pads do not
+        // Idle-retrigger stutter. Never for boom/pluck paths (Domi hang fix).
+        val continuousHold = adjSustainLevel > PLUCK_SUSTAIN &&
                 (triggerMode == TriggerMode.Dynamic ||
                     (triggerMode == TriggerMode.Hybrid && hybridBlend < 0.45f))
 
@@ -372,7 +415,7 @@ class EnvelopeProcessor {
         if (gateOpen && state == EnvelopeState.Sustain &&
             (triggerMode == TriggerMode.Dynamic || triggerMode == TriggerMode.Hybrid)
         ) {
-            updateMagnitude(mag)
+            updateMagnitude(mag, currentTimeMs)
         }
 
         lastGateOpen = gateOpen
@@ -395,8 +438,12 @@ class EnvelopeProcessor {
         value = 0f
         magnitude = 0f
         attackTarget = 1f
-        microPauseFrames = 0
+        lastTriggerTimeMs = 0f
+        lastTriggerVelocity = 0f
+        microPauseUntilMs = 0f
         nextMicroPauseMs = 0f
+        silenceEvent = false
+        lastMagUpdateMs = 0f
     }
 }
 

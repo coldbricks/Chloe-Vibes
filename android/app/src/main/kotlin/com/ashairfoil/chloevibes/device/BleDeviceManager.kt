@@ -72,15 +72,21 @@ class BleDeviceManager(private val context: Context) {
 
     // BLE write gating -- Lovense devices drop commands if sent too fast.
     // We wait for the onCharacteristicWrite callback before sending the next.
+    // Stops/true-zeros bypass the interval so rest troughs are not delayed
+    // behind a stale peak packet still in flight.
     @Volatile private var writeInFlight = false
     private var pendingCommand: String? = null
     private val writeLock = Object()
     private var lastWriteMs: Long = 0
-    private val minWriteIntervalMs = 30L  // ~33Hz command rate
+    private val minWriteIntervalMs = 28L  // ~36Hz steady-state; stops may go faster
+    private val stopWriteIntervalMs = 12L // allow rest to win over peak backlog
     private val writeTimeoutMs = 120L
     private var pendingDrainScheduled = false
     private var writeWatchdogScheduled = false
-    private val peakHoldMs = 55L
+    // Peak hold only preserves punch transients — long holds filled Domi
+    // rest troughs. WAVE-002: ~20–25 ms; large down-steps bypass entirely.
+    private val peakHoldMs = 22L
+    private val peakHoldDropBypassSteps = 3
 
     // Output dithering -- temporal sub-step resolution.
     // Lovense has 21 intensity levels (0-20). By dithering between adjacent
@@ -268,11 +274,23 @@ class BleDeviceManager(private val context: Context) {
         // same guard — the user may have started a scan mid-backoff.
         stopScan()
         resetWriteState()
+        // Fresh session: dual + feel defaults until DeviceType confirms.
+        // Stale rest/gamma from a prior toy must not leak across reconnect.
+        isDualMotor = false
+        applyMotorFeel(LovenseProtocol.MotorFeel.Generic)
         closeGatt()
         val device = bluetoothAdapter?.getRemoteDevice(address) ?: return false
         Log.d("ChloeVibes", "BLE connecting to device: $address")
         connectionState = ConnectionState.Connecting
         onConnectionStateChanged?.invoke(connectionState)
+        // Provisional curves from advertised name so the first hits after
+        // Ready feel right before DeviceType reply lands.
+        val provisionalName = device.name
+            ?: discoveredDevices[address]?.name
+        if (provisionalName != null) {
+            applyMotorFeel(LovenseProtocol.MotorFeel.fromAdvertisedName(provisionalName))
+            Log.d("ChloeVibes", "Provisional motor feel from name='$provisionalName' rest=$motorRestFloor gamma=$motorFeelGamma")
+        }
 
         gatt = device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
         return gatt != null
@@ -295,12 +313,16 @@ class BleDeviceManager(private val context: Context) {
         userRequestedDisconnect = true
         lastConnectAddress = null
         handler.removeCallbacks(reconnectRunnable)
+        // Best-effort zero before tearing the link so the toy does not keep
+        // spinning on the last intensity after we drop GATT.
+        try { stopMotors() } catch (_: Exception) { }
         closeGatt()
         resetWriteState()
         connectionState = ConnectionState.Disconnected
         connectedDeviceName = null
         batteryLevel = -1
         isDualMotor = false
+        applyMotorFeel(LovenseProtocol.MotorFeel.Generic)
         onConnectionStateChanged?.invoke(connectionState)
     }
 
@@ -367,6 +389,11 @@ class BleDeviceManager(private val context: Context) {
                     Log.d("ChloeVibes", "BLE connected to: ${gatt.device.name ?: gatt.device.address}")
                     connectionState = ConnectionState.Connected
                     connectedDeviceName = gatt.device.name
+                    // Refresh provisional feel once the stack exposes the name
+                    // (often null at connectInternal time).
+                    gatt.device.name?.let { name ->
+                        applyMotorFeel(LovenseProtocol.MotorFeel.fromAdvertisedName(name))
+                    }
                     // Dual-motor capability is detected from the DeviceType
                     // response once services are ready (see parseLovenseResponse).
                     // Lovense advertises as "LVS-XXXX", so the model name is never
@@ -536,6 +563,8 @@ class BleDeviceManager(private val context: Context) {
             return false
         }
         val g = gatt ?: return false
+        val isStop = LovenseProtocol.isStopCommand(command)
+        val intervalMs = if (isStop) stopWriteIntervalMs else minWriteIntervalMs
 
         var shouldWrite = false
         var queueBecauseInFlight = false
@@ -552,13 +581,16 @@ class BleDeviceManager(private val context: Context) {
             }
 
             if (writeInFlight) {
+                // Latest intensity always wins (including kick after a queued
+                // stop). Stop commands still use a shorter interval so rest
+                // is not delayed behind a peak that just left the radio.
                 pendingCommand = command
                 queueBecauseInFlight = true
             } else {
                 val sinceLast = now - lastWriteMs
-                if (sinceLast < minWriteIntervalMs) {
+                if (sinceLast < intervalMs) {
                     pendingCommand = command
-                    pendingDelayMs = minWriteIntervalMs - sinceLast
+                    pendingDelayMs = intervalMs - sinceLast
                 } else {
                     writeInFlight = true
                     lastWriteMs = now
@@ -587,7 +619,7 @@ class BleDeviceManager(private val context: Context) {
                 BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
             }
         val started = g.writeCharacteristic(characteristic)
-        if (!command.startsWith("Vibrate")) {
+        if (!command.startsWith("Vibrate") || isStop) {
             Log.d("ChloeVibes", "TX '$command' started=$started wt=${characteristic.writeType}")
         }
         if (!started) {
@@ -595,7 +627,7 @@ class BleDeviceManager(private val context: Context) {
                 writeInFlight = false
                 pendingCommand = command
             }
-            schedulePendingDrain(minWriteIntervalMs)
+            schedulePendingDrain(intervalMs)
         } else {
             scheduleWriteWatchdog()
         }
@@ -690,12 +722,19 @@ class BleDeviceManager(private val context: Context) {
     // Device-class feel: linear 0–1 → ERM is not equal body sensation.
     // Wands (Domi) crush softs and hang above rest; compact toys need a
     // higher rest floor. Goal: music on genitals — punch + true quiet.
-    @Volatile private var motorRestFloor: Float = 0.02f
-    @Volatile private var motorFeelGamma: Float = 1.4f
+    // Defaults match LovenseProtocol.MotorFeel.Generic (gui.rs lockstep).
+    @Volatile private var motorRestFloor: Float = LovenseProtocol.MotorFeel.Generic.restFloor
+    @Volatile private var motorFeelGamma: Float = LovenseProtocol.MotorFeel.Generic.feelGamma
+
+    private fun applyMotorFeel(feel: LovenseProtocol.MotorFeel) {
+        motorRestFloor = feel.restFloor
+        motorFeelGamma = feel.feelGamma
+    }
 
     /**
      * Map pipeline level through device rest-floor + power curve before
-     * Domi-style 0–20 quantization.
+     * Domi-style 0–20 quantization. True-zero below rest; gamma keeps softs
+     * quiet so residual energy cannot re-arm a Domi hum.
      */
     private fun shapeForMotor(level: Float): Float {
         val x = level.coerceIn(0f, 1f)
@@ -776,7 +815,11 @@ class BleDeviceManager(private val context: Context) {
         }
     }
 
-    /** Stop all motors immediately, bypassing peak hold and duplicate suppression. */
+    /**
+     * Stop all motors immediately, bypassing peak hold and duplicate suppression.
+     * Stop commands replace any pending vibrate so a safety path cannot be
+     * overwritten by a stale intensity still sitting in the write queue.
+     */
     fun stopMotors() {
         ditherErrorMain = 0f
         ditherErrorMotor1 = 0f
@@ -790,42 +833,64 @@ class BleDeviceManager(private val context: Context) {
         lastRequestedMainLevel = -1
         lastRequestedMotor1Level = -1
         lastRequestedMotor2Level = -1
-        if (connectionState == ConnectionState.Ready) {
-            sendCommand(LovenseProtocol.stop())
+        val stopCmd = LovenseProtocol.stop()
+        // Coalesce the queue to stop before attempting the live write so an
+        // in-flight vibrate completion cannot flush a later intensity first.
+        synchronized(writeLock) {
+            pendingCommand = stopCmd
         }
+        if (connectionState == ConnectionState.Ready) {
+            sendCommand(stopCmd)
+        }
+    }
+
+    /**
+     * Brief peak hold for punch, with honesty rules:
+     * - level 0 always passes (true-zero rest / silence-class)
+     * - large downward steps (≥ peakHoldDropBypassSteps) bypass hold so
+     *   boom troughs are not filled by a 55 ms residual peak
+     */
+    private fun holdPeak(level: Int, heldLevel: Int, heldUntilMs: Long): Triple<Int, Int, Long> {
+        if (level <= 0) {
+            return Triple(0, 0, 0L)
+        }
+        val now = System.currentTimeMillis()
+        // Large drop toward rest: do not keep the old peak alive.
+        if (heldLevel - level >= peakHoldDropBypassSteps) {
+            return Triple(level, level, 0L)
+        }
+        var newHeld = heldLevel
+        var newUntil = heldUntilMs
+        if (level > heldLevel) {
+            newHeld = level
+            newUntil = now + peakHoldMs
+        } else if (now > heldUntilMs) {
+            newHeld = level
+            newUntil = 0L
+        }
+        val out = if (now <= newUntil) newHeld.coerceAtLeast(level) else level
+        return Triple(out, newHeld, newUntil)
     }
 
     private fun holdMainPeak(level: Int): Int {
-        val now = System.currentTimeMillis()
-        if (level > heldMainLevel) {
-            heldMainLevel = level
-            heldMainUntilMs = now + peakHoldMs
-        } else if (now > heldMainUntilMs) {
-            heldMainLevel = level
-        }
-        return if (now <= heldMainUntilMs) heldMainLevel.coerceAtLeast(level) else level
+        val (out, held, until) = holdPeak(level, heldMainLevel, heldMainUntilMs)
+        heldMainLevel = held
+        heldMainUntilMs = until
+        return out
     }
 
     private fun holdMotor1Peak(level: Int): Int {
-        val now = System.currentTimeMillis()
-        if (level > heldMotor1Level) {
-            heldMotor1Level = level
-            heldMotor1UntilMs = now + peakHoldMs
-        } else if (now > heldMotor1UntilMs) {
-            heldMotor1Level = level
-        }
-        return if (now <= heldMotor1UntilMs) heldMotor1Level.coerceAtLeast(level) else level
+        val (out, held, until) = holdPeak(level, heldMotor1Level, heldMotor1UntilMs)
+        heldMotor1Level = held
+        heldMotor1UntilMs = until
+        return out
     }
 
     private fun holdMotor2Peak(level: Int): Int {
-        val now = System.currentTimeMillis()
-        if (level > heldMotor2Level) {
-            heldMotor2Level = level
-            heldMotor2UntilMs = now + peakHoldMs
-        } else if (now > heldMotor2UntilMs) {
-            heldMotor2Level = level
-        }
-        return if (now <= heldMotor2UntilMs) heldMotor2Level.coerceAtLeast(level) else level
+        val (out, held, until) = holdPeak(level, heldMotor2Level, heldMotor2UntilMs)
+        heldMotor2Level = held
+        heldMotor2UntilMs = until
+        return out
     }
 
     /** Request battery level update. */
@@ -883,29 +948,13 @@ class BleDeviceManager(private val context: Context) {
     private fun applyDeviceType(identifier: String) {
         val dual = identifier in DUAL_VIBRATE_IDENTIFIERS
         isDualMotor = dual
-        // Feel profiles by Lovense DeviceType code (protocol research).
-        // W = Domi/wand ERM; S = Lush; P = Edge; ED = Gush; Z = Hush; ...
-        when (identifier) {
-            "W", "H" -> { // Domi / wand-class
-                motorRestFloor = 0.018f
-                motorFeelGamma = 1.55f
-            }
-            "P", "J", "N", "OC" -> { // Edge / dual-body class
-                motorRestFloor = 0.022f
-                motorFeelGamma = 1.45f
-            }
-            "S", "ED", "Z", "B", "C", "EA" -> { // Lush / Gush / Hush / compact
-                motorRestFloor = 0.028f
-                motorFeelGamma = 1.35f
-            }
-            else -> {
-                motorRestFloor = 0.02f
-                motorFeelGamma = 1.4f
-            }
-        }
+        // Feel profiles by Lovense DeviceType code — lockstep with desktop
+        // MotorKind / LovenseProtocol.MotorFeel (Nora A/C = DualBody).
+        val feel = LovenseProtocol.MotorFeel.fromDeviceTypeId(identifier)
+        applyMotorFeel(feel)
         Log.d(
             "ChloeVibes",
-            "Lovense DeviceType id=$identifier dualMotor=$dual rest=$motorRestFloor gamma=$motorFeelGamma"
+            "Lovense DeviceType id=$identifier dualMotor=$dual feel=$feel rest=$motorRestFloor gamma=$motorFeelGamma"
         )
     }
 }

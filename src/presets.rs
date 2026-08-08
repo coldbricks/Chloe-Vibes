@@ -36,6 +36,10 @@ pub struct Preset {
     pub trigger_mode: TriggerMode,
     pub binary_level: f32,
     pub hybrid_blend: f32,
+    /// Soft-knee width around gate threshold (Bass Drum default 0.15).
+    pub threshold_knee: f32,
+    /// Dynamic trigger response curve (Bass Drum default 1.2).
+    pub dynamic_curve: f32,
 
     // ADSR Envelope
     pub attack_ms: f32,
@@ -49,6 +53,8 @@ pub struct Preset {
     // Output Range
     pub min_vibe: f32,
     pub max_vibe: f32,
+    /// Output slew fall time (ms). Boom path uses ~42 ms for deep troughs.
+    pub output_slew_ms: f32,
 
     // Climax Engine (defaults = off with neutral settings)
     pub climax_enabled: bool,
@@ -120,6 +126,8 @@ pub fn factory_presets() -> Vec<Preset> {
             trigger_mode: TriggerMode::Hybrid,
             binary_level: 0.82,
             hybrid_blend: 0.58,
+            threshold_knee: 0.15,
+            dynamic_curve: 1.2,
             attack_ms: 20.0,
             decay_ms: 375.0,
             sustain_level: 0.08,
@@ -129,6 +137,7 @@ pub fn factory_presets() -> Vec<Preset> {
             release_curve: 1.3,
             min_vibe: 0.0,
             max_vibe: 1.0,
+            output_slew_ms: 42.0,
             climax_enabled: false,
             climax_intensity: 0.7,
             climax_build_up_ms: 90_000.0,
@@ -151,6 +160,8 @@ pub fn factory_presets() -> Vec<Preset> {
             trigger_mode: TriggerMode::Dynamic,
             binary_level: 0.8,
             hybrid_blend: 0.5,
+            threshold_knee: 0.15,
+            dynamic_curve: 1.2,
             attack_ms: 30.0,
             decay_ms: 160.0,
             sustain_level: 0.9,
@@ -160,6 +171,7 @@ pub fn factory_presets() -> Vec<Preset> {
             release_curve: 1.15,
             min_vibe: 0.0,
             max_vibe: 1.0,
+            output_slew_ms: 42.0,
             climax_enabled: false,
             climax_intensity: 0.7,
             climax_build_up_ms: 90_000.0,
@@ -182,6 +194,8 @@ pub fn factory_presets() -> Vec<Preset> {
             trigger_mode: TriggerMode::Dynamic,
             binary_level: 0.8,
             hybrid_blend: 0.5,
+            threshold_knee: 0.15,
+            dynamic_curve: 1.2,
             attack_ms: 1.0,
             decay_ms: 10.0,
             sustain_level: 0.9,
@@ -191,6 +205,7 @@ pub fn factory_presets() -> Vec<Preset> {
             release_curve: 1.0,
             min_vibe: 0.0,
             max_vibe: 1.0,
+            output_slew_ms: 42.0,
             climax_enabled: false,
             climax_intensity: 0.7,
             climax_build_up_ms: 90_000.0,
@@ -216,6 +231,8 @@ pub fn factory_presets() -> Vec<Preset> {
             trigger_mode: TriggerMode::Hybrid,
             binary_level: 0.88,
             hybrid_blend: 0.62,
+            threshold_knee: 0.15,
+            dynamic_curve: 1.2,
             attack_ms: 20.0,
             decay_ms: 335.0,
             sustain_level: 0.08,
@@ -225,6 +242,7 @@ pub fn factory_presets() -> Vec<Preset> {
             release_curve: 1.35,
             min_vibe: 0.0,
             max_vibe: 1.0,
+            output_slew_ms: 42.0,
             climax_enabled: false,
             climax_intensity: 0.7,
             climax_build_up_ms: 90_000.0,
@@ -247,6 +265,8 @@ pub fn factory_presets() -> Vec<Preset> {
             trigger_mode: TriggerMode::Hybrid,
             binary_level: 0.90,
             hybrid_blend: 0.72,
+            threshold_knee: 0.15,
+            dynamic_curve: 1.2,
             attack_ms: 20.0,
             decay_ms: 375.0,
             sustain_level: 0.06,
@@ -256,6 +276,7 @@ pub fn factory_presets() -> Vec<Preset> {
             release_curve: 1.4,
             min_vibe: 0.0,
             max_vibe: 1.0,
+            output_slew_ms: 42.0,
             climax_enabled: false,
             climax_intensity: 0.7,
             climax_build_up_ms: 90_000.0,
@@ -278,6 +299,8 @@ pub fn factory_presets() -> Vec<Preset> {
             trigger_mode: TriggerMode::Binary,
             binary_level: 1.0,
             hybrid_blend: 0.5,
+            threshold_knee: 0.15,
+            dynamic_curve: 1.2,
             attack_ms: 0.5,
             decay_ms: 5.0,
             sustain_level: 0.95,
@@ -287,6 +310,7 @@ pub fn factory_presets() -> Vec<Preset> {
             release_curve: 3.0,
             min_vibe: 0.0,
             max_vibe: 1.0,
+            output_slew_ms: 42.0,
             climax_enabled: false,
             climax_intensity: 0.7,
             climax_build_up_ms: 90_000.0,
@@ -310,6 +334,8 @@ pub fn factory_presets() -> Vec<Preset> {
             trigger_mode: TriggerMode::Dynamic,
             binary_level: 0.8,
             hybrid_blend: 0.5,
+            threshold_knee: 0.15,
+            dynamic_curve: 1.2,
             attack_ms: 200.0,
             decay_ms: 100.0,
             sustain_level: 0.85,
@@ -319,6 +345,7 @@ pub fn factory_presets() -> Vec<Preset> {
             release_curve: 1.5,
             min_vibe: 0.05,
             max_vibe: 0.85,
+            output_slew_ms: 42.0,
             climax_enabled: false,
             climax_intensity: 0.7,
             climax_build_up_ms: 90_000.0,
@@ -341,6 +368,8 @@ pub fn factory_presets() -> Vec<Preset> {
             trigger_mode: TriggerMode::Hybrid,
             binary_level: 0.5,
             hybrid_blend: 0.3,
+            threshold_knee: 0.15,
+            dynamic_curve: 1.2,
             attack_ms: 15.0,
             decay_ms: 60.0,
             sustain_level: 0.7,
@@ -350,6 +379,7 @@ pub fn factory_presets() -> Vec<Preset> {
             release_curve: 1.8,
             min_vibe: 0.05,
             max_vibe: 0.9,
+            output_slew_ms: 42.0,
             climax_enabled: false,
             climax_intensity: 0.7,
             climax_build_up_ms: 90_000.0,
@@ -372,6 +402,8 @@ pub fn factory_presets() -> Vec<Preset> {
             trigger_mode: TriggerMode::Dynamic,
             binary_level: 0.8,
             hybrid_blend: 0.5,
+            threshold_knee: 0.15,
+            dynamic_curve: 1.2,
             attack_ms: 2.0,
             decay_ms: 120.0,
             sustain_level: 0.3,
@@ -381,6 +413,7 @@ pub fn factory_presets() -> Vec<Preset> {
             release_curve: 2.5,
             min_vibe: 0.0,
             max_vibe: 1.0,
+            output_slew_ms: 42.0,
             climax_enabled: false,
             climax_intensity: 0.7,
             climax_build_up_ms: 90_000.0,
@@ -404,6 +437,8 @@ pub fn factory_presets() -> Vec<Preset> {
             trigger_mode: TriggerMode::Dynamic,
             binary_level: 0.8,
             hybrid_blend: 0.5,
+            threshold_knee: 0.15,
+            dynamic_curve: 1.2,
             attack_ms: 8.0,
             decay_ms: 150.0,
             sustain_level: 0.75,
@@ -413,6 +448,7 @@ pub fn factory_presets() -> Vec<Preset> {
             release_curve: 1.5,
             min_vibe: 0.1,
             max_vibe: 1.0,
+            output_slew_ms: 42.0,
             climax_enabled: false,
             climax_intensity: 0.7,
             climax_build_up_ms: 90_000.0,
@@ -435,6 +471,8 @@ pub fn factory_presets() -> Vec<Preset> {
             trigger_mode: TriggerMode::Hybrid,
             binary_level: 0.85,
             hybrid_blend: 0.6,
+            threshold_knee: 0.15,
+            dynamic_curve: 1.2,
             attack_ms: 3.0,
             decay_ms: 60.0,
             sustain_level: 0.5,
@@ -444,6 +482,7 @@ pub fn factory_presets() -> Vec<Preset> {
             release_curve: 2.0,
             min_vibe: 0.0,
             max_vibe: 1.0,
+            output_slew_ms: 42.0,
             climax_enabled: false,
             climax_intensity: 0.7,
             climax_build_up_ms: 90_000.0,
@@ -467,6 +506,8 @@ pub fn factory_presets() -> Vec<Preset> {
             trigger_mode: TriggerMode::Dynamic,
             binary_level: 0.8,
             hybrid_blend: 0.5,
+            threshold_knee: 0.15,
+            dynamic_curve: 1.2,
             attack_ms: 300.0,
             decay_ms: 200.0,
             sustain_level: 0.9,
@@ -476,6 +517,7 @@ pub fn factory_presets() -> Vec<Preset> {
             release_curve: 1.0,
             min_vibe: 0.15,
             max_vibe: 0.6,
+            output_slew_ms: 42.0,
             climax_enabled: false,
             climax_intensity: 0.7,
             climax_build_up_ms: 90_000.0,
@@ -498,6 +540,8 @@ pub fn factory_presets() -> Vec<Preset> {
             trigger_mode: TriggerMode::Binary,
             binary_level: 0.7,
             hybrid_blend: 0.5,
+            threshold_knee: 0.15,
+            dynamic_curve: 1.2,
             attack_ms: 10.0,
             decay_ms: 50.0,
             sustain_level: 0.6,
@@ -507,6 +551,7 @@ pub fn factory_presets() -> Vec<Preset> {
             release_curve: 2.5,
             min_vibe: 0.0,
             max_vibe: 0.75,
+            output_slew_ms: 42.0,
             climax_enabled: false,
             climax_intensity: 0.7,
             climax_build_up_ms: 90_000.0,
@@ -529,6 +574,8 @@ pub fn factory_presets() -> Vec<Preset> {
             trigger_mode: TriggerMode::Dynamic,
             binary_level: 0.8,
             hybrid_blend: 0.5,
+            threshold_knee: 0.15,
+            dynamic_curve: 1.2,
             attack_ms: 1.0,
             decay_ms: 25.0,
             sustain_level: 0.15,
@@ -538,6 +585,7 @@ pub fn factory_presets() -> Vec<Preset> {
             release_curve: 3.0,
             min_vibe: 0.0,
             max_vibe: 0.7,
+            output_slew_ms: 42.0,
             climax_enabled: false,
             climax_intensity: 0.7,
             climax_build_up_ms: 90_000.0,
@@ -561,6 +609,8 @@ pub fn factory_presets() -> Vec<Preset> {
             trigger_mode: TriggerMode::Hybrid,
             binary_level: 0.84,
             hybrid_blend: 0.58,
+            threshold_knee: 0.15,
+            dynamic_curve: 1.2,
             attack_ms: 20.0,
             decay_ms: 375.0,
             sustain_level: 0.08,
@@ -570,6 +620,7 @@ pub fn factory_presets() -> Vec<Preset> {
             release_curve: 1.3,
             min_vibe: 0.0,
             max_vibe: 1.0,
+            output_slew_ms: 42.0,
             climax_enabled: false,
             climax_intensity: 0.7,
             climax_build_up_ms: 90_000.0,
@@ -592,6 +643,8 @@ pub fn factory_presets() -> Vec<Preset> {
             trigger_mode: TriggerMode::Dynamic,
             binary_level: 0.8,
             hybrid_blend: 0.5,
+            threshold_knee: 0.15,
+            dynamic_curve: 1.2,
             attack_ms: 12.0,
             decay_ms: 110.0,
             sustain_level: 0.78,
@@ -601,6 +654,7 @@ pub fn factory_presets() -> Vec<Preset> {
             release_curve: 1.4,
             min_vibe: 0.06,
             max_vibe: 0.92,
+            output_slew_ms: 42.0,
             climax_enabled: false,
             climax_intensity: 0.7,
             climax_build_up_ms: 90_000.0,
@@ -623,6 +677,8 @@ pub fn factory_presets() -> Vec<Preset> {
             trigger_mode: TriggerMode::Hybrid,
             binary_level: 0.92,
             hybrid_blend: 0.68,
+            threshold_knee: 0.15,
+            dynamic_curve: 1.2,
             attack_ms: 20.0,
             decay_ms: 400.0,
             sustain_level: 0.05,
@@ -632,6 +688,7 @@ pub fn factory_presets() -> Vec<Preset> {
             release_curve: 1.4,
             min_vibe: 0.0,
             max_vibe: 1.0,
+            output_slew_ms: 42.0,
             climax_enabled: false,
             climax_intensity: 0.7,
             climax_build_up_ms: 90_000.0,
@@ -655,6 +712,8 @@ pub fn factory_presets() -> Vec<Preset> {
             trigger_mode: TriggerMode::Dynamic,
             binary_level: 0.8,
             hybrid_blend: 0.5,
+            threshold_knee: 0.15,
+            dynamic_curve: 1.2,
             attack_ms: 15.0,
             decay_ms: 200.0,
             sustain_level: 0.82,
@@ -664,6 +723,7 @@ pub fn factory_presets() -> Vec<Preset> {
             release_curve: 1.2,
             min_vibe: 0.12,
             max_vibe: 1.0,
+            output_slew_ms: 42.0,
             climax_enabled: false,
             climax_intensity: 0.7,
             climax_build_up_ms: 90_000.0,
@@ -674,35 +734,40 @@ pub fn factory_presets() -> Vec<Preset> {
             climax_pattern: ClimaxPattern::Wave,
         },
         Preset {
+            // Product edge path: climax ON. Stairs escalates; deep tease + true-zero
+            // floor so deny lands as silence, not a soft plateau. Pulse kept motor-honest.
             name: "Edge & Deny",
-            description: "Builds intensity then deliberately pulls back — designed to delay and intensify",
+            description: "Session arc — stepped build, hard deny to near-silence, aching rebuild; edges without flat-max numbness",
             category: PresetCategory::Effect,
-            main_volume: 1.6,
+            main_volume: 1.55,
             frequency_mode: FrequencyMode::Full,
             target_frequency: 200.0,
             gate_threshold: 0.08,
             auto_gate_amount: 0.0,
-            gate_smoothing: 0.10,
+            gate_smoothing: 0.12,
             trigger_mode: TriggerMode::Dynamic,
-            binary_level: 0.8,
-            hybrid_blend: 0.5,
-            attack_ms: 20.0,
-            decay_ms: 100.0,
-            sustain_level: 0.85,
-            release_ms: 350.0,
-            attack_curve: 0.6,
-            decay_curve: 1.0,
-            release_curve: 1.3,
-            min_vibe: 0.08,
-            max_vibe: 0.95,
-            climax_enabled: false,
-            climax_intensity: 0.7,
-            climax_build_up_ms: 90_000.0,
-            climax_tease_ratio: 0.18,
-            climax_tease_drop: 0.35,
-            climax_surge_boost: 0.5,
-            climax_pulse_depth: 0.18,
-            climax_pattern: ClimaxPattern::Wave,
+            binary_level: 0.78,
+            hybrid_blend: 0.45,
+            threshold_knee: 0.15,
+            dynamic_curve: 1.15,
+            attack_ms: 22.0,
+            decay_ms: 120.0,
+            sustain_level: 0.78,
+            release_ms: 380.0,
+            attack_curve: 0.55,
+            decay_curve: 1.05,
+            release_curve: 1.35,
+            min_vibe: 0.0,
+            max_vibe: 0.92,
+            output_slew_ms: 42.0,
+            climax_enabled: true,
+            climax_intensity: 0.82,
+            climax_build_up_ms: 100_000.0,
+            climax_tease_ratio: 0.28,
+            climax_tease_drop: 0.72,
+            climax_surge_boost: 0.55,
+            climax_pulse_depth: 0.12,
+            climax_pattern: ClimaxPattern::Stairs,
         },
         Preset {
             name: "Slow Burn",
@@ -717,6 +782,8 @@ pub fn factory_presets() -> Vec<Preset> {
             trigger_mode: TriggerMode::Dynamic,
             binary_level: 0.8,
             hybrid_blend: 0.5,
+            threshold_knee: 0.15,
+            dynamic_curve: 1.2,
             attack_ms: 50.0,
             decay_ms: 300.0,
             sustain_level: 0.90,
@@ -726,6 +793,7 @@ pub fn factory_presets() -> Vec<Preset> {
             release_curve: 1.0,
             min_vibe: 0.05,
             max_vibe: 0.80,
+            output_slew_ms: 42.0,
             climax_enabled: false,
             climax_intensity: 0.7,
             climax_build_up_ms: 90_000.0,
@@ -748,6 +816,8 @@ pub fn factory_presets() -> Vec<Preset> {
             trigger_mode: TriggerMode::Hybrid,
             binary_level: 0.75,
             hybrid_blend: 0.35,
+            threshold_knee: 0.15,
+            dynamic_curve: 1.2,
             attack_ms: 3.0,
             decay_ms: 80.0,
             sustain_level: 0.55,
@@ -757,6 +827,7 @@ pub fn factory_presets() -> Vec<Preset> {
             release_curve: 2.0,
             min_vibe: 0.0,
             max_vibe: 1.0,
+            output_slew_ms: 42.0,
             climax_enabled: false,
             climax_intensity: 0.7,
             climax_build_up_ms: 90_000.0,
@@ -767,34 +838,38 @@ pub fn factory_presets() -> Vec<Preset> {
             climax_pattern: ClimaxPattern::Wave,
         },
         Preset {
+            // Honest name: climax engine drives the long musical arc.
             name: "Crescendo",
-            description: "Designed for the climax engine — builds relentlessly with musical dynamics",
+            description: "Climax-driven musical arc — slow Wave build, soft early tease, late surge; contrast floor stays low",
             category: PresetCategory::Musical,
-            main_volume: 1.3,
+            main_volume: 1.35,
             frequency_mode: FrequencyMode::Full,
             target_frequency: 200.0,
             gate_threshold: 0.07,
             auto_gate_amount: 0.0,
-            gate_smoothing: 0.18,
+            gate_smoothing: 0.16,
             trigger_mode: TriggerMode::Dynamic,
             binary_level: 0.8,
             hybrid_blend: 0.5,
-            attack_ms: 25.0,
-            decay_ms: 150.0,
-            sustain_level: 0.88,
-            release_ms: 450.0,
+            threshold_knee: 0.15,
+            dynamic_curve: 1.15,
+            attack_ms: 28.0,
+            decay_ms: 160.0,
+            sustain_level: 0.82,
+            release_ms: 480.0,
             attack_curve: 0.5,
             decay_curve: 0.9,
-            release_curve: 1.2,
-            min_vibe: 0.10,
-            max_vibe: 0.95,
-            climax_enabled: false,
-            climax_intensity: 0.7,
-            climax_build_up_ms: 90_000.0,
-            climax_tease_ratio: 0.18,
-            climax_tease_drop: 0.35,
-            climax_surge_boost: 0.5,
-            climax_pulse_depth: 0.18,
+            release_curve: 1.25,
+            min_vibe: 0.04,
+            max_vibe: 0.94,
+            output_slew_ms: 48.0,
+            climax_enabled: true,
+            climax_intensity: 0.78,
+            climax_build_up_ms: 110_000.0,
+            climax_tease_ratio: 0.16,
+            climax_tease_drop: 0.42,
+            climax_surge_boost: 0.85,
+            climax_pulse_depth: 0.14,
             climax_pattern: ClimaxPattern::Wave,
         },
         // === NEW INTENSITY PRESETS ===
@@ -811,6 +886,8 @@ pub fn factory_presets() -> Vec<Preset> {
             trigger_mode: TriggerMode::Hybrid,
             binary_level: 0.95,
             hybrid_blend: 0.40,
+            threshold_knee: 0.15,
+            dynamic_curve: 1.2,
             attack_ms: 5.0,
             decay_ms: 40.0,
             sustain_level: 0.95,
@@ -820,6 +897,7 @@ pub fn factory_presets() -> Vec<Preset> {
             release_curve: 1.1,
             min_vibe: 0.15,
             max_vibe: 1.0,
+            output_slew_ms: 42.0,
             climax_enabled: false,
             climax_intensity: 0.7,
             climax_build_up_ms: 90_000.0,
@@ -842,6 +920,8 @@ pub fn factory_presets() -> Vec<Preset> {
             trigger_mode: TriggerMode::Hybrid,
             binary_level: 1.0,
             hybrid_blend: 0.55,
+            threshold_knee: 0.15,
+            dynamic_curve: 1.2,
             attack_ms: 1.0,
             decay_ms: 45.0,
             sustain_level: 0.70,
@@ -851,6 +931,7 @@ pub fn factory_presets() -> Vec<Preset> {
             release_curve: 2.2,
             min_vibe: 0.08,
             max_vibe: 1.0,
+            output_slew_ms: 42.0,
             climax_enabled: false,
             climax_intensity: 0.7,
             climax_build_up_ms: 90_000.0,
@@ -873,6 +954,8 @@ pub fn factory_presets() -> Vec<Preset> {
             trigger_mode: TriggerMode::Dynamic,
             binary_level: 0.8,
             hybrid_blend: 0.5,
+            threshold_knee: 0.15,
+            dynamic_curve: 1.2,
             attack_ms: 10.0,
             decay_ms: 180.0,
             sustain_level: 0.88,
@@ -882,6 +965,7 @@ pub fn factory_presets() -> Vec<Preset> {
             release_curve: 1.15,
             min_vibe: 0.12,
             max_vibe: 1.0,
+            output_slew_ms: 42.0,
             climax_enabled: false,
             climax_intensity: 0.7,
             climax_build_up_ms: 90_000.0,
@@ -904,6 +988,8 @@ pub fn factory_presets() -> Vec<Preset> {
             trigger_mode: TriggerMode::Dynamic,
             binary_level: 0.9,
             hybrid_blend: 0.5,
+            threshold_knee: 0.15,
+            dynamic_curve: 1.2,
             attack_ms: 2.0,
             decay_ms: 30.0,
             sustain_level: 0.82,
@@ -913,6 +999,7 @@ pub fn factory_presets() -> Vec<Preset> {
             release_curve: 1.8,
             min_vibe: 0.05,
             max_vibe: 1.0,
+            output_slew_ms: 42.0,
             climax_enabled: false,
             climax_intensity: 0.7,
             climax_build_up_ms: 90_000.0,
@@ -935,6 +1022,8 @@ pub fn factory_presets() -> Vec<Preset> {
             trigger_mode: TriggerMode::Hybrid,
             binary_level: 0.95,
             hybrid_blend: 0.50,
+            threshold_knee: 0.15,
+            dynamic_curve: 1.2,
             attack_ms: 3.0,
             decay_ms: 50.0,
             sustain_level: 0.90,
@@ -944,6 +1033,7 @@ pub fn factory_presets() -> Vec<Preset> {
             release_curve: 1.5,
             min_vibe: 0.10,
             max_vibe: 1.0,
+            output_slew_ms: 42.0,
             climax_enabled: false,
             climax_intensity: 0.7,
             climax_build_up_ms: 90_000.0,
@@ -953,99 +1043,217 @@ pub fn factory_presets() -> Vec<Preset> {
             climax_pulse_depth: 0.18,
             climax_pattern: ClimaxPattern::Wave,
         },
-        // === EXPERIENCE PRESETS (climax engine enabled) ===
+        // === EXPERIENCE PRESETS (climax engine enabled — session arc) ===
+        // Design rules vs neural adaptation death:
+        //   - true-zero / near-zero min_vibe so deny + troughs reset nerves
+        //   - moderate sustain (not 0.9+ flat) so music still carves contrast
+        //   - pulse_depth ≤ ~0.22 (motor-expressible); deep tease for edge
+        //   - Surge presets keep tease_ratio ≤ 0.18 so terminal surge is not cancelled
         Preset {
             name: "Slow Tease",
-            description: "Long edging cycle — deep denial drops, gentle rebuilds, designed to keep you right on the edge",
+            description: "Long edging cycle — Stairs climb, deep deny to silence, slow rebuild; stays on the edge without flat-max burn",
             category: PresetCategory::Effect,
-            main_volume: 1.5,
+            main_volume: 1.45,
             frequency_mode: FrequencyMode::Full,
             target_frequency: 200.0,
             gate_threshold: 0.07,
             auto_gate_amount: 0.0,
-            gate_smoothing: 0.18,
+            gate_smoothing: 0.16,
             trigger_mode: TriggerMode::Dynamic,
-            binary_level: 0.8,
-            hybrid_blend: 0.5,
-            attack_ms: 25.0,
-            decay_ms: 140.0,
-            sustain_level: 0.88,
-            release_ms: 400.0,
+            binary_level: 0.78,
+            hybrid_blend: 0.45,
+            threshold_knee: 0.15,
+            dynamic_curve: 1.15,
+            attack_ms: 28.0,
+            decay_ms: 150.0,
+            sustain_level: 0.76,
+            release_ms: 420.0,
             attack_curve: 0.5,
-            decay_curve: 0.9,
-            release_curve: 1.2,
-            min_vibe: 0.08,
-            max_vibe: 0.92,
+            decay_curve: 0.95,
+            release_curve: 1.25,
+            min_vibe: 0.0,
+            max_vibe: 0.90,
+            output_slew_ms: 48.0,
             climax_enabled: true,
-            climax_intensity: 0.8,
-            climax_build_up_ms: 120_000.0,
+            climax_intensity: 0.78,
+            climax_build_up_ms: 150_000.0,
             climax_tease_ratio: 0.30,
-            climax_tease_drop: 0.70,
-            climax_surge_boost: 0.6,
-            climax_pulse_depth: 0.12,
-            climax_pattern: ClimaxPattern::Wave,
+            climax_tease_drop: 0.75,
+            climax_surge_boost: 0.50,
+            climax_pulse_depth: 0.10,
+            climax_pattern: ClimaxPattern::Stairs,
         },
         Preset {
             name: "Ride the Beat",
-            description: "Music-locked escalation — chaos + sub-harmonic resonance sync to the rhythm, builds across cycles",
+            description: "Music-locked escalation — hybrid punch + Surge climax; low tease so terminal peaks survive",
             category: PresetCategory::Musical,
-            main_volume: 1.7,
+            main_volume: 1.75,
             frequency_mode: FrequencyMode::Full,
             target_frequency: 200.0,
             gate_threshold: 0.10,
-            auto_gate_amount: 0.15,
-            gate_smoothing: 0.08,
+            auto_gate_amount: 0.12,
+            gate_smoothing: 0.07,
             trigger_mode: TriggerMode::Hybrid,
-            binary_level: 0.80,
-            hybrid_blend: 0.35,
-            attack_ms: 5.0,
-            decay_ms: 80.0,
-            sustain_level: 0.72,
-            release_ms: 200.0,
+            binary_level: 0.82,
+            hybrid_blend: 0.40,
+            threshold_knee: 0.15,
+            dynamic_curve: 1.2,
+            attack_ms: 8.0,
+            decay_ms: 95.0,
+            sustain_level: 0.62,
+            release_ms: 210.0,
             attack_curve: 0.35,
-            decay_curve: 1.3,
-            release_curve: 1.6,
-            min_vibe: 0.05,
+            decay_curve: 1.35,
+            release_curve: 1.55,
+            min_vibe: 0.0,
             max_vibe: 1.0,
+            output_slew_ms: 42.0,
             climax_enabled: true,
-            climax_intensity: 0.7,
-            climax_build_up_ms: 60_000.0,
-            climax_tease_ratio: 0.15,
-            climax_tease_drop: 0.35,
-            climax_surge_boost: 0.7,
-            climax_pulse_depth: 0.22,
+            climax_intensity: 0.74,
+            climax_build_up_ms: 75_000.0,
+            climax_tease_ratio: 0.12,
+            climax_tease_drop: 0.38,
+            climax_surge_boost: 0.90,
+            climax_pulse_depth: 0.16,
             climax_pattern: ClimaxPattern::Surge,
         },
         Preset {
             name: "Break Me",
-            description: "No restraint — extreme surge, aggressive deny cycles, dual motor anti-phase, maximum chaos",
+            description: "Hard climax path — fast Surge, deep deny contrast, motor-honest pulse; intensity without constant floor",
             category: PresetCategory::Effect,
-            main_volume: 2.4,
+            main_volume: 2.2,
             frequency_mode: FrequencyMode::Full,
             target_frequency: 200.0,
             gate_threshold: 0.05,
             auto_gate_amount: 0.0,
             gate_smoothing: 0.05,
             trigger_mode: TriggerMode::Hybrid,
-            binary_level: 0.95,
-            hybrid_blend: 0.45,
-            attack_ms: 2.0,
-            decay_ms: 35.0,
-            sustain_level: 0.92,
-            release_ms: 100.0,
-            attack_curve: 0.25,
-            decay_curve: 1.1,
+            binary_level: 0.92,
+            hybrid_blend: 0.48,
+            threshold_knee: 0.15,
+            dynamic_curve: 1.25,
+            attack_ms: 3.0,
+            decay_ms: 45.0,
+            sustain_level: 0.80,
+            release_ms: 120.0,
+            attack_curve: 0.28,
+            decay_curve: 1.15,
             release_curve: 1.4,
-            min_vibe: 0.12,
+            min_vibe: 0.02,
             max_vibe: 1.0,
+            output_slew_ms: 36.0,
             climax_enabled: true,
             climax_intensity: 1.0,
-            climax_build_up_ms: 45_000.0,
-            climax_tease_ratio: 0.22,
-            climax_tease_drop: 0.55,
-            climax_surge_boost: 1.2,
-            climax_pulse_depth: 0.35,
+            climax_build_up_ms: 50_000.0,
+            climax_tease_ratio: 0.16,
+            climax_tease_drop: 0.58,
+            climax_surge_boost: 1.25,
+            climax_pulse_depth: 0.22,
             climax_pattern: ClimaxPattern::Surge,
+        },
+        // === BOOM TEMPO MACROS (catalog names match desktop Deep 90 / Club 125 / Hard 140) ===
+        // Climax always off — pure bass-drum body. Same recipe as Bass Drum, tempo-scaled.
+        Preset {
+            name: "Deep 90",
+            description: "Deep 90 — slow bass-drum boom, body-long decay into silence",
+            category: PresetCategory::Bass,
+            main_volume: 1.85,
+            frequency_mode: FrequencyMode::LowPass,
+            target_frequency: 100.0,
+            gate_threshold: 0.13,
+            auto_gate_amount: 0.0,
+            gate_smoothing: 0.06,
+            trigger_mode: TriggerMode::Hybrid,
+            binary_level: 0.80,
+            hybrid_blend: 0.55,
+            threshold_knee: 0.15,
+            dynamic_curve: 1.2,
+            attack_ms: 20.0,
+            decay_ms: 520.0,
+            sustain_level: 0.08,
+            release_ms: 330.0,
+            attack_curve: 0.7,
+            decay_curve: 1.8,
+            release_curve: 1.3,
+            min_vibe: 0.0,
+            max_vibe: 1.0,
+            output_slew_ms: 55.0,
+            climax_enabled: false,
+            climax_intensity: 0.7,
+            climax_build_up_ms: 90_000.0,
+            climax_tease_ratio: 0.18,
+            climax_tease_drop: 0.35,
+            climax_surge_boost: 0.5,
+            climax_pulse_depth: 0.18,
+            climax_pattern: ClimaxPattern::Wave,
+        },
+        Preset {
+            name: "Club 125",
+            description: "Club 125 — default bass-drum boom (same shape as Bass Drum)",
+            category: PresetCategory::Bass,
+            main_volume: 1.90,
+            frequency_mode: FrequencyMode::LowPass,
+            target_frequency: 120.0,
+            gate_threshold: 0.14,
+            auto_gate_amount: 0.0,
+            gate_smoothing: 0.06,
+            trigger_mode: TriggerMode::Hybrid,
+            binary_level: 0.82,
+            hybrid_blend: 0.58,
+            threshold_knee: 0.15,
+            dynamic_curve: 1.2,
+            attack_ms: 20.0,
+            decay_ms: 375.0,
+            sustain_level: 0.08,
+            release_ms: 240.0,
+            attack_curve: 0.7,
+            decay_curve: 1.8,
+            release_curve: 1.3,
+            min_vibe: 0.0,
+            max_vibe: 1.0,
+            output_slew_ms: 42.0,
+            climax_enabled: false,
+            climax_intensity: 0.7,
+            climax_build_up_ms: 90_000.0,
+            climax_tease_ratio: 0.18,
+            climax_tease_drop: 0.35,
+            climax_surge_boost: 0.5,
+            climax_pulse_depth: 0.18,
+            climax_pattern: ClimaxPattern::Wave,
+        },
+        Preset {
+            name: "Hard 140",
+            description: "Hard 140 — harder hit, full musical boom, deep trough",
+            category: PresetCategory::Bass,
+            main_volume: 2.15,
+            frequency_mode: FrequencyMode::LowPass,
+            target_frequency: 120.0,
+            gate_threshold: 0.16,
+            auto_gate_amount: 0.0,
+            gate_smoothing: 0.06,
+            trigger_mode: TriggerMode::Hybrid,
+            binary_level: 0.90,
+            hybrid_blend: 0.68,
+            threshold_knee: 0.15,
+            dynamic_curve: 1.2,
+            attack_ms: 20.0,
+            decay_ms: 335.0,
+            sustain_level: 0.06,
+            release_ms: 210.0,
+            attack_curve: 0.7,
+            decay_curve: 1.9,
+            release_curve: 1.3,
+            min_vibe: 0.0,
+            max_vibe: 1.0,
+            output_slew_ms: 42.0,
+            climax_enabled: false,
+            climax_intensity: 0.7,
+            climax_build_up_ms: 90_000.0,
+            climax_tease_ratio: 0.18,
+            climax_tease_drop: 0.35,
+            climax_surge_boost: 0.5,
+            climax_pulse_depth: 0.18,
+            climax_pattern: ClimaxPattern::Wave,
         },
     ]
 }
@@ -1057,11 +1265,21 @@ fn cached_presets() -> &'static [Preset] {
     PRESETS.get_or_init(factory_presets)
 }
 
-/// Get a preset by name (case-insensitive)
+/// Get a preset by name (case-insensitive).
+/// Migrates legacy Chloe tempo macro names → Deep 90 / Club 125 / Hard 140.
 pub fn find_preset(name: &str) -> Option<Preset> {
+    let resolved = if name.eq_ignore_ascii_case("Chloe Loose") {
+        "Deep 90"
+    } else if name.eq_ignore_ascii_case("Chloe Medium") {
+        "Club 125"
+    } else if name.eq_ignore_ascii_case("Chloe Ultimate") {
+        "Hard 140"
+    } else {
+        name
+    };
     cached_presets()
         .iter()
-        .find(|p| p.name.eq_ignore_ascii_case(name))
+        .find(|p| p.name.eq_ignore_ascii_case(resolved))
         .cloned()
 }
 
@@ -1072,4 +1290,93 @@ pub fn presets_in_category(category: PresetCategory) -> Vec<Preset> {
         .filter(|p| p.category == category)
         .cloned()
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio::{ClimaxPattern, FrequencyMode, TriggerMode};
+
+    #[test]
+    fn bass_drum_is_boom_king() {
+        let p = find_preset("Bass Drum").expect("Bass Drum");
+        assert!(!p.climax_enabled);
+        assert_eq!(p.frequency_mode, FrequencyMode::LowPass);
+        assert_eq!(p.trigger_mode, TriggerMode::Hybrid);
+        assert!((p.target_frequency - 120.0).abs() < 1e-3);
+        assert!((p.decay_ms - 375.0).abs() < 1e-3);
+        assert!((p.sustain_level - 0.08).abs() < 1e-3);
+        assert!((p.min_vibe - 0.0).abs() < 1e-3);
+        assert!((p.output_slew_ms - 42.0).abs() < 1e-3);
+        assert!((p.threshold_knee - 0.15).abs() < 1e-3);
+        assert!((p.dynamic_curve - 1.2).abs() < 1e-3);
+    }
+
+    #[test]
+    fn club_125_matches_bass_drum_body() {
+        let bd = find_preset("Bass Drum").unwrap();
+        let club = find_preset("Club 125").unwrap();
+        assert!(!club.climax_enabled);
+        assert!((club.decay_ms - bd.decay_ms).abs() < 1e-3);
+        assert!((club.output_slew_ms - 42.0).abs() < 1e-3);
+        assert!((club.binary_level - bd.binary_level).abs() < 1e-3);
+    }
+
+    #[test]
+    fn edge_and_deny_climax_is_live() {
+        let p = find_preset("Edge & Deny").expect("Edge & Deny");
+        assert!(p.climax_enabled, "named edge path must enable climax");
+        assert!(p.climax_tease_drop > 0.5, "deep deny");
+        assert!(p.climax_tease_ratio >= 0.22);
+        assert!(p.min_vibe <= 0.02, "true rest floor for deny");
+        assert_eq!(p.climax_pattern, ClimaxPattern::Stairs);
+    }
+
+    #[test]
+    fn experience_presets_edge_without_flat_max() {
+        for name in ["Slow Tease", "Ride the Beat", "Break Me", "Crescendo"] {
+            let p = find_preset(name).unwrap_or_else(|| panic!("missing {name}"));
+            assert!(p.climax_enabled, "{name} climax on");
+            assert!(
+                p.min_vibe <= 0.05,
+                "{name} min_vibe too high for contrast ({})",
+                p.min_vibe
+            );
+            assert!(
+                p.climax_pulse_depth <= 0.25,
+                "{name} pulse_depth motor-honest"
+            );
+            if matches!(p.climax_pattern, ClimaxPattern::Surge) {
+                assert!(
+                    p.climax_tease_ratio <= 0.18,
+                    "{name} Surge tease must not cancel terminal peak"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_chloe_macro_names_migrate() {
+        assert_eq!(find_preset("Chloe Loose").unwrap().name, "Deep 90");
+        assert_eq!(find_preset("Chloe Medium").unwrap().name, "Club 125");
+        assert_eq!(find_preset("Chloe Ultimate").unwrap().name, "Hard 140");
+        assert!(!find_preset("Deep 90").unwrap().climax_enabled);
+        assert!((find_preset("Deep 90").unwrap().output_slew_ms - 55.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn apply_preset_writes_slew_and_knee() {
+        let mut s = crate::settings::Settings::default();
+        let deep = find_preset("Deep 90").unwrap();
+        s.apply_preset(&deep);
+        assert!((s.output_slew_ms - 55.0).abs() < 1e-3);
+        assert!((s.threshold_knee - 0.15).abs() < 1e-3);
+        assert!((s.dynamic_curve - 1.2).abs() < 1e-3);
+        assert!(!s.climax_mode_enabled);
+
+        let edge = find_preset("Edge & Deny").unwrap();
+        s.apply_preset(&edge);
+        assert!(s.climax_mode_enabled);
+        assert!((s.climax_tease_drop - 0.72).abs() < 1e-3);
+    }
 }

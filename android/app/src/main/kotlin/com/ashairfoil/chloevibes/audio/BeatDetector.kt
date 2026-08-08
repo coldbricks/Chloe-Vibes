@@ -10,12 +10,21 @@
 
 package com.ashairfoil.chloevibes.audio
 
+import kotlin.math.pow
 import kotlin.math.sqrt
 
 /**
  * Onset/beat detector using adaptive thresholding on spectral flux.
  */
 class BeatDetector {
+
+    companion object {
+        /**
+         * Predictive onset lead (ms). ~50ms matches fixed transport lag better
+         * than the historical 76ms (ghosty on residual gate).
+         */
+        const val PREFIRE_LEAD_MS: Float = 50f
+    }
 
     /** Rolling history of spectral flux values. */
     private val fluxHistory = FloatArray(43) // ~1 second at 43Hz
@@ -101,11 +110,78 @@ class BeatDetector {
             // Faster decay back to baseline -- recover sensitivity between beats
             adaptiveThreshold = (adaptiveThreshold * 0.985f).coerceAtLeast(0.12f)
             recentOnsetStrength *= 0.98f
+            // Tempo confidence must decay without new onsets
+            decayTempoConfidence(currentTimeMs)
         }
 
         val strength = if (threshold > 0f) spectralFlux / threshold else 0f
 
         return Pair(isOnset, strength)
+    }
+
+    /** Smoothed onset strength for velocity / prefire synthetic floor. */
+    fun recentOnsetStrength(): Float = recentOnsetStrength
+
+    /**
+     * Whether predictive pre-fire is allowed right now.
+     * Requires a fresh tempo lock and a recent real onset (recency guard).
+     */
+    fun prefireOk(currentTimeMs: Float): Boolean {
+        if (tempoConfidence <= 0.6f || tempoIntervalMs <= 0f) return false
+        if (predictedNextOnsetMs <= 0f) return false
+        // Recency: last real onset within ~1.75 beats (tightened from 2.0).
+        val sinceOnset = currentTimeMs - lastOnsetTimeMs
+        if (sinceOnset > tempoIntervalMs * 1.75f) return false
+        val timeTo = predictedNextOnsetMs - currentTimeMs
+        return timeTo in 0f..PREFIRE_LEAD_MS
+    }
+
+    /**
+     * One-shot predictive onset for the motor path.
+     * Returns synthetic strength floor so envelope drive accepts prefire while
+     * flux is still low. Consumes the prediction (multi-frame latch).
+     */
+    fun takePrefire(currentTimeMs: Float): Float? {
+        if (!prefireOk(currentTimeMs)) return null
+        predictedNextOnsetMs += tempoIntervalMs.coerceAtLeast(1f)
+        return recentOnsetStrength.coerceAtLeast(1.15f).coerceAtMost(1.35f)
+    }
+
+    /** Clear tempo lock and onset history so a dead lock cannot resurrect. */
+    private fun clearTempoLock() {
+        tempoConfidence = 0f
+        tempoIntervalMs = 0f
+        predictedNextOnsetMs = 0f
+        onsetTsCount = 0
+        onsetTsIndex = 0
+        onsetTimestamps.fill(0f)
+    }
+
+    private fun decayTempoConfidence(currentTimeMs: Float) {
+        if (tempoConfidence <= 0f || tempoIntervalMs <= 0f) return
+        val since = currentTimeMs - lastOnsetTimeMs
+        val grace = tempoIntervalMs * 1.5f
+        if (since <= grace) {
+            if (tempoConfidence > 0.5f) {
+                val intervalsElapsed = (since / tempoIntervalMs).toInt()
+                predictedNextOnsetMs =
+                    lastOnsetTimeMs + (intervalsElapsed + 1) * tempoIntervalMs
+            }
+            return
+        }
+        val staleBeats = (since - grace) / tempoIntervalMs.coerceAtLeast(1f)
+        // Slightly faster bleed than 0.55 — stale locks die before the next track.
+        tempoConfidence = (tempoConfidence * 0.50f.pow(staleBeats)).coerceAtLeast(0f)
+        if (tempoConfidence < 0.5f) {
+            predictedNextOnsetMs = 0f
+            if (tempoConfidence < 0.05f) {
+                clearTempoLock()
+            }
+        } else {
+            val intervalsElapsed = (since / tempoIntervalMs).toInt()
+            predictedNextOnsetMs =
+                lastOnsetTimeMs + (intervalsElapsed + 1) * tempoIntervalMs
+        }
     }
 
     private fun updateTempoPrediction(currentTimeMs: Float) {

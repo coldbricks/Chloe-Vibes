@@ -6,7 +6,7 @@
 
 | | |
 |--|--|
-| **Version** | [**v1.5.0**](https://github.com/coldbricks/Chloe-Vibes/releases/latest) |
+| **Version** | [**v1.5.1**](https://github.com/coldbricks/Chloe-Vibes/releases/latest) |
 | **Clients** | Windows (Rust · egui) · Android (Kotlin · Compose) |
 | **Devices** | Lovense BLE · Buttplug / Intiface (desktop) |
 | **Sister app** | [**ChloeVR**](https://github.com/coldbricks/ChloeVR) — XR cinema + stage (shares this engine’s beat DNA) |
@@ -103,15 +103,17 @@ Expert knobs (trigger shape, slew, curves) live under **OVERRIDE** — the main 
 
 ---
 
-## What’s new in v1.5.0
+## What’s new in v1.5.1
 
 | Area | Change |
 |------|--------|
-| **FIND BOOM** | Max-dynamic bass-drum tuner (UI name for AUTO-LOCK) |
-| **Bass Drum default** | Kick-only natural BOOM path |
-| **Domi hang fix** | Pluck/boom release to true zero; device rest floors; motors actually stop |
-| **UI declutter** | Expert controls collapsed; auto-scan on connect |
-| **Crash hardening** | WASAPI capture panic recovery; session heartbeat log |
+| **Prefire that lands** | Strength floor + one-shot latch; Gate→Beat order; 50 ms lead |
+| **Motor-honest rests** | Silence-class hard-snap; micro-pauses 90–120 ms; BLE peak-hold bypass |
+| **Edge & Deny live** | Climax ON; deep deny true-rest; post-deny punch; dual-motor climax wired |
+| **Android dead-man** | 2 s pipeline watchdog + sticky Stop all |
+| **Boom catalog** | Deep 90 / Club 125 / Hard 140 honesty + velocity upgrade |
+
+v1.5.0: FIND BOOM · Domi hang · UI declutter · crash hardening.
 
 ---
 
@@ -123,7 +125,7 @@ Order never changes on either client:
 SYSTEM AUDIO
     → Spectral (2048-pt FFT, 8 bands)
     → Gate (hysteresis · optional auto)
-    → Beat (onset · tempo · 76 ms pre-fire)
+    → Beat (onset · tempo · 50 ms pre-fire + confidence decay)
     → ADSR (A/D/S/R · curves · overshoot)
     → Climax (optional · off by default)
     → Output map (0…20 · asymmetric slew)
@@ -164,7 +166,7 @@ cd android && ./gradlew assembleDebug testDebugUnitTest
 | **Desktop package** | `chloe-vibes` (Cargo) |
 | **Android applicationId** | `com.ashairfoil.chloevibes` |
 | **Android SDK** | min 26 · target / compile 35 |
-| **Version** | 1.5.0 · versionCode 5 |
+| **Version** | 1.5.1 · versionCode 6 |
 
 CI: `fmt` · `clippy -D warnings` · release build · Rust + Kotlin parity golden.
 
@@ -188,6 +190,7 @@ Buttplug client                 BleDeviceManager
 
 | Version | Notes |
 |---------|--------|
+| **v1.5.1** (local / tryout) | Peak-feel WAVE-002 · prefire · Edge & Deny · Android watchdog |
 | **[v1.5.0](https://github.com/coldbricks/Chloe-Vibes/releases/tag/v1.5.0)** | FIND BOOM · Domi hang · UI declutter · crash hardening |
 | [v1.4.0](https://github.com/coldbricks/Chloe-Vibes/releases/tag/v1.4.0) | AUTO-LOCK beat lock + punch |
 | [v1.3.0](https://github.com/coldbricks/Chloe-Vibes/releases/tag/v1.3.0) | Reliability · safety · first AUTO-LOCK |

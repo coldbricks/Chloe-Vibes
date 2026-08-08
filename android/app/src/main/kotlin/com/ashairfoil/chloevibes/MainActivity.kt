@@ -13,25 +13,25 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.mutableStateListOf
 import androidx.core.content.ContextCompat
 import com.ashairfoil.chloevibes.audio.AudioCaptureManager
-import com.ashairfoil.chloevibes.audio.AudioSourceMode
 import com.ashairfoil.chloevibes.audio.EnvelopeState
 import com.ashairfoil.chloevibes.audio.NUM_BANDS
 import com.ashairfoil.chloevibes.audio.findPreset
 import com.ashairfoil.chloevibes.device.BleDeviceInfo
 import com.ashairfoil.chloevibes.device.BleDeviceManager
-import com.ashairfoil.chloevibes.device.ConnectionState
 import com.ashairfoil.chloevibes.ui.ChloeVibesTheme
 import com.ashairfoil.chloevibes.ui.MainScreen
 import com.ashairfoil.chloevibes.ui.MainScreenState
 
 class MainActivity : ComponentActivity() {
 
+    private lateinit var chloeVibesApplication: ChloeVibesApplication
     private lateinit var audioCaptureManager: AudioCaptureManager
     private lateinit var bleDeviceManager: BleDeviceManager
     private val uiState = MainScreenState()
@@ -41,12 +41,17 @@ class MainActivity : ComponentActivity() {
     // UI update runnable (~30Hz)
     private val uiUpdateRunnable = object : Runnable {
         override fun run() {
+            uiState.isCapturing = audioCaptureManager.isRunning
             if (audioCaptureManager.isRunning) {
                 val state = audioCaptureManager.state
                 uiState.currentOutput = state.lastFinalOutput
                 uiState.gateOpen = state.lastGateOpen
                 uiState.envelopeState = state.lastEnvelopeState
                 uiState.bandEnergies = state.lastSpectralData.bandEnergies.copyOf()
+                uiState.climaxPhase = state.lastClimaxPhase
+            } else {
+                uiState.currentOutput = 0f
+                uiState.climaxPhase = 0f
             }
             handler.postDelayed(this, 33) // ~30Hz UI updates
         }
@@ -65,21 +70,13 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        audioCaptureManager = AudioCaptureManager(this)
-        bleDeviceManager = BleDeviceManager(this)
-
-        // Wire BLE device output to haptic device
-        audioCaptureManager.onOutputUpdate = { output ->
-            bleDeviceManager.setIntensity(output)
-        }
-        // Dual-motor output for devices like Domi 2
-        audioCaptureManager.onDualOutputUpdate = { motor1, motor2 ->
-            if (bleDeviceManager.isDualMotor) {
-                bleDeviceManager.setDualIntensity(motor1, motor2)
-            } else {
-                bleDeviceManager.setIntensity(motor1)
-            }
-        }
+        chloeVibesApplication = application as ChloeVibesApplication
+        audioCaptureManager = chloeVibesApplication.audioCaptureManager
+        bleDeviceManager = chloeVibesApplication.bleDeviceManager
+        uiState.connectionState = bleDeviceManager.connectionState
+        uiState.connectedDeviceName = bleDeviceManager.connectedDeviceName
+        uiState.batteryLevel = bleDeviceManager.batteryLevel
+        discoveredDevices.addAll(bleDeviceManager.getDiscoveredDevices())
 
         // Wire BLE callbacks
         bleDeviceManager.onDeviceDiscovered = { device ->
@@ -103,6 +100,25 @@ class MainActivity : ComponentActivity() {
         bleDeviceManager.onBatteryUpdate = { level ->
             handler.post { uiState.batteryLevel = level }
         }
+        // Dead-man / emergency-stop surface (Application → UI).
+        chloeVibesApplication.onSafetyStateChanged = { safety ->
+            handler.post {
+                uiState.watchdogTripped = safety.watchdogTripped
+                uiState.safetyMessage = safety.message
+                if (safety.motorsForcedZero) {
+                    uiState.isCapturing = audioCaptureManager.isRunning
+                    uiState.currentOutput = 0f
+                    uiState.gateOpen = false
+                    uiState.envelopeState = EnvelopeState.Idle
+                    uiState.bandEnergies = FloatArray(NUM_BANDS)
+                }
+            }
+        }
+        // Restore sticky banner if Activity was recreated mid-trip.
+        chloeVibesApplication.currentSafetyUiState().let { safety ->
+            uiState.watchdogTripped = safety.watchdogTripped
+            uiState.safetyMessage = safety.message
+        }
 
         // Apply default preset
         val defaultPreset = findPreset("Bass Drum")
@@ -125,9 +141,22 @@ class MainActivity : ComponentActivity() {
                     },
                     onStartCapture = { requestPermissionsAndStart() },
                     onStopCapture = { stopCapture() },
+                    onStopAll = { emergencyStopAll() },
                     onScanDevices = { scanForDevices() },
-                    onConnectDevice = { address -> bleDeviceManager.connect(address) },
-                    onDisconnectDevice = { bleDeviceManager.disconnect() },
+                    onConnectDevice = { address ->
+                        chloeVibesApplication.armConnectedDeviceForCompanion()
+                        bleDeviceManager.connect(address)
+                    },
+                    onDisconnectDevice = {
+                        chloeVibesApplication.disarmCompanion()
+                        bleDeviceManager.disconnect()
+                    },
+                    onClimaxReset = {
+                        audioCaptureManager.state.climaxEngine.reset(
+                            System.currentTimeMillis().toFloat()
+                        )
+                        uiState.climaxPhase = 0f
+                    },
                     discoveredDevices = discoveredDevices,
                     onParameterChanged = { syncParamsToCapture() }
                 )
@@ -136,11 +165,13 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
-        super.onDestroy()
         handler.removeCallbacks(uiUpdateRunnable)
-        audioCaptureManager.stop()
-        bleDeviceManager.stopMotors()
-        bleDeviceManager.disconnect()
+        bleDeviceManager.onDeviceDiscovered = null
+        bleDeviceManager.onConnectionStateChanged = null
+        bleDeviceManager.onBatteryUpdate = null
+        chloeVibesApplication.onSafetyStateChanged = null
+        if (isFinishing) chloeVibesApplication.disconnectIfNoCompanionSession()
+        super.onDestroy()
     }
 
     // -----------------------------------------------------------------------
@@ -165,22 +196,51 @@ class MainActivity : ComponentActivity() {
 
     private fun startCapture() {
         syncParamsToCapture()
-        val started = audioCaptureManager.start(AudioSourceMode.SystemAudio)
-        if (!started) {
-            // Fall back to microphone
-            audioCaptureManager.start(AudioSourceMode.Microphone)
+        uiState.isCapturing = chloeVibesApplication.startAudioCapture()
+        if (uiState.isCapturing) {
+            // Successful re-arm clears a prior dead-man banner.
+            uiState.watchdogTripped = false
+            uiState.safetyMessage = null
+        } else {
+            val safety = chloeVibesApplication.currentSafetyUiState()
+            uiState.watchdogTripped = safety.watchdogTripped
+            uiState.safetyMessage = safety.message
         }
-        uiState.isCapturing = audioCaptureManager.isRunning
+        applyKeepScreenOn(uiState.isCapturing)
     }
 
     private fun stopCapture() {
-        audioCaptureManager.stop()
-        bleDeviceManager.stopMotors()
+        chloeVibesApplication.stopAudioCapture()
         uiState.isCapturing = false
         uiState.currentOutput = 0f
         uiState.gateOpen = false
         uiState.envelopeState = EnvelopeState.Idle
         uiState.bandEnergies = FloatArray(NUM_BANDS)
+        uiState.climaxPhase = 0f
+        applyKeepScreenOn(false)
+    }
+
+    /** Sticky safety rail: zero motors + stop audio capture if it owns output. */
+    private fun emergencyStopAll() {
+        chloeVibesApplication.emergencyStopAll()
+        uiState.isCapturing = false
+        uiState.currentOutput = 0f
+        uiState.gateOpen = false
+        uiState.envelopeState = EnvelopeState.Idle
+        uiState.bandEnergies = FloatArray(NUM_BANDS)
+        uiState.climaxPhase = 0f
+        val safety = chloeVibesApplication.currentSafetyUiState()
+        uiState.watchdogTripped = safety.watchdogTripped
+        uiState.safetyMessage = safety.message
+        applyKeepScreenOn(false)
+    }
+
+    private fun applyKeepScreenOn(keepOn: Boolean) {
+        if (keepOn) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
     }
 
     /** Push all UI parameter values into the AudioCaptureManager. */

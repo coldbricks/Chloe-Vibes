@@ -541,10 +541,18 @@ pub struct EnvelopeProcessor {
     min_retrigger_ms: f32,
     /// Time of last trigger (ms)
     last_trigger_time_ms: f32,
+    /// Velocity of last trigger (for gate-edge → real-onset upgrade)
+    last_trigger_velocity: f32,
     /// Stochastic micro-pause: next pause timestamp (ms); 0 = not initialized
     next_micro_pause_ms: f32,
-    /// Remaining micro-pause frames (0 = not pausing)
-    micro_pause_frames: i32,
+    /// End time of the active micro-pause (ms); 0 = not pausing.
+    /// Time-based (not frame-counted) so repaint rate cannot shrink the pause.
+    micro_pause_until_ms: f32,
+    /// True this frame when the envelope forced a silence-class zero
+    /// (micro-pause). Downstream slew / peak-hold must hard-snap to rest.
+    pub silence_event: bool,
+    /// Last time update_magnitude ran (ms) for time-based sustain smoothing.
+    last_mag_update_ms: f32,
 }
 
 impl EnvelopeProcessor {
@@ -559,8 +567,11 @@ impl EnvelopeProcessor {
             last_gate_open: false,
             min_retrigger_ms: 20.0,
             last_trigger_time_ms: 0.0,
+            last_trigger_velocity: 0.0,
             next_micro_pause_ms: 0.0,
-            micro_pause_frames: 0,
+            micro_pause_until_ms: 0.0,
+            silence_event: false,
+            last_mag_update_ms: 0.0,
         }
     }
 
@@ -580,6 +591,8 @@ impl EnvelopeProcessor {
                 self.value = 0.0;
                 self.state = EnvelopeState::Idle;
                 self.magnitude = 0.0;
+                // Boom floor at zero: silence-class so slew/peak-hold hard-snap.
+                self.silence_event = true;
             } else {
                 self.state = EnvelopeState::Release;
                 self.start_time_ms = current_time_ms;
@@ -592,22 +605,35 @@ impl EnvelopeProcessor {
 
     /// Trigger the envelope (gate just opened or strong onset detected).
     pub fn trigger(&mut self, magnitude: f32, current_time_ms: f32, velocity: f32, attack_ms: f32) {
-        // Enforce minimum retrigger interval
+        // Enforce minimum retrigger interval — but allow a real onset to
+        // *upgrade* a gate-edge thump (velocity=1.0) that fired a few ms ago.
+        // Without this, min_retrigger_ms steals kick overshoot on tight gates.
         if current_time_ms - self.last_trigger_time_ms < self.min_retrigger_ms {
-            return;
+            let upgrade = velocity > 1.05
+                && velocity > self.last_trigger_velocity + 0.08
+                && self.state != EnvelopeState::Idle;
+            if !upgrade {
+                return;
+            }
+            // Upgrade path: re-apply overshoot without resetting the schedule
+            // of the next micro-pause; still re-enter Attack/Decay for punch.
         }
 
-        let scaled_magnitude = magnitude * (0.5 + 0.5 * velocity);
-        self.magnitude = scaled_magnitude.clamp(0.0, 1.5);
+        // Magnitude tracks body level; velocity > 1 lives in attack_target
+        // overshoot so process() headroom is not double-scaled then clipped.
+        let vel_for_mag = velocity.min(1.0);
+        let scaled_magnitude = magnitude * (0.5 + 0.5 * vel_for_mag);
+        self.magnitude = scaled_magnitude.clamp(0.0, 1.0);
 
         // Velocity overshoot: strong onsets briefly exceed normal peak.
         // A hard drum hit should momentarily push past the normal ceiling,
         // creating a visceral "punch" sensation before decaying to sustain.
         self.attack_target = if velocity > 1.0 {
-            (1.0 + 0.15 * (velocity - 1.0)).min(1.2)
+            (1.0 + 0.30 * (velocity - 1.0)).min(1.28)
         } else {
             1.0
         };
+        self.last_trigger_velocity = velocity;
 
         // For short attacks (< 50ms), skip directly to Decay at peak.
         // Motor spin-up (~20ms) provides the physical ramp — sending peak
@@ -623,9 +649,10 @@ impl EnvelopeProcessor {
             self.phase_start_value = self.value.max(0.4);
         }
 
-        // Reset micro-pause on retrigger
-        self.micro_pause_frames = 0;
-        self.next_micro_pause_ms = 0.0;
+        // Abort an active micro-pause on retrigger, but keep the scheduled
+        // next rest so pad/continuous material still gets anti-adaptation zeros.
+        self.micro_pause_until_ms = 0.0;
+        self.silence_event = false;
         self.last_trigger_time_ms = current_time_ms;
     }
 
@@ -639,17 +666,23 @@ impl EnvelopeProcessor {
     }
 
     /// Update the sustain magnitude (for dynamic modes where energy
-    /// changes while gate is held open).
-    pub fn update_magnitude(&mut self, new_magnitude: f32) {
+    /// changes while gate is held open). Time-based so repaint rate cannot
+    /// make the hold smoother/faster than designed.
+    pub fn update_magnitude(&mut self, new_magnitude: f32, current_time_ms: f32) {
         if self.state == EnvelopeState::Sustain {
-            // Asymmetric smoothing: fast rise (feel the hit), slower fall (natural decay).
-            // 30% rise = punchy response to louder moments.
-            // 15% fall = smooth enough to avoid jitter but responsive enough to feel dynamics.
-            let alpha = if new_magnitude > self.magnitude {
-                0.30
+            let dt_s = if self.last_mag_update_ms > 0.0 {
+                ((current_time_ms - self.last_mag_update_ms) / 1000.0).clamp(0.0, 0.05)
             } else {
-                0.15
+                1.0 / 60.0
             };
+            self.last_mag_update_ms = current_time_ms;
+            // Fast rise (~50ms 63%), slower fall (~110ms) — punch without chatter.
+            let tau = if new_magnitude > self.magnitude {
+                0.050
+            } else {
+                0.110
+            };
+            let alpha = 1.0 - (-dt_s / tau).exp();
             self.magnitude = self.magnitude * (1.0 - alpha) + new_magnitude * alpha;
         }
     }
@@ -670,6 +703,7 @@ impl EnvelopeProcessor {
         release_curve: f32,
     ) -> f32 {
         let elapsed = current_time_ms - self.start_time_ms;
+        self.silence_event = false;
 
         match self.state {
             EnvelopeState::Attack => {
@@ -708,29 +742,32 @@ impl EnvelopeProcessor {
                 }
             }
             EnvelopeState::Sustain => {
-                // Stochastic micro-pauses: drops to true zero for 3-6 frames (48-96ms).
-                // Long enough for the motor to actually stop, creating a real nerve
-                // reset. Intermittent stimulation maintains sensitivity far longer
-                // than continuous vibration. True zero (not 5%) ensures the motor
-                // fully decelerates — partial intensity keeps nerves in the adapted state.
-                if self.micro_pause_frames > 0 {
-                    self.micro_pause_frames -= 1;
-                    self.value = 0.0; // True zero — motor must stop
+                // Stochastic micro-pauses: true zero for 90–120 ms (time-based).
+                // Long enough for Domi/ERM coast-down; intermittent rest
+                // maintains sensitivity far longer than continuous vibration.
+                // silence_event flags the output stage to bypass slew/peak-hold.
+                if self.micro_pause_until_ms > 0.0 && current_time_ms < self.micro_pause_until_ms {
+                    self.value = 0.0;
+                    self.silence_event = true;
                 } else if self.next_micro_pause_ms > 0.0
                     && current_time_ms >= self.next_micro_pause_ms
                 {
-                    // 3-6 frames at 60Hz = 48-96ms (motor needs ~20ms to stop)
-                    self.micro_pause_frames = 3 + ((current_time_ms * 7.13) as i32 & 0x3);
-                    // Next pause in 2-8 seconds (deterministic pseudo-random)
-                    let pseudo_rand = ((current_time_ms * 13.37) as u32 & 0xFFFF) as f32 / 65535.0;
-                    self.next_micro_pause_ms = current_time_ms + 2000.0 + pseudo_rand * 6000.0;
+                    // 90–120 ms pause — floor raised so rest completes on hardware
+                    let pseudo_rand = ((current_time_ms * 7.13) as u32 & 0xFFFF) as f32 / 65535.0;
+                    let pause_ms = 90.0 + pseudo_rand * 30.0;
+                    self.micro_pause_until_ms = current_time_ms + pause_ms;
+                    // Subsequent pauses every 2–8 seconds
+                    let gap_rand = ((current_time_ms * 13.37) as u32 & 0xFFFF) as f32 / 65535.0;
+                    self.next_micro_pause_ms = current_time_ms + 2000.0 + gap_rand * 6000.0;
                     self.value = 0.0;
+                    self.silence_event = true;
                 } else {
-                    // Initialize micro-pause timer on first sustain frame
+                    self.micro_pause_until_ms = 0.0;
+                    // First rest sooner (0.8–2.5 s) so pads get a zero early
                     if self.next_micro_pause_ms <= 0.0 {
                         let pseudo_rand =
                             ((current_time_ms * 13.37) as u32 & 0xFFFF) as f32 / 65535.0;
-                        self.next_micro_pause_ms = current_time_ms + 2000.0 + pseudo_rand * 6000.0;
+                        self.next_micro_pause_ms = current_time_ms + 800.0 + pseudo_rand * 1700.0;
                     }
 
                     // 5-layer modulation to prevent neural adaptation.
@@ -755,6 +792,7 @@ impl EnvelopeProcessor {
                     self.value = 0.0;
                     self.state = EnvelopeState::Idle;
                     self.magnitude = 0.0;
+                    self.silence_event = true;
                 } else {
                     let progress = (elapsed / release_ms).clamp(0.0, 1.0);
                     let release_factor = apply_curve(1.0 - progress, release_curve);
@@ -764,6 +802,8 @@ impl EnvelopeProcessor {
                         self.value = 0.0;
                         self.state = EnvelopeState::Idle;
                         self.magnitude = 0.0;
+                        // Pluck/boom true-rest: hard-snap past slew so troughs empty.
+                        self.silence_event = true;
                     }
                 }
             }
@@ -771,13 +811,16 @@ impl EnvelopeProcessor {
                 self.value = (self.value * 0.95).max(0.0); // Gentle fade
                 if self.value < 0.001 {
                     self.value = 0.0;
+                    self.silence_event = true;
                 }
                 self.magnitude = 0.0;
             }
         }
 
-        // Apply magnitude scaling
-        (self.value * self.magnitude).clamp(0.0, 1.0)
+        // Magnitude scales body level; attack_target overshoot may exceed 1.0.
+        // Cap at 1.20 so Auto-Lock binary headroom (≤0.88) becomes real punch
+        // instead of flattening into a 1.0 plateau.
+        (self.value * self.magnitude).clamp(0.0, 1.20)
     }
 
     /// Drive the envelope from gate state and onset detection.
@@ -856,11 +899,11 @@ impl EnvelopeProcessor {
             is_onset && onset_strength > 1.05 && gate_open && self.state != EnvelopeState::Attack;
 
         // Continuous (pad/organ) re-arm: only Dynamic, or Hybrid that is mostly
-        // dynamic, AND only when sustain is organ-like. Percussive / boom paths
-        // must NOT re-arm just because the gate is still open — that was the
-        // Domi "once it starts it never returns to 0" bug (Idle→trigger loop
-        // on residual bass energy).
-        let continuous_hold = sustain_level > Self::PLUCK_SUSTAIN
+        // dynamic, AND only when *centroid-adjusted* sustain is organ-like —
+        // same threshold enter_post_decay uses so near-boundary pads do not
+        // Idle-retrigger stutter. Percussive / boom paths must NOT re-arm just
+        // because the gate is still open (Domi hang fix).
+        let continuous_hold = adj_sustain_level > Self::PLUCK_SUSTAIN
             && (matches!(trigger_mode, TriggerMode::Dynamic)
                 || (matches!(trigger_mode, TriggerMode::Hybrid) && hybrid_blend < 0.45));
 
@@ -889,7 +932,7 @@ impl EnvelopeProcessor {
             && self.state == EnvelopeState::Sustain
             && matches!(trigger_mode, TriggerMode::Dynamic | TriggerMode::Hybrid)
         {
-            self.update_magnitude(magnitude);
+            self.update_magnitude(magnitude, current_time_ms);
         }
 
         self.last_gate_open = gate_open;
@@ -912,8 +955,12 @@ impl EnvelopeProcessor {
         self.value = 0.0;
         self.magnitude = 0.0;
         self.attack_target = 1.0;
-        self.micro_pause_frames = 0;
+        self.last_trigger_time_ms = 0.0;
+        self.last_trigger_velocity = 0.0;
+        self.micro_pause_until_ms = 0.0;
         self.next_micro_pause_ms = 0.0;
+        self.silence_event = false;
+        self.last_mag_update_ms = 0.0;
     }
 }
 
@@ -949,6 +996,10 @@ pub struct BeatDetector {
 }
 
 impl BeatDetector {
+    /// Predictive onset lead (ms). ~50ms matches fixed transport lag better
+    /// than the historical 76ms (which felt early/ghosty on residual gate).
+    pub const PREFIRE_LEAD_MS: f32 = 50.0;
+
     pub fn new() -> Self {
         Self {
             flux_history: vec![0.0; 43], // ~1 second at 43Hz
@@ -1018,6 +1069,9 @@ impl BeatDetector {
             // Faster decay back to baseline — recover sensitivity between beats.
             self.adaptive_threshold = (self.adaptive_threshold * 0.985).max(0.12);
             self.recent_onset_strength *= 0.98;
+            // Tempo confidence must decay without new onsets — otherwise a
+            // stale lock keeps pre-firing into silence / the next track.
+            self.decay_tempo_confidence(current_time_ms);
         }
 
         let strength = if threshold > 0.0 {
@@ -1027,6 +1081,87 @@ impl BeatDetector {
         };
 
         (is_onset, strength)
+    }
+
+    /// Smoothed onset strength for velocity / prefire synthetic floor.
+    #[allow(dead_code)] // public API for hosts/tests; take_prefire uses the field
+    pub fn recent_onset_strength(&self) -> f32 {
+        self.recent_onset_strength
+    }
+
+    /// Whether predictive pre-fire is allowed right now.
+    /// Requires a fresh tempo lock and a recent real onset (recency guard).
+    pub fn prefire_ok(&self, current_time_ms: f32) -> bool {
+        if self.tempo_confidence <= 0.6 || self.tempo_interval_ms <= 0.0 {
+            return false;
+        }
+        if self.predicted_next_onset_ms <= 0.0 {
+            return false;
+        }
+        // Recency: last real onset within ~1.75 beats (tightened from 2.0 to
+        // cut ghost pre-fires on residual gate after a drop-out).
+        let since_onset = current_time_ms - self.last_onset_time_ms;
+        if since_onset > self.tempo_interval_ms * 1.75 {
+            return false;
+        }
+        let time_to = self.predicted_next_onset_ms - current_time_ms;
+        (0.0..=Self::PREFIRE_LEAD_MS).contains(&time_to)
+    }
+
+    /// One-shot predictive onset for the motor path.
+    ///
+    /// Returns a synthetic strength floor so envelope drive (≥1.05) accepts the
+    /// prefire even while spectral flux is still low. Consumes the prediction
+    /// so multi-frame UI ticks cannot double-punch the same beat.
+    pub fn take_prefire(&mut self, current_time_ms: f32) -> Option<f32> {
+        if !self.prefire_ok(current_time_ms) {
+            return None;
+        }
+        // Push prediction past this beat's lead window (one-shot latch).
+        self.predicted_next_onset_ms += self.tempo_interval_ms.max(1.0);
+        let strength = self.recent_onset_strength.max(1.15).min(1.35);
+        Some(strength)
+    }
+
+    /// Clear tempo lock and onset history so a dead lock cannot resurrect.
+    fn clear_tempo_lock(&mut self) {
+        self.tempo_confidence = 0.0;
+        self.tempo_interval_ms = 0.0;
+        self.predicted_next_onset_ms = 0.0;
+        self.onset_ts_count = 0;
+        self.onset_ts_index = 0;
+        self.onset_timestamps = [0.0; 16];
+    }
+
+    fn decay_tempo_confidence(&mut self, current_time_ms: f32) {
+        if self.tempo_confidence <= 0.0 || self.tempo_interval_ms <= 0.0 {
+            return;
+        }
+        let since = current_time_ms - self.last_onset_time_ms;
+        // After 1.5 missed beats, start bleeding confidence; by ~3 beats → zero.
+        let grace = self.tempo_interval_ms * 1.5;
+        if since <= grace {
+            // Still advance the prediction so the next beat stays on-grid.
+            if self.tempo_confidence > 0.5 {
+                let intervals_elapsed = (since / self.tempo_interval_ms) as u32;
+                self.predicted_next_onset_ms = self.last_onset_time_ms
+                    + (intervals_elapsed + 1) as f32 * self.tempo_interval_ms;
+            }
+            return;
+        }
+        let stale_beats = (since - grace) / self.tempo_interval_ms.max(1.0);
+        // Slightly faster bleed than 0.55 — stale locks die before the next track.
+        self.tempo_confidence = (self.tempo_confidence * (0.50_f32).powf(stale_beats)).max(0.0);
+        if self.tempo_confidence < 0.5 {
+            self.predicted_next_onset_ms = 0.0;
+            if self.tempo_confidence < 0.05 {
+                self.clear_tempo_lock();
+            }
+        } else {
+            let intervals_elapsed = (since / self.tempo_interval_ms) as u32;
+            self.predicted_next_onset_ms =
+                self.last_onset_time_ms + (intervals_elapsed + 1) as f32 * self.tempo_interval_ms;
+        }
     }
 
     fn update_tempo_prediction(&mut self, current_time_ms: f32) {
@@ -1120,6 +1255,8 @@ pub struct ClimaxEngine {
     deny_duration_ms: f32,
     // Breathing-rate modulation: couples to involuntary arousal breathing
     breathing_phase: f32,
+    /// Silence-class this frame (deep deny rest / dry zero). Hosts hard-snap.
+    pub silence_event: bool,
 }
 
 impl ClimaxEngine {
@@ -1146,6 +1283,7 @@ impl ClimaxEngine {
             deny_start_ms: 0.0,
             deny_duration_ms: 0.0,
             breathing_phase: 0.0,
+            silence_event: false,
         }
     }
 
@@ -1171,6 +1309,7 @@ impl ClimaxEngine {
         self.deny_start_ms = 0.0;
         self.deny_duration_ms = 0.0;
         self.breathing_phase = 0.0;
+        self.silence_event = false;
     }
 
     /// Returns current cycle progress in [0, 1).
@@ -1201,9 +1340,12 @@ impl ClimaxEngine {
         pulse_depth: f32,
         pattern: ClimaxPattern,
     ) -> f32 {
-        let dry = input.clamp(0.0, 1.0);
+        // Allow envelope velocity overshoot headroom through when climax is off.
+        let dry = input.clamp(0.0, 1.20);
+        self.silence_event = false;
         if !enabled {
             self.reset(current_time_ms);
+            // Passthrough keeps punch headroom; map_output clamps device range.
             return dry;
         }
 
@@ -1223,8 +1365,10 @@ impl ClimaxEngine {
                 .floor()
                 .max(1.0);
             self.cycle_anchor_ms += cycles * cycle_len;
-            self.cycle_count = self.cycle_count.saturating_add(1);
-            self.arousal_momentum = (self.arousal_momentum + 0.12).min(0.75);
+            // Advance by full wraps (not +1) so large dt jumps stay honest.
+            let n = cycles as u32;
+            self.cycle_count = self.cycle_count.saturating_add(n);
+            self.arousal_momentum = (self.arousal_momentum + 0.12 * cycles).min(0.75);
         }
         // Slow momentum decay during silence
         if !gate_open {
@@ -1233,7 +1377,14 @@ impl ClimaxEngine {
 
         let progress = ((current_time_ms - self.cycle_anchor_ms) / cycle_len).clamp(0.0, 1.0);
         let intensity = intensity.clamp(0.0, 1.0);
-        let cycle_maturity = (self.cycle_count as f32 / 6.0).min(1.0); // 0→1 over first 6 cycles
+        // Maturity: fast ramp over first 6 cycles, then slow log growth past 1.0
+        // so long sessions keep escalating deny depth / post-deny punch.
+        let cycle_maturity = if self.cycle_count <= 6 {
+            self.cycle_count as f32 / 6.0
+        } else {
+            let extra = ((self.cycle_count as f32 - 6.0) + 1.0).ln();
+            (1.0 + 0.12 * extra).min(1.20)
+        };
 
         let ramp = match pattern {
             ClimaxPattern::Wave => smooth_step(progress),
@@ -1244,24 +1395,26 @@ impl ClimaxEngine {
             ClimaxPattern::Surge => progress.powf(0.6),
         };
 
-        // ---- Tease factor: asymmetric dip near end of cycle ----
-        // Fast cliff down → hold at floor → slow sensual rebuild.
-        // The sharp drop triggers a gasp reflex; the slow return builds
-        // aching anticipation. Tease depth escalates across cycles —
-        // first tease is gentle, later ones are devastating.
-        let tease_start = 1.0 - tease_ratio.clamp(0.05, 0.5);
-        let tease_factor = if progress >= tease_start {
-            let t = ((progress - tease_start) / (1.0 - tease_start)).clamp(0.0, 1.0);
-            let escalating_drop = tease_drop.clamp(0.0, 0.9) * (0.6 + 0.4 * cycle_maturity);
-            let envelope = if t < 0.10 {
-                // Sharp cliff down (first 10% of tease window)
-                smooth_step(t / 0.10)
-            } else if t < 0.55 {
+        // ---- Terminal arc: tease THEN surge (non-overlapping) ----
+        // Tease×surge used to cancel end-of-cycle peaks when both ran in the
+        // last 20%. Surge owns the final 12%; tease fills the window just before.
+        let surge_start = 0.88;
+        let tease_window = tease_ratio.clamp(0.05, 0.5);
+        let tease_start = (surge_start - tease_window).max(0.45);
+        let tease_factor = if progress >= tease_start && progress < surge_start {
+            let span = (surge_start - tease_start).max(0.01);
+            let t = ((progress - tease_start) / span).clamp(0.0, 1.0);
+            let escalating_drop =
+                tease_drop.clamp(0.0, 0.9) * (0.65 + 0.45 * cycle_maturity.min(1.0));
+            let envelope = if t < 0.12 {
+                // Sharp cliff down (first 12% of tease window)
+                smooth_step(t / 0.12)
+            } else if t < 0.62 {
                 // Hold at floor — nerve endings reset, anticipation builds
                 1.0
             } else {
-                // Slow curved rebuild (last 45%) — agonizingly gradual
-                let rebuild_t = (t - 0.55) / 0.45;
+                // Slow curved rebuild into the surge handoff
+                let rebuild_t = (t - 0.62) / 0.38;
                 1.0 - smooth_step(rebuild_t) * smooth_step(rebuild_t)
             };
             1.0 - escalating_drop * envelope
@@ -1269,12 +1422,8 @@ impl ClimaxEngine {
             1.0
         };
 
-        // ---- Surge factor: accelerating curve (slow build → explosive finish) ----
+        // ---- Surge factor: accelerating curve after tease completes ----
         // smooth_step² starts almost flat, then rockets upward in the final moments.
-        // At t=0.25: 0.03 (barely perceptible). At t=0.75: 0.74 (building fast).
-        // At t=0.95: 0.98 (slamming into peak). This is the opposite of the old
-        // powf(0.2) which hit 87% immediately and then plateaued.
-        let surge_start = 0.80;
         let surge_factor = if progress >= surge_start {
             let t = ((progress - surge_start) / (1.0 - surge_start)).clamp(0.0, 1.0);
             let ss = smooth_step(t);
@@ -1286,17 +1435,19 @@ impl ClimaxEngine {
         // ---- Onset boost: scales with cycle progression ----
         // A drum hit during surge should feel like being pushed over the edge.
         // Early in cycle: modest bump. During surge: devastating impact.
-        if is_onset && gate_open {
+        if is_onset && gate_open && dry > 0.001 {
             let onset_scale = 0.14 + 0.22 * ramp; // 0.14 → 0.36 across cycle
             self.onset_boost =
-                (self.onset_boost + onset_scale * onset_strength.clamp(0.0, 2.5)).min(0.60);
+                (self.onset_boost + onset_scale * onset_strength.clamp(0.0, 2.5)).min(0.70);
         }
         self.onset_boost = (self.onset_boost - dt * 0.7).max(0.0);
 
-        // ---- 5-oscillator detuned micro-pulse ----
-        let pulse_depth = pulse_depth.clamp(0.0, 0.55);
-        let max_pulse_hz = if progress >= surge_start { 10.0 } else { 7.0 };
-        let pulse_rate_hz = (2.0 + intensity * 3.0 + energy * 2.0 + ramp * 1.0).min(max_pulse_hz);
+        // ---- 5-oscillator detuned micro-pulse (motor-expressible ≤5 Hz) ----
+        // Rates above ~5 Hz are crushed by ERM physics; move budget into depth.
+        let pulse_depth = (pulse_depth.clamp(0.0, 0.55) * (1.0 + 0.20 * ramp)).min(0.62);
+        let max_pulse_hz = 5.0;
+        let pulse_rate_hz =
+            (1.6 + intensity * 1.8 + energy * 1.0 + ramp * 0.6).min(max_pulse_hz);
         let detune1 = 0.07;
         let detune2 = 0.13;
         self.micro_phase = (self.micro_phase + dt * pulse_rate_hz * TAU).rem_euclid(TAU);
@@ -1316,14 +1467,11 @@ impl ClimaxEngine {
         let pulse = 1.0 - pulse_depth + pulse_depth * (0.5 + 0.5 * pulse_raw);
 
         // ---- Sub-harmonic resonance: scales with progression ----
-        // Base 8% depth, building to 24% during surge. The device motor's
-        // mechanical resonance (~150-200Hz) couples with these sub-harmonic
-        // amplitude rates to create deep tissue "throbbing" that intensifies
-        // as the cycle builds toward climax.
-        let sub_freq_hz = 1.5 + ramp * 2.5 + energy * 0.5;
+        // Cap sub-harmonic rate in the motor-expressible band (≤5 Hz).
+        let sub_freq_hz = (1.2 + ramp * 2.0 + energy * 0.4).min(5.0);
         self.sub_harmonic_phase =
             (self.sub_harmonic_phase + dt * sub_freq_hz * TAU).rem_euclid(TAU);
-        let sub_depth = 0.08 + 0.16 * ramp; // 8% → 24%
+        let sub_depth = 0.10 + 0.18 * ramp; // 10% → 28% (depth budget from rate cap)
         let sub_resonance = 1.0 + sub_depth * intensity * self.sub_harmonic_phase.sin();
 
         // ---- Chaos layer (Lorenz attractor): scales with progression ----
@@ -1358,18 +1506,31 @@ impl ClimaxEngine {
         // that compensates for desensitization over long sessions.
         let momentum_bonus = self.arousal_momentum * 0.7;
         let arousal_gain = (1.0 + (1.2 + momentum_bonus) * ramp) * (1.0 + intensity * 0.40);
-        let gated_boost = if gate_open { self.onset_boost } else { 0.0 };
+        // Dry silence (micro-pause / boom rest): no residual boost re-injection.
+        let gated_boost = if gate_open && dry > 0.001 {
+            self.onset_boost
+        } else {
+            0.0
+        };
 
-        let raw_output = (dry
-            * arousal_gain
-            * tease_factor
-            * surge_factor
-            * pulse
-            * sub_resonance
-            * chaos_mod
-            * breathing_mod
-            + gated_boost)
-            .clamp(0.0, 1.0);
+        if dry <= 0.001 {
+            self.motor2_output = 0.0;
+            self.silence_event = true;
+            // Still run deny bookkeeping below with raw_output=0 so dwell freezes.
+        }
+
+        // Soft ceiling when post-deny / onset boost is live so additive punch
+        // is not clamp-killed on already-loud dry plateaus (map_output still
+        // respects user max_vibe × gain).
+        let peak_cap = if gated_boost > 0.05 { 1.12 } else { 1.0 };
+        let raw_output = if dry <= 0.001 {
+            0.0
+        } else {
+            (dry * arousal_gain * tease_factor * surge_factor * pulse * sub_resonance * chaos_mod
+                * breathing_mod
+                + gated_boost)
+                .clamp(0.0, peak_cap)
+        };
 
         // ---- Dual-motor spatial contrast ----
         let phase_offset_hz = 0.3 + ramp * 1.7;
@@ -1382,22 +1543,25 @@ impl ClimaxEngine {
         // ---- Edge-and-deny: escalating across cycles ----
         // First deny is gentle and brief. Later denies are deeper and longer,
         // building frustration and making each return more devastating.
-        // Time-to-deny also shortens — the system gets more aggressive.
-        if raw_output > 0.75 {
-            self.high_output_ms += dt * 1000.0;
-        } else {
-            self.high_output_ms = (self.high_output_ms - dt * 400.0).max(0.0);
+        // Freeze high_output dwell while deny is active — count felt output only.
+        if !self.deny_active {
+            if raw_output > 0.75 {
+                self.high_output_ms += dt * 1000.0;
+            } else {
+                self.high_output_ms = (self.high_output_ms - dt * 400.0).max(0.0);
+            }
         }
 
-        // Deny trigger: 6s initially, dropping to 3s as cycles mature
-        let deny_trigger_ms = 6000.0 - 3000.0 * cycle_maturity;
+        // Deny trigger: 6s initially, dropping to ~2.4s as maturity grows past 1
+        let maturity_for_timing = cycle_maturity.min(1.15);
+        let deny_trigger_ms = 6000.0 - 3200.0 * maturity_for_timing;
         if !self.deny_active && self.high_output_ms > deny_trigger_ms {
             self.deny_active = true;
             self.deny_start_ms = current_time_ms;
-            // Duration escalates: 600ms initially → up to 3000ms in later cycles
-            let base_duration = 600.0 + 1800.0 * cycle_maturity;
+            // Duration escalates: 700ms initially → multi-second at maturity
+            let base_duration = 700.0 + 2200.0 * maturity_for_timing;
             let jitter = 0.5 + 0.5 * (current_time_ms * 0.00137).sin();
-            self.deny_duration_ms = base_duration + 400.0 * jitter;
+            self.deny_duration_ms = base_duration + 500.0 * jitter;
             self.high_output_ms = 0.0;
         }
 
@@ -1405,13 +1569,13 @@ impl ClimaxEngine {
             let deny_elapsed = current_time_ms - self.deny_start_ms;
             if deny_elapsed >= self.deny_duration_ms {
                 self.deny_active = false;
-                // Post-deny surge: overshoot harder after deeper denies.
-                let post_deny_boost = 0.30 + 0.25 * cycle_maturity;
-                self.onset_boost = (self.onset_boost + post_deny_boost).min(0.65);
+                // Post-deny return punch: additive boost survives loud dry plateaus.
+                let post_deny_boost = 0.40 + 0.35 * maturity_for_timing;
+                self.onset_boost = (self.onset_boost + post_deny_boost).min(0.85);
             } else {
-                let deny_t = deny_elapsed / self.deny_duration_ms;
-                // Deny depth escalates: 60% initially → 90% at maturity
-                let deny_depth = 0.60 + 0.30 * cycle_maturity;
+                let deny_t = deny_elapsed / self.deny_duration_ms.max(1.0);
+                // Deny depth escalates: 70% initially → ~95% at high maturity
+                let deny_depth = (0.70 + 0.28 * maturity_for_timing).min(0.95);
                 // Asymmetric envelope: cliff → hold → slow sensual return.
                 let deny_envelope = if deny_t < 0.10 {
                     // Sharp cliff (50-100ms to floor)
@@ -1424,6 +1588,12 @@ impl ClimaxEngine {
                     let return_t = (deny_t - 0.75) / 0.25;
                     deny_depth * (1.0 - smooth_step(return_t))
                 };
+                // Deep deny (≥30% cut) → true motor rest (silence-class), not a soft plateau.
+                if deny_envelope >= 0.30 {
+                    self.silence_event = true;
+                    self.motor2_output = 0.0;
+                    return 0.0;
+                }
                 let denied = (raw_output * (1.0 - deny_envelope)).clamp(0.0, 1.0);
                 self.motor2_output =
                     (self.motor2_output * (1.0 - deny_envelope * 0.7)).clamp(0.0, 1.0);
@@ -1975,19 +2145,238 @@ mod tests {
     fn envelope_output_bounded() {
         let mut env = EnvelopeProcessor::new();
         let mut time = 0.0f32;
-        env.trigger(1.0, 0.0, 1.5, 100.0); // high velocity
+        env.trigger(1.0, 0.0, 1.5, 100.0); // high velocity → attack_target overshoot
         for _ in 0..500 {
             time += 16.0;
-            env.process(time, 100.0, 200.0, 0.95, 300.0, 1.0, 1.0, 1.0);
+            let out = env.process(time, 100.0, 200.0, 0.95, 300.0, 1.0, 1.0, 1.0);
             assert!(
-                env.value >= 0.0 && env.value <= 1.0,
-                "envelope value should be in [0,1], got {}",
+                env.value >= 0.0 && env.value <= 1.28,
+                "envelope value should be in [0,1.28] (overshoot), got {}",
                 env.value
+            );
+            assert!(
+                (0.0..=1.20).contains(&out),
+                "process output must stay in punch headroom [0,1.20], got {out}"
             );
         }
     }
 
+    #[test]
+    fn envelope_boom_rest_sets_silence_event() {
+        let mut env = EnvelopeProcessor::new();
+        // Pluck sustain → Release → Idle with silence_event for hard-snap troughs.
+        env.trigger(1.0, 100.0, 1.2, 20.0);
+        let _ = env.process(100.0, 20.0, 80.0, 0.08, 60.0, 1.0, 1.0, 1.0);
+        // Advance through decay into release/idle
+        let mut saw = false;
+        for i in 0..40 {
+            let t = 200.0 + i as f32 * 16.0;
+            let out = env.process(t, 20.0, 80.0, 0.08, 60.0, 1.0, 1.0, 1.0);
+            if env.state == EnvelopeState::Idle && env.silence_event {
+                assert_eq!(out, 0.0);
+                saw = true;
+                break;
+            }
+        }
+        assert!(saw, "pluck/boom path must raise silence_event at true rest");
+    }
+
+    #[test]
+    fn envelope_micro_pause_schedule_survives_retrigger() {
+        let mut env = EnvelopeProcessor::new();
+        env.trigger(1.0, 100.0, 1.0, 20.0);
+        let _ = env.process(350.0, 20.0, 200.0, 0.8, 150.0, 1.0, 1.0, 1.0);
+        assert_eq!(env.state, EnvelopeState::Sustain);
+        // Arm a near-future pause, then retrigger — schedule must not reset to 0.
+        // Force next pause by running until scheduled, record next, retrigger mid-sustain.
+        let mut armed_at = 0.0_f32;
+        for i in 0..200 {
+            let t = 400.0 + i as f32 * 16.0;
+            let _ = env.process(t, 20.0, 200.0, 0.8, 150.0, 1.0, 1.0, 1.0);
+            if env.silence_event {
+                armed_at = t;
+                break;
+            }
+        }
+        assert!(armed_at > 0.0, "must enter a micro-pause to arm schedule");
+        // After pause ends, next_micro_pause is in the future; retrigger should keep it.
+        let after = armed_at + 150.0;
+        let _ = env.process(after, 20.0, 200.0, 0.8, 150.0, 1.0, 1.0, 1.0);
+        env.trigger(1.0, after + 30.0, 1.0, 20.0);
+        // Re-enter sustain quickly (short attack)
+        let _ = env.process(after + 50.0, 20.0, 50.0, 0.8, 150.0, 1.0, 1.0, 1.0);
+        // If schedule survived, we should silence again within ~8s without waiting full re-init gap only.
+        let mut saw_again = false;
+        for i in 0..600 {
+            let t = after + 60.0 + i as f32 * 16.0;
+            let _ = env.process(t, 20.0, 50.0, 0.8, 150.0, 1.0, 1.0, 1.0);
+            if env.silence_event {
+                saw_again = true;
+                break;
+            }
+        }
+        assert!(
+            saw_again,
+            "retrigger must not wipe next_micro_pause schedule forever"
+        );
+    }
+
+    #[test]
+    fn climax_deep_deny_is_true_rest() {
+        let mut ce = ClimaxEngine::new();
+        // Hold high output until deny engages, then assert silence-class zero.
+        let mut denied = false;
+        for i in 0..2000 {
+            let time = i as f32 * 16.0;
+            let out = ce.process(
+                0.95,
+                0.9,
+                true,
+                false,
+                0.0,
+                time,
+                true,
+                1.0,
+                30_000.0,
+                0.2,
+                0.5,
+                0.4,
+                0.2,
+                ClimaxPattern::Wave,
+            );
+            if ce.silence_event {
+                assert_eq!(out, 0.0, "deep deny must hard-zero");
+                assert_eq!(ce.motor2_output, 0.0);
+                denied = true;
+                break;
+            }
+        }
+        assert!(denied, "edge-and-deny must activate under sustained high output");
+    }
+
     // --- BeatDetector tempo tracking ---
+
+    #[test]
+    fn beat_detector_exposes_recent_onset_strength() {
+        let mut bd = BeatDetector::new();
+        for i in 0..80 {
+            bd.process(0.02, i as f32 * 16.0);
+        }
+        let t = 80.0 * 16.0 + 100.0;
+        let (onset, _) = bd.process(6.0, t);
+        assert!(onset);
+        assert!(
+            bd.recent_onset_strength() > 1.0,
+            "hard spike should raise smoothed onset strength"
+        );
+    }
+
+    #[test]
+    fn beat_detector_take_prefire_latches_and_strength() {
+        let mut bd = BeatDetector::new();
+        // Establish baseline then plant a clean 500 ms grid.
+        let mut t = 0.0_f32;
+        for _ in 0..20 {
+            bd.process(0.01, t);
+            t += 16.0;
+        }
+        for i in 0..12 {
+            let spike_t = 1000.0 + i as f32 * 500.0;
+            for k in 0..20 {
+                let ft = spike_t - 320.0 + k as f32 * 16.0;
+                if ft > 0.0 {
+                    bd.process(0.02, ft);
+                }
+            }
+            bd.process(8.0, spike_t);
+        }
+        assert!(bd.tempo_confidence > 0.5, "need tempo lock for prefire");
+        // Walk into the lead window of the predicted next onset.
+        let pred = bd.predicted_next_onset_ms;
+        assert!(pred > 0.0);
+        let lead_t = pred - BeatDetector::PREFIRE_LEAD_MS * 0.5;
+        let first = bd.take_prefire(lead_t);
+        assert!(first.is_some(), "prefire should fire inside lead window");
+        assert!(first.unwrap() >= 1.15, "synthetic strength floor");
+        // Same window must not fire again (one-shot latch).
+        assert!(
+            bd.take_prefire(lead_t + 8.0).is_none(),
+            "latched prefire must not double-fire"
+        );
+    }
+
+    #[test]
+    fn beat_detector_tempo_confidence_decays_without_onsets() {
+        let mut bd = BeatDetector::new();
+        // Plant a clean 500 ms grid so tempo locks.
+        let mut t = 0.0_f32;
+        for _ in 0..20 {
+            bd.process(0.01, t);
+            t += 16.0;
+        }
+        // Strong periodic spikes
+        for i in 0..12 {
+            let spike_t = 1000.0 + i as f32 * 500.0;
+            for k in 0..20 {
+                let ft = spike_t - 320.0 + k as f32 * 16.0;
+                if ft > 0.0 {
+                    bd.process(0.02, ft);
+                }
+            }
+            let (onset, _) = bd.process(8.0, spike_t);
+            assert!(onset || i == 0, "expected periodic onsets");
+        }
+        assert!(
+            bd.tempo_confidence > 0.5,
+            "should lock tempo, conf={}",
+            bd.tempo_confidence
+        );
+        let locked = bd.tempo_confidence;
+        let interval = bd.tempo_interval_ms;
+        // Advance ~4 beats with only silence flux — confidence must bleed.
+        let end = 1000.0 + 12.0 * 500.0 + interval * 4.0;
+        let mut u = 1000.0 + 12.0 * 500.0 + 16.0;
+        while u < end {
+            bd.process(0.01, u);
+            u += 16.0;
+        }
+        assert!(
+            bd.tempo_confidence < locked * 0.5,
+            "stale lock must decay: was {locked}, now {}",
+            bd.tempo_confidence
+        );
+        assert!(
+            !bd.prefire_ok(end),
+            "pre-fire must refuse a corpse tempo lock"
+        );
+    }
+
+    #[test]
+    fn envelope_micro_pause_is_time_based_silence_event() {
+        let mut env = EnvelopeProcessor::new();
+        // High sustain → Sustain stage with micro-pauses.
+        env.trigger(1.0, 100.0, 1.0, 20.0);
+        // Finish decay into sustain (200ms decay from t=100)
+        let _ = env.process(350.0, 20.0, 200.0, 0.8, 150.0, 1.0, 1.0, 1.0);
+        assert_eq!(env.state, EnvelopeState::Sustain);
+        // Force schedule: next pause at "now"
+        // Drive process far enough that a pause can arm and run.
+        let mut saw_silence = false;
+        for i in 0..500 {
+            let t = 400.0 + i as f32 * 16.0;
+            let out = env.process(t, 20.0, 200.0, 0.8, 150.0, 1.0, 1.0, 1.0);
+            if env.silence_event {
+                saw_silence = true;
+                assert_eq!(out, 0.0, "silence event must be true zero");
+                // Hold still inside the pause window — still silence.
+                let mid = env.process(t + 30.0, 20.0, 200.0, 0.8, 150.0, 1.0, 1.0, 1.0);
+                assert!(env.silence_event, "60–100ms pause must span real time");
+                assert_eq!(mid, 0.0);
+                break;
+            }
+        }
+        assert!(saw_silence, "sustain path must eventually micro-pause");
+    }
 
     #[test]
     fn beat_detector_tempo_tracking() {

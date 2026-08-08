@@ -1,6 +1,6 @@
 # ChloeVibes — Technical Reference
 
-Software version **1.5.0**. Product overview and install: [root README](../README.md).
+Software version **1.5.1**. Product overview and install: [root README](../README.md).
 
 This document is the long-form engineering reference (signal chain, protocols, parity, limitations, CI).
 
@@ -17,7 +17,7 @@ This document is the long-form engineering reference (signal chain, protocols, p
 | Spectral resolution | 2048-point FFT, 1024 usable bins, 23.4 Hz per bin at 48 kHz |
 | Output interface | Lovense BLE over Nordic UART Service; Buttplug 9.0.9 client on desktop |
 | Output resolution | Integer intensity 0 to 20 (21 discrete levels) |
-| Software version | 1.5.0 |
+| Software version | 1.5.1 |
 | License | MIT |
 
 ---
@@ -80,11 +80,11 @@ A hysteresis gate with threshold-proportional hysteresis and asymmetric smoothin
 
 ### 2.3 Beat Detector
 
-Onset detection runs on spectral flux against an adaptive threshold computed as the mean plus a multiple of the standard deviation over a 43-frame window. Onsets are subject to a 55 ms refractory cooldown, bounding detection at approximately 270 BPM at sixteenth-note resolution. Tempo is tracked across the most recent 16 onset timestamps. The engine publishes a predicted next-onset time when tempo confidence exceeds 0.5. Downstream, each client pre-fires the drive command approximately 76 ms ahead of the predicted onset when tempo confidence exceeds 0.6, compensating for transmission and actuator latency.
+Onset detection runs on spectral flux against an adaptive threshold computed as the mean plus a multiple of the standard deviation over a 43-frame window. Onsets are subject to a 55 ms refractory cooldown, bounding detection at approximately 270 BPM at sixteenth-note resolution. Tempo is tracked across the most recent 16 onset timestamps. The engine publishes a predicted next-onset time when tempo confidence exceeds 0.5. Downstream, each client pre-fires the drive command approximately 50 ms ahead of the predicted onset when tempo confidence exceeds 0.6 and a real onset was seen within about two beats (recency guard). Without new onsets, tempo confidence decays so stale locks cannot ghost-fire into silence or the next track.
 
 ### 2.4 ADSR Envelope Processor
 
-A full Attack-Decay-Sustain-Release envelope with an independent power-curve exponent per stage. Velocity overshoot drives the attack target to a maximum of 1.2 (120%) on hard transients. Frequency-dependent shaping, keyed to spectral centroid, reduces sustain by up to 25% and extends release by up to 40% for low-centroid content. During sustain the processor applies a five-layer modulation on irrational frequency ratios (0.17 to 2.7 Hz, selected so the summed waveform does not repeat) and deterministic stochastic micro-pauses: true-zero intervals of 3 to 6 frames (48 to 96 ms) recurring every 2 to 8 seconds. The minimum retrigger interval is 20 ms.
+A full Attack-Decay-Sustain-Release envelope with an independent power-curve exponent per stage. Velocity overshoot drives the attack target to a maximum of 1.2 (120%) on hard transients. Frequency-dependent shaping, keyed to spectral centroid, reduces sustain by up to 25% and extends release by up to 40% for low-centroid content. During sustain the processor applies a five-layer modulation on irrational frequency ratios (0.17 to 2.7 Hz, selected so the summed waveform does not repeat) and deterministic stochastic micro-pauses: true-zero intervals of 60 to 100 ms (time-based, not frame-counted) recurring every 2 to 8 seconds. Silence-class events hard-snap past output slew and Android peak-hold so the motor actually rests. The minimum retrigger interval is 20 ms.
 
 ### 2.5 Climax Engine
 
@@ -237,11 +237,11 @@ Unfiltered low-latency scan with a 15 s timeout. Connect over TRANSPORT_LE. Requ
 | Signal chain | Spectral, Gate, Beat, ADSR, Climax, Output |
 | FFT | 2048-point, Hann, 1024 bins, 23.4 Hz @ 48 kHz |
 | Frame rate | 60 Hz nominal; Android UI ~30 Hz |
-| Predictive onset lead | 76 ms at tempo confidence > 0.6 |
+| Predictive onset lead | 50 ms at tempo confidence > 0.6 (recency + decay) |
 | Output resolution | Lovense 0–20 integer |
 | BLE command rate | Desktop 50 Hz; Android 33 Hz |
 | Desktop stack | Rust, eframe/egui 0.33.3, Buttplug 9.0.9 |
-| Android stack | `com.ashairfoil.chloevibes` 1.5.0 (versionCode 5) |
+| Android stack | `com.ashairfoil.chloevibes` 1.5.1 (versionCode 6) |
 | Safety (desktop) | Watchdog 2 s, panic-stop, verified stop-all, session.log |
 | License | MIT |
 

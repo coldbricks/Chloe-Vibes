@@ -170,11 +170,11 @@ impl Settings {
         self.trigger_mode = preset.trigger_mode;
         self.binary_level = preset.binary_level;
         self.hybrid_blend = preset.hybrid_blend;
-        self.threshold_knee = defaults::THRESHOLD_KNEE;
-        self.dynamic_curve = defaults::DYNAMIC_CURVE;
+        self.threshold_knee = preset.threshold_knee;
+        self.dynamic_curve = preset.dynamic_curve;
         self.input_rise_ms = defaults::INPUT_RISE_MS;
         self.input_fall_ms = defaults::INPUT_FALL_MS;
-        self.output_slew_ms = defaults::OUTPUT_SLEW_MS;
+        self.output_slew_ms = preset.output_slew_ms;
         self.trim_ms = defaults::TRIM_MS;
         self.attack_ms = preset.attack_ms;
         self.decay_ms = preset.decay_ms;
@@ -271,8 +271,9 @@ pub mod defaults {
     pub const INPUT_RISE_MS: f32 = 8.0;
     pub const INPUT_FALL_MS: f32 = 160.0;
     // Fall path is 1.0× this value — keep low so the boom can actually land.
-    // Rise is 0.35× (~17 ms), so motor spin-up owns the attack.
-    pub const OUTPUT_SLEW_MS: f32 = 48.0;
+    // Rise is 0.35× normally; large jumps use a faster punch path in gui.rs.
+    // 42ms fall leaves more trough between kicks than the old 48–85ms pump.
+    pub const OUTPUT_SLEW_MS: f32 = 42.0;
     pub const TRIM_MS: f32 = 0.0;
 
     // Frequency — kick / sub only (Hz)
@@ -461,7 +462,8 @@ impl Settings {
         let save_device_settings = get_value(storage, names::SAVE_DEVICE_SETTINGS).unwrap_or(false);
 
         // New settings
-        let trigger_mode = get_value(storage, names::TRIGGER_MODE).unwrap_or(TriggerMode::Dynamic);
+        // Missing keys fall back to Bass Drum path (Hybrid + LowPass), not Dynamic+Full.
+        let trigger_mode = get_value(storage, names::TRIGGER_MODE).unwrap_or(TriggerMode::Hybrid);
         let binary_level =
             get_value(storage, names::BINARY_LEVEL).unwrap_or(defaults::BINARY_LEVEL);
         let hybrid_blend =
@@ -478,7 +480,7 @@ impl Settings {
             get_value(storage, names::OUTPUT_SLEW_MS).unwrap_or(defaults::OUTPUT_SLEW_MS);
         let trim_ms = get_value(storage, names::TRIM_MS).unwrap_or(defaults::TRIM_MS);
         let frequency_mode =
-            get_value(storage, names::FREQUENCY_MODE).unwrap_or(FrequencyMode::Full);
+            get_value(storage, names::FREQUENCY_MODE).unwrap_or(FrequencyMode::LowPass);
         let target_frequency =
             get_value(storage, names::TARGET_FREQUENCY).unwrap_or(defaults::TARGET_FREQUENCY);
 

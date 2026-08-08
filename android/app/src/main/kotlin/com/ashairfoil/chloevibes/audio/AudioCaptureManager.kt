@@ -19,6 +19,7 @@ import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.media.audiofx.Visualizer
+import android.os.SystemClock
 import android.util.Log
 import androidx.core.content.ContextCompat
 import java.util.concurrent.atomic.AtomicReference
@@ -57,6 +58,8 @@ class ProcessingState {
     @Volatile var lastEnvelopeOutput: Float = 0f
     @Volatile var lastFinalOutput: Float = 0f
     @Volatile var lastEnvelopeState: EnvelopeState = EnvelopeState.Idle
+    /** Climax cycle progress in [0, 1) for UI CYCLE % readout. */
+    @Volatile var lastClimaxPhase: Float = 0f
 }
 
 // ---------------------------------------------------------------------------
@@ -91,8 +94,8 @@ data class ProcessingParams(
     val minVibe: Float = 0f,
     val maxVibe: Float = 1f,
     val outputGain: Float = 1f,
-    // Fall path is 1.0× this; rise is 0.35×. 48 ms matches the bass-drum boom path.
-    val outputSlewMs: Float = 48f,
+    // Fall path is 1.0× this; rise is 0.35× (0.15× on large jumps). 42 ms boom trough.
+    val outputSlewMs: Float = 42f,
     val climaxEnabled: Boolean = false,
     val climaxIntensity: Float = 0.7f,
     val climaxBuildUpMs: Float = 90_000f,
@@ -251,6 +254,19 @@ class AudioCaptureManager(private val context: Context) {
     private var outputLevel: Float = 0f
     private var outputLevel2: Float = 0f
 
+    /**
+     * Monotonic [SystemClock.elapsedRealtime] stamp updated once per successful
+     * processing frame. Application dead-man ages this; stale → stop motors.
+     */
+    @Volatile var lastPipelineHeartbeatMs: Long = 0L
+        private set
+
+    /**
+     * Invoked on the processing thread when the loop exits after persistent
+     * errors. Application must fence output and stop motors (fail-closed).
+     */
+    var onPipelineFailClosed: (() -> Unit)? = null
+
     /** Called when Visualizer produces silence and we auto-fallback to mic. */
     var onFallbackToMic: (() -> Unit)? = null
 
@@ -277,6 +293,7 @@ class AudioCaptureManager(private val context: Context) {
             releaseCurve = preset.releaseCurve,
             minVibe = preset.minVibe,
             maxVibe = preset.maxVibe,
+            outputSlewMs = preset.outputSlewMs,
             climaxEnabled = preset.climaxEnabled,
             climaxIntensity = preset.climaxIntensity,
             climaxBuildUpMs = preset.climaxBuildUpMs,
@@ -306,6 +323,9 @@ class AudioCaptureManager(private val context: Context) {
 
         if (started) {
             running = true
+            // Arm heartbeat before the first frame so the Application watchdog
+            // has a fresh baseline (avoids an immediate false trip).
+            lastPipelineHeartbeatMs = SystemClock.elapsedRealtime()
             processingThread = Thread(::processingLoop, "ChloeVibes-Processing").apply {
                 priority = Thread.MAX_PRIORITY
                 isDaemon = true
@@ -336,6 +356,7 @@ class AudioCaptureManager(private val context: Context) {
             release()
         }
         audioRecord = null
+        lastPipelineHeartbeatMs = 0L
     }
 
     val isRunning: Boolean get() = running
@@ -648,26 +669,22 @@ class AudioCaptureManager(private val context: Context) {
                 spectralData.spectralFlux, currentTimeMs
             )
 
-            // Predictive onset: when tempo is locked, pre-trigger ~2 BLE
-            // frames early so the attack command arrives on-beat instead
-            // of 85-115ms late. False positives feel like syncopation;
-            // late delivery feels like lag.
+            // Predictive onset: takePrefire injects strength floor + one-shot
+            // latch (mirrors Rust BeatDetector::take_prefire). Confidence
+            // decays without onsets so stale locks cannot ghost-fire.
             var isOnset = detectedOnset
-            if (!isOnset && state.beatDetector.tempoConfidence > 0.6f) {
-                val predicted = state.beatDetector.predictedNextOnsetMs
-                if (predicted > 0f) {
-                    val leadTimeMs = 76f // ~2 BLE write intervals
-                    val timeToPredicted = predicted - currentTimeMs
-                    if (timeToPredicted in 0f..leadTimeMs && gateOpen) {
-                        isOnset = true
-                    }
+            var onsetStr = onsetStrength
+            if (!isOnset && gateOpen) {
+                val preStr = state.beatDetector.takePrefire(currentTimeMs)
+                if (preStr != null) {
+                    isOnset = true
+                    onsetStr = preStr
                 }
             }
 
-            // Rust-parity onset pre-gate (gui.rs:1408-1410): reject weak
-            // or low-energy "onsets" before they reach the envelope, so
-            // rhythm rider presets don't retrigger on background texture.
-            if (isOnset && (onsetStrength <= 1.02f || energy <= params.gateThreshold * 0.40f)) {
+            // Rust-parity onset pre-gate: single threshold 1.05 (matches envelope
+            // drive; kills 1.02–1.05 dead band). Prefire strength is already ≥1.15.
+            if (isOnset && (onsetStr <= 1.05f || energy <= params.gateThreshold * 0.40f)) {
                 isOnset = false
             }
 
@@ -676,7 +693,7 @@ class AudioCaptureManager(private val context: Context) {
                 gateOpen = gateOpen,
                 energy = energy,
                 isOnset = isOnset,
-                onsetStrength = onsetStrength,
+                onsetStrength = onsetStr,
                 currentTimeMs = currentTimeMs,
                 triggerMode = params.triggerMode,
                 threshold = effectiveThreshold,
@@ -702,7 +719,7 @@ class AudioCaptureManager(private val context: Context) {
                 energy = energy,
                 gateOpen = gateOpen,
                 isOnset = isOnset,
-                onsetStrength = onsetStrength,
+                onsetStrength = onsetStr,
                 currentTimeMs = currentTimeMs,
                 enabled = params.climaxEnabled,
                 intensity = params.climaxIntensity,
@@ -713,6 +730,11 @@ class AudioCaptureManager(private val context: Context) {
                 pulseDepth = params.climaxPulseDepth,
                 pattern = params.climaxPattern
             )
+            state.lastClimaxPhase = if (params.climaxEnabled) {
+                state.climaxEngine.phaseProgress(currentTimeMs, params.climaxBuildUpMs)
+            } else {
+                0f
+            }
 
             // Step 7: Output mapping (shared with Rust via map_output) + slew.
             // mapOutput zeroes the target when silent or effectively zero, so
@@ -720,10 +742,19 @@ class AudioCaptureManager(private val context: Context) {
             val isSilent = energy < 0.005f &&
                     !gateOpen &&
                     state.envelope.state == EnvelopeState.Idle
+            val silenceClass = isSilent
+                    || state.envelope.silenceEvent
+                    || state.climaxEngine.silenceEvent
             val targetOutput = mapOutput(
-                climaxOutput, params.minVibe, params.maxVibe, params.outputGain, isSilent
+                climaxOutput, params.minVibe, params.maxVibe, params.outputGain, silenceClass
             )
-            outputLevel = smoothOutput(outputLevel, targetOutput, deltaTimeS, params.outputSlewMs)
+            // Silence-class (micro-pause / boom rest / deep deny) hard-snaps
+            // past slew so the motor actually stops; large upward jumps punch.
+            outputLevel = if (silenceClass || targetOutput <= 0.001f) {
+                0f
+            } else {
+                smoothOutput(outputLevel, targetOutput, deltaTimeS, params.outputSlewMs)
+            }
             val finalOutput = outputLevel.coerceIn(0f, 1f)
             state.lastFinalOutput = finalOutput
 
@@ -731,15 +762,21 @@ class AudioCaptureManager(private val context: Context) {
             // write gate is clear when a real trigger arrives.  Send the stop
             // command once when output drops to zero, then go silent.
             if (finalOutput > 0.001f || lastSentOutput > 0.001f) {
-                // Motor 2 is driven by the HIGH-frequency content of the live
-                // audio (treble/detail); motor 1 carries the full body vibe. On a
-                // dual-motor device this puts bass/body on motor 1 and sizzle on
-                // motor 2 -- tuned by the audio itself, not the climax engine.
-                // Mirrors the Rust desktop motor2 derivation in gui.rs.
+                // Motor 2: climax ON → ClimaxEngine.motor2Output (spatial arc);
+                // climax OFF → treble spectral shadow of motor 1 (music path).
+                // Mirrors Rust desktop motor2 derivation in gui.rs.
                 val dualCb = onDualOutputUpdate
                 if (dualCb != null) {
-                    val motor2Target = if (isSilent) {
+                    val motor2Target = if (silenceClass || isSilent) {
                         0f
+                    } else if (params.climaxEnabled) {
+                        mapOutput(
+                            state.climaxEngine.motor2Output,
+                            params.minVibe,
+                            params.maxVibe,
+                            params.outputGain,
+                            false
+                        )
                     } else {
                         // Bands 0..3 = Sub/Bass/Lo-Mid/Mid, 4..7 = Hi-Mid/Pres/Brill/Air.
                         val be = spectralData.bandEnergies
@@ -750,7 +787,11 @@ class AudioCaptureManager(private val context: Context) {
                         val trebleWeight = (trebleFrac * 3.0f).coerceIn(0f, 1f)
                         (finalOutput * trebleWeight).coerceIn(0f, 1f)
                     }
-                    outputLevel2 = smoothOutput(outputLevel2, motor2Target, deltaTimeS, params.outputSlewMs)
+                    outputLevel2 = if (motor2Target <= 0.001f || silenceClass) {
+                        0f
+                    } else {
+                        smoothOutput(outputLevel2, motor2Target, deltaTimeS, params.outputSlewMs)
+                    }
                     val motor2Final = outputLevel2.coerceIn(0f, 1f)
                     dualCb.invoke(finalOutput, motor2Final)
                 } else {
@@ -760,7 +801,10 @@ class AudioCaptureManager(private val context: Context) {
                 lastSentOutput = finalOutput
             }
 
-            // Frame completed successfully -- reset error counter
+            // Frame completed successfully -- stamp dead-man heartbeat and
+            // reset the error counter. Stamp after output so a hang inside
+            // the BLE write path still ages out.
+            lastPipelineHeartbeatMs = SystemClock.elapsedRealtime()
             consecutiveErrors = 0
 
             // Maintain ~60Hz by sleeping only the remainder of this frame budget.
@@ -779,7 +823,31 @@ class AudioCaptureManager(private val context: Context) {
               Log.e("ChloeVibes", "Processing frame error", e)
               consecutiveErrors++
               if (consecutiveErrors > 100) {
-                  Log.w("ChloeVibes", "Persistent processing errors ($consecutiveErrors consecutive), breaking out of processing loop")
+                  // Fail-closed: do not leave the last intensity on a body.
+                  Log.w(
+                      "ChloeVibes",
+                      "Persistent processing errors ($consecutiveErrors consecutive), fail-closed"
+                  )
+                  running = false
+                  outputLevel = 0f
+                  outputLevel2 = 0f
+                  lastSentOutput = 0f
+                  state.lastFinalOutput = 0f
+                  try {
+                      val dualCb = onDualOutputUpdate
+                      if (dualCb != null) {
+                          dualCb.invoke(0f, 0f)
+                      } else {
+                          onOutputUpdate?.invoke(0f)
+                      }
+                  } catch (zeroErr: Exception) {
+                      Log.e("ChloeVibes", "Fail-closed zero emit failed", zeroErr)
+                  }
+                  try {
+                      onPipelineFailClosed?.invoke()
+                  } catch (cbErr: Exception) {
+                      Log.e("ChloeVibes", "onPipelineFailClosed failed", cbErr)
+                  }
                   break
               }
           }
@@ -819,9 +887,9 @@ internal fun mapOutput(
 }
 
 /**
- * Asymmetric output slew: rises fast (slewMs * 0.35) and falls slower (slewMs),
- * matching the Rust desktop output stage so the haptic "pump" feel is identical
- * on both platforms. slewMs is configurable (was a fixed 4/18ms on Android).
+ * Asymmetric output slew: rises fast (slewMs * 0.35, or 0.15 on large jumps)
+ * and falls slower (slewMs), matching the Rust desktop output stage so the
+ * haptic "pump" feel is identical on both platforms.
  */
 private fun smoothOutput(
     current: Float,
@@ -829,7 +897,12 @@ private fun smoothOutput(
     deltaTimeS: Float,
     slewMs: Float
 ): Float {
-    val upMs = (slewMs * 0.35f).coerceAtLeast(1f)
+    val jumpUp = target - current
+    val upMs = if (jumpUp > 0.25f) {
+        (slewMs * 0.15f).coerceIn(1f, 12f)
+    } else {
+        (slewMs * 0.35f).coerceAtLeast(1f)
+    }
     val downMs = slewMs.coerceAtLeast(1f)
     val timeMs = if (target >= current) upMs else downMs
     val alpha = smoothingAlpha(deltaTimeS, timeMs)

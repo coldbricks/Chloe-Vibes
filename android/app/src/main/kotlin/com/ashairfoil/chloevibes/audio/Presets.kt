@@ -1,6 +1,6 @@
 // ==========================================================================
 // Presets.kt -- Named Preset Configurations
-// Ported from presets.rs -- all 29 factory presets
+// Ported from presets.rs -- keep shared parameters aligned with src/presets.rs
 //
 // Presets snap all signal-processing parameters to known-good values.
 // Think of these like synth patches -- each one is tuned for a specific
@@ -33,13 +33,15 @@ data class Preset(
     val gateThreshold: Float,
     val autoGateAmount: Float,
     val gateSmoothing: Float,
-    val thresholdKnee: Float = 0.22f,
+    /** Soft-knee width; Bass Drum default 0.15 (parity with Rust). */
+    val thresholdKnee: Float = 0.15f,
 
     // Trigger
     val triggerMode: TriggerMode,
     val binaryLevel: Float,
     val hybridBlend: Float,
-    val dynamicCurve: Float = 1f,
+    /** Dynamic trigger curve; Bass Drum default 1.2 (parity with Rust). */
+    val dynamicCurve: Float = 1.2f,
 
     // ADSR Envelope
     val attackMs: Float,
@@ -53,6 +55,8 @@ data class Preset(
     // Output Range
     val minVibe: Float,
     val maxVibe: Float,
+    /** Output slew fall time (ms). Boom path ~42 ms for deep troughs. */
+    val outputSlewMs: Float = 42f,
 
     // Climax Engine (defaults = off with neutral settings)
     val climaxEnabled: Boolean = false,
@@ -523,28 +527,40 @@ fun factoryPresets(): List<Preset> = listOf(
         minVibe = 0.12f,
         maxVibe = 1f
     ),
+    // Product edge path: climax ON. Stairs escalates; deep tease + true-zero floor.
     Preset(
         name = "Edge & Deny",
-        description = "Builds intensity then deliberately pulls back -- designed to delay and intensify",
+        description = "Session arc — stepped build, hard deny to near-silence, aching rebuild; edges without flat-max numbness",
         category = PresetCategory.Effect,
-        mainVolume = 1.6f,
+        mainVolume = 1.55f,
         frequencyMode = FrequencyMode.Full,
         targetFrequency = 200f,
         gateThreshold = 0.08f,
         autoGateAmount = 0f,
-        gateSmoothing = 0.10f,
+        gateSmoothing = 0.12f,
+        thresholdKnee = 0.15f,
         triggerMode = TriggerMode.Dynamic,
-        binaryLevel = 0.8f,
-        hybridBlend = 0.5f,
-        attackMs = 20f,
-        decayMs = 100f,
-        sustainLevel = 0.85f,
-        releaseMs = 350f,
-        attackCurve = 0.6f,
-        decayCurve = 1f,
-        releaseCurve = 1.3f,
-        minVibe = 0.08f,
-        maxVibe = 0.95f
+        binaryLevel = 0.78f,
+        hybridBlend = 0.45f,
+        dynamicCurve = 1.15f,
+        attackMs = 22f,
+        decayMs = 120f,
+        sustainLevel = 0.78f,
+        releaseMs = 380f,
+        attackCurve = 0.55f,
+        decayCurve = 1.05f,
+        releaseCurve = 1.35f,
+        minVibe = 0f,
+        maxVibe = 0.92f,
+        outputSlewMs = 42f,
+        climaxEnabled = true,
+        climaxIntensity = 0.82f,
+        climaxBuildUpMs = 100_000f,
+        climaxTeaseRatio = 0.28f,
+        climaxTeaseDrop = 0.72f,
+        climaxSurgeBoost = 0.55f,
+        climaxPulseDepth = 0.12f,
+        climaxPattern = ClimaxPattern.Stairs
     ),
     Preset(
         name = "Slow Burn",
@@ -592,28 +608,40 @@ fun factoryPresets(): List<Preset> = listOf(
         minVibe = 0f,
         maxVibe = 1f
     ),
+    // Honest name: climax engine drives the long musical arc.
     Preset(
         name = "Crescendo",
-        description = "Designed for the climax engine -- builds relentlessly with musical dynamics",
+        description = "Climax-driven musical arc — slow Wave build, soft early tease, late surge; contrast floor stays low",
         category = PresetCategory.Musical,
-        mainVolume = 1.3f,
+        mainVolume = 1.35f,
         frequencyMode = FrequencyMode.Full,
         targetFrequency = 200f,
         gateThreshold = 0.07f,
         autoGateAmount = 0f,
-        gateSmoothing = 0.18f,
+        gateSmoothing = 0.16f,
+        thresholdKnee = 0.15f,
         triggerMode = TriggerMode.Dynamic,
         binaryLevel = 0.8f,
         hybridBlend = 0.5f,
-        attackMs = 25f,
-        decayMs = 150f,
-        sustainLevel = 0.88f,
-        releaseMs = 450f,
+        dynamicCurve = 1.15f,
+        attackMs = 28f,
+        decayMs = 160f,
+        sustainLevel = 0.82f,
+        releaseMs = 480f,
         attackCurve = 0.5f,
         decayCurve = 0.9f,
-        releaseCurve = 1.2f,
-        minVibe = 0.10f,
-        maxVibe = 0.95f
+        releaseCurve = 1.25f,
+        minVibe = 0.04f,
+        maxVibe = 0.94f,
+        outputSlewMs = 48f,
+        climaxEnabled = true,
+        climaxIntensity = 0.78f,
+        climaxBuildUpMs = 110_000f,
+        climaxTeaseRatio = 0.16f,
+        climaxTeaseDrop = 0.42f,
+        climaxSurgeBoost = 0.85f,
+        climaxPulseDepth = 0.14f,
+        climaxPattern = ClimaxPattern.Wave
     ),
     // === MAXIMUM INTENSITY PRESETS ===
     Preset(
@@ -731,104 +759,118 @@ fun factoryPresets(): List<Preset> = listOf(
         minVibe = 0.10f,
         maxVibe = 1f
     ),
-    // === EXPERIENCE PRESETS (climax engine enabled, full-stack) ===
+    // === EXPERIENCE PRESETS (climax engine enabled — session arc) ===
+    // Design rules vs neural adaptation death:
+    //   - true-zero / near-zero min_vibe so deny + troughs reset nerves
+    //   - moderate sustain (not 0.9+ flat) so music still carves contrast
+    //   - pulse_depth ≤ ~0.22 (motor-expressible); deep tease for edge
+    //   - Surge presets keep tease_ratio ≤ 0.18 so terminal surge is not cancelled
     Preset(
         name = "Slow Tease",
-        description = "Long edging cycle -- deep denial drops, gentle rebuilds, designed to keep you right on the edge",
+        description = "Long edging cycle — Stairs climb, deep deny to silence, slow rebuild; stays on the edge without flat-max burn",
         category = PresetCategory.Effect,
-        mainVolume = 1.5f,
+        mainVolume = 1.45f,
         frequencyMode = FrequencyMode.Full,
         targetFrequency = 200f,
         gateThreshold = 0.07f,
         autoGateAmount = 0f,
-        gateSmoothing = 0.18f,
+        gateSmoothing = 0.16f,
+        thresholdKnee = 0.15f,
         triggerMode = TriggerMode.Dynamic,
-        binaryLevel = 0.8f,
-        hybridBlend = 0.5f,
-        attackMs = 25f,
-        decayMs = 140f,
-        sustainLevel = 0.88f,
-        releaseMs = 400f,
+        binaryLevel = 0.78f,
+        hybridBlend = 0.45f,
+        dynamicCurve = 1.15f,
+        attackMs = 28f,
+        decayMs = 150f,
+        sustainLevel = 0.76f,
+        releaseMs = 420f,
         attackCurve = 0.5f,
-        decayCurve = 0.9f,
-        releaseCurve = 1.2f,
-        minVibe = 0.08f,
-        maxVibe = 0.92f,
+        decayCurve = 0.95f,
+        releaseCurve = 1.25f,
+        minVibe = 0f,
+        maxVibe = 0.90f,
+        outputSlewMs = 48f,
         climaxEnabled = true,
-        climaxIntensity = 0.8f,
-        climaxBuildUpMs = 120_000f,
+        climaxIntensity = 0.78f,
+        climaxBuildUpMs = 150_000f,
         climaxTeaseRatio = 0.30f,
-        climaxTeaseDrop = 0.70f,
-        climaxSurgeBoost = 0.6f,
-        climaxPulseDepth = 0.12f,
-        climaxPattern = ClimaxPattern.Wave
+        climaxTeaseDrop = 0.75f,
+        climaxSurgeBoost = 0.50f,
+        climaxPulseDepth = 0.10f,
+        climaxPattern = ClimaxPattern.Stairs
     ),
     Preset(
         name = "Ride the Beat",
-        description = "Music-locked escalation -- chaos + sub-harmonic resonance sync to the rhythm, builds across cycles",
+        description = "Music-locked escalation — hybrid punch + Surge climax; low tease so terminal peaks survive",
         category = PresetCategory.Musical,
-        mainVolume = 1.7f,
+        mainVolume = 1.75f,
         frequencyMode = FrequencyMode.Full,
         targetFrequency = 200f,
         gateThreshold = 0.10f,
-        autoGateAmount = 0.15f,
-        gateSmoothing = 0.08f,
+        autoGateAmount = 0.12f,
+        gateSmoothing = 0.07f,
+        thresholdKnee = 0.15f,
         triggerMode = TriggerMode.Hybrid,
-        binaryLevel = 0.80f,
-        hybridBlend = 0.35f,
-        attackMs = 5f,
-        decayMs = 80f,
-        sustainLevel = 0.72f,
-        releaseMs = 200f,
+        binaryLevel = 0.82f,
+        hybridBlend = 0.40f,
+        dynamicCurve = 1.2f,
+        attackMs = 8f,
+        decayMs = 95f,
+        sustainLevel = 0.62f,
+        releaseMs = 210f,
         attackCurve = 0.35f,
-        decayCurve = 1.3f,
-        releaseCurve = 1.6f,
-        minVibe = 0.05f,
+        decayCurve = 1.35f,
+        releaseCurve = 1.55f,
+        minVibe = 0f,
         maxVibe = 1f,
+        outputSlewMs = 42f,
         climaxEnabled = true,
-        climaxIntensity = 0.7f,
-        climaxBuildUpMs = 60_000f,
-        climaxTeaseRatio = 0.15f,
-        climaxTeaseDrop = 0.35f,
-        climaxSurgeBoost = 0.7f,
-        climaxPulseDepth = 0.22f,
+        climaxIntensity = 0.74f,
+        climaxBuildUpMs = 75_000f,
+        climaxTeaseRatio = 0.12f,
+        climaxTeaseDrop = 0.38f,
+        climaxSurgeBoost = 0.90f,
+        climaxPulseDepth = 0.16f,
         climaxPattern = ClimaxPattern.Surge
     ),
     Preset(
         name = "Break Me",
-        description = "No restraint -- extreme surge, aggressive deny cycles, dual motor anti-phase, maximum chaos",
+        description = "Hard climax path — fast Surge, deep deny contrast, motor-honest pulse; intensity without constant floor",
         category = PresetCategory.Effect,
-        mainVolume = 2.4f,
+        mainVolume = 2.2f,
         frequencyMode = FrequencyMode.Full,
         targetFrequency = 200f,
         gateThreshold = 0.05f,
         autoGateAmount = 0f,
         gateSmoothing = 0.05f,
+        thresholdKnee = 0.15f,
         triggerMode = TriggerMode.Hybrid,
-        binaryLevel = 0.95f,
-        hybridBlend = 0.45f,
-        attackMs = 2f,
-        decayMs = 35f,
-        sustainLevel = 0.92f,
-        releaseMs = 100f,
-        attackCurve = 0.25f,
-        decayCurve = 1.1f,
+        binaryLevel = 0.92f,
+        hybridBlend = 0.48f,
+        dynamicCurve = 1.25f,
+        attackMs = 3f,
+        decayMs = 45f,
+        sustainLevel = 0.80f,
+        releaseMs = 120f,
+        attackCurve = 0.28f,
+        decayCurve = 1.15f,
         releaseCurve = 1.4f,
-        minVibe = 0.12f,
+        minVibe = 0.02f,
         maxVibe = 1f,
+        outputSlewMs = 36f,
         climaxEnabled = true,
         climaxIntensity = 1.0f,
-        climaxBuildUpMs = 45_000f,
-        climaxTeaseRatio = 0.22f,
-        climaxTeaseDrop = 0.55f,
-        climaxSurgeBoost = 1.2f,
-        climaxPulseDepth = 0.35f,
+        climaxBuildUpMs = 50_000f,
+        climaxTeaseRatio = 0.16f,
+        climaxTeaseDrop = 0.58f,
+        climaxSurgeBoost = 1.25f,
+        climaxPulseDepth = 0.22f,
         climaxPattern = ClimaxPattern.Surge
     ),
-    // === BOOM TEMPO MACROS (parity with Rust apply_chloe_rhythm_profile) ===
-    // Same names kept for catalog continuity; guts are pure bass-drum body.
+    // === BOOM TEMPO MACROS (catalog names match desktop Deep 90 / Club 125 / Hard 140) ===
+    // Climax always off — pure bass-drum body. Same recipe as Bass Drum, tempo-scaled.
     Preset(
-        name = "Chloe Loose",
+        name = "Deep 90",
         description = "Deep 90 — slow bass-drum boom, body-long decay into silence",
         category = PresetCategory.Bass,
         mainVolume = 1.85f,
@@ -850,10 +892,11 @@ fun factoryPresets(): List<Preset> = listOf(
         decayCurve = 1.8f,
         releaseCurve = 1.3f,
         minVibe = 0f,
-        maxVibe = 1f
+        maxVibe = 1f,
+        outputSlewMs = 55f
     ),
     Preset(
-        name = "Chloe Medium",
+        name = "Club 125",
         description = "Club 125 — default bass-drum boom (same shape as Bass Drum)",
         category = PresetCategory.Bass,
         mainVolume = 1.90f,
@@ -875,10 +918,11 @@ fun factoryPresets(): List<Preset> = listOf(
         decayCurve = 1.8f,
         releaseCurve = 1.3f,
         minVibe = 0f,
-        maxVibe = 1f
+        maxVibe = 1f,
+        outputSlewMs = 42f
     ),
     Preset(
-        name = "Chloe Ultimate",
+        name = "Hard 140",
         description = "Hard 140 — harder hit, full musical boom, deep trough",
         category = PresetCategory.Bass,
         mainVolume = 2.15f,
@@ -900,13 +944,21 @@ fun factoryPresets(): List<Preset> = listOf(
         decayCurve = 1.9f,
         releaseCurve = 1.3f,
         minVibe = 0f,
-        maxVibe = 1f
+        maxVibe = 1f,
+        outputSlewMs = 42f
     )
 )
 
-/** Get a preset by name (case-insensitive). */
-fun findPreset(name: String): Preset? =
-    factoryPresets().find { it.name.equals(name, ignoreCase = true) }
+/** Get a preset by name (case-insensitive). Migrates legacy Chloe tempo macro names. */
+fun findPreset(name: String): Preset? {
+    val resolved = when {
+        name.equals("Chloe Loose", ignoreCase = true) -> "Deep 90"
+        name.equals("Chloe Medium", ignoreCase = true) -> "Club 125"
+        name.equals("Chloe Ultimate", ignoreCase = true) -> "Hard 140"
+        else -> name
+    }
+    return factoryPresets().find { it.name.equals(resolved, ignoreCase = true) }
+}
 
 /** Get all presets in a given category. */
 fun presetsInCategory(category: PresetCategory): List<Preset> =

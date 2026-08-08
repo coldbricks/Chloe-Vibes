@@ -15,8 +15,68 @@ package com.ashairfoil.chloevibes.device
 /**
  * Lovense BLE command builder.
  * All commands are ASCII strings ending with ';'
+ *
+ * Motor-class rest floors / gammas must stay lockstep with desktop
+ * `MotorKind` in `src/gui.rs` (true-zero rest + punch contrast).
  */
 object LovenseProtocol {
+
+    /** Device-class feel profiles (parity with desktop MotorKind). */
+    enum class MotorFeel(val restFloor: Float, val feelGamma: Float) {
+        /** Domi / wand-style big ERM — higher floor, steeper gamma. */
+        Wand(0.026f, 1.68f),
+        /** Lush / Ferri / Gush / Hush-style compact. */
+        Compact(0.032f, 1.40f),
+        /** Edge / Nora / dual-focus insertables. */
+        DualBody(0.026f, 1.55f),
+        Generic(0.024f, 1.48f);
+
+        companion object {
+            fun fromDeviceTypeId(identifier: String): MotorFeel =
+                when (identifier.uppercase()) {
+                    "W", "H" -> Wand
+                    "P", "J", "N", "OC", "A", "C" -> DualBody // Edge/Dolce/Gemini/Osci/Nora
+                    "S", "ED", "Z", "B", "EA", "L" -> Compact // Lush/Gush/Hush/Max/Ambi
+                    else -> Generic
+                }
+
+            fun fromAdvertisedName(name: String): MotorFeel {
+                val n = name.lowercase()
+                return when {
+                    n.contains("domi") || n.contains("wand") ||
+                        n.contains("magic wand") || n.contains("hyphy") -> Wand
+                    n.contains("edge") || n.contains("nora") ||
+                        n.contains("dolce") || n.contains("gemini") ||
+                        n.contains("osci") -> DualBody
+                    n.contains("lush") || n.contains("ferri") ||
+                        n.contains("gush") || n.contains("hush") ||
+                        n.contains("ambi") || n.contains("diamo") ||
+                        n.contains("exomoon") || n.contains("calor") ||
+                        n.contains("flexer") || n.contains("max") -> Compact
+                    else -> {
+                        // Classic LVS-<code><digits> advertisements before DeviceType.
+                        modelHint(name)?.let { hint ->
+                            when (hint.lowercase()) {
+                                "domi" -> Wand
+                                "edge", "nora", "dolce", "gemini", "osci", "osci 3" -> DualBody
+                                "lush", "gush", "hush", "max", "ambi" -> Compact
+                                else -> Generic
+                            }
+                        } ?: Generic
+                    }
+                }
+            }
+        }
+    }
+
+    /** True when a command is a full motor stop (must preempt peak/pending). */
+    fun isStopCommand(command: String): Boolean {
+        val c = command.trim()
+        if (c == "Vibrate:0;" || c.startsWith("Vibrate:0;")) return true
+        // Dual-motor zero pair
+        if (c.contains("Vibrate1:0;") && c.contains("Vibrate2:0;")) return true
+        return false
+    }
 
     /**
      * Set vibration intensity.
