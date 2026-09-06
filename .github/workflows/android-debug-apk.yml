@@ -1,12 +1,10 @@
 name: Build Android Debug APK
 
 on:
-  push:
-    branches: [ master ]
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build-android-debug-apk:
@@ -39,18 +37,3 @@ jobs:
           name: ChloeVibes-latest-debug-apk
           path: dist/ChloeVibes-latest-debug.apk
           if-no-files-found: error
-
-      - name: Publish release asset
-        uses: ncipollo/release-action@v1
-        with:
-          tag: android-latest
-          name: ChloeVibes Android Latest
-          body: Latest Android debug APK built from master.
-          artifacts: dist/ChloeVibes-latest-debug.apk
-          artifactErrorsFailBuild: true
-          allowUpdates: true
-          removeArtifacts: true
-          replacesArtifacts: true
-          # Keep the comprehensive "latest" (Windows + Android) release as the
-          # GitHub "Latest" — this rolling APK-only release must not claim it.
-          makeLatest: false

@@ -49,11 +49,12 @@
 
 use chloe_vibes::audio::{
     map_output, BeatDetector, ClimaxEngine, ClimaxPattern, EnvelopeProcessor, EnvelopeState,
-    FrequencyMode, Gate, SpectralAnalyzer, TriggerMode,
+    FrequencyMode, Gate, SpectralAnalyzer, TriggerMode, FFT_SIZE,
 };
 use std::f32::consts::TAU;
 use std::fs;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
 // Synthetic PCM generation
@@ -240,6 +241,15 @@ struct FrameOut {
 // ---------------------------------------------------------------------------
 
 fn run_chain(pcm: &[f32], scenario: &Scenario) -> Vec<FrameOut> {
+    run_chain_measured(pcm, scenario, None, FRAME_SIZE)
+}
+
+fn run_chain_measured(
+    pcm: &[f32],
+    scenario: &Scenario,
+    mut timings: Option<&mut Vec<Duration>>,
+    analysis_window_samples: usize,
+) -> Vec<FrameOut> {
     let mut analyzer = SpectralAnalyzer::new(SAMPLE_RATE);
     let mut gate = Gate::new();
     let mut beat = BeatDetector::new();
@@ -252,10 +262,12 @@ fn run_chain(pcm: &[f32], scenario: &Scenario) -> Vec<FrameOut> {
     for frame_idx in 0..num_frames {
         let start = frame_idx * FRAME_SIZE;
         let end = start + FRAME_SIZE;
-        let chunk = &pcm[start..end];
+        let chunk = &pcm[end.saturating_sub(analysis_window_samples)..end];
 
         // currentTimeMs advances by FRAME_SIZE samples per frame.
         let current_time_ms = (frame_idx as f32) * (FRAME_SIZE as f32) * 1000.0 / SAMPLE_RATE;
+
+        let started = timings.as_ref().map(|_| Instant::now());
 
         // 1) Spectral analysis (mono, 1 channel)
         let spectral = analyzer.analyze(chunk, 1);
@@ -338,13 +350,18 @@ fn run_chain(pcm: &[f32], scenario: &Scenario) -> Vec<FrameOut> {
             is_silent,
         );
 
-        out.push(FrameOut {
+        let frame = std::hint::black_box(FrameOut {
             envelope: env_out,
             climax: climax_out,
             motor2_shaped,
             motor1_out,
             motor2_out,
         });
+        if let Some(started) = started {
+            let elapsed = started.elapsed();
+            timings.as_deref_mut().unwrap().push(elapsed);
+        }
+        out.push(frame);
     }
 
     out
@@ -430,6 +447,70 @@ fn golden_path() -> PathBuf {
 // ---------------------------------------------------------------------------
 // The test
 // ---------------------------------------------------------------------------
+
+/// Opt-in benchmark of the existing CPU engine, not a substitute FFT backend.
+/// Run: cargo test --release --test parity benchmark_signal_chain -- --ignored --nocapture
+#[test]
+#[ignore = "opt-in release timing benchmark; no wall-clock pass/fail threshold"]
+fn benchmark_signal_chain() -> Result<(), &'static str> {
+    if cfg!(debug_assertions) {
+        return Err("Use --release for meaningful engine timings");
+    }
+    const REPETITIONS: usize = 20;
+    const WARMUP_REPETITIONS: usize = 2;
+    let pcm = generate_pcm();
+    let frames_per_run = pcm.len() / FRAME_SIZE;
+    let mut all_timings = Vec::with_capacity(frames_per_run * REPETITIONS * SCENARIOS.len());
+    let mut scenario_timings = Vec::with_capacity(SCENARIOS.len());
+
+    // PCM generation, engine construction, vector allocation and reporting all
+    // stay outside the timed segment. State evolves through each 10s scenario.
+    for scenario in SCENARIOS {
+        for _ in 0..WARMUP_REPETITIONS {
+            std::hint::black_box(run_chain_measured(&pcm, scenario, None, FFT_SIZE));
+        }
+        let mut timings = Vec::with_capacity(frames_per_run * REPETITIONS);
+        for _ in 0..REPETITIONS {
+            std::hint::black_box(run_chain_measured(
+                &pcm,
+                scenario,
+                Some(&mut timings),
+                FFT_SIZE,
+            ));
+        }
+        all_timings.extend_from_slice(&timings);
+        scenario_timings.push((scenario.label, timings));
+    }
+
+    fn report(label: &str, samples: &mut [Duration]) {
+        samples.sort_unstable();
+        let percentile = |p: f64| {
+            let index = ((p * samples.len() as f64).ceil() as usize).saturating_sub(1);
+            samples[index].as_secs_f64() * 1_000_000.0
+        };
+        let total_seconds = samples.iter().map(Duration::as_secs_f64).sum::<f64>();
+        let mean_us = total_seconds * 1_000_000.0 / samples.len() as f64;
+        let max_us = samples.last().unwrap().as_secs_f64() * 1_000_000.0;
+        eprintln!(
+            "{label}: frames={} p50_us={:.3} p95_us={:.3} p99_us={:.3} max_us={max_us:.3} mean_us={mean_us:.3} throughput_frames_s={:.0} p99_of_60Hz_budget_percent={:.3}",
+            samples.len(), percentile(0.50), percentile(0.95), percentile(0.99),
+            samples.len() as f64 / total_seconds,
+            percentile(0.99) / (1_000_000.0 / 60.0) * 100.0,
+        );
+    }
+
+    eprintln!(
+        "CPU release engine benchmark: 48kHz mono, 1024-sample hop, rolling 2048-sample FFT window; FFT -> energy -> gate -> beat -> ADSR -> Climax -> both output maps."
+    );
+    eprintln!(
+        "Warmup={WARMUP_REPETITIONS} runs/scenario, measured={REPETITIONS} runs/scenario. Excludes capture, UI scheduling, output slew/delay, Bluetooth and physical motor latency."
+    );
+    for (label, mut timings) in scenario_timings {
+        report(label, &mut timings);
+    }
+    report("ALL", &mut all_timings);
+    Ok(())
+}
 
 #[test]
 fn parity_rust_golden() {

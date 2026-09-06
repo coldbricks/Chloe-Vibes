@@ -16,6 +16,7 @@ import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.media.audiofx.Visualizer
@@ -46,10 +47,10 @@ enum class AudioSourceMode {
  * Updated on the processing thread, read by the UI thread.
  */
 class ProcessingState {
-    val analyzer = SpectralAnalyzer(48000f)
-    val gate = Gate()
+    var analyzer = SpectralAnalyzer(48000f)
+    var gate = Gate()
     val envelope = EnvelopeProcessor()
-    val beatDetector = BeatDetector()
+    var beatDetector = BeatDetector()
     val climaxEngine = ClimaxEngine()
 
     @Volatile var lastSpectralData = SpectralData()
@@ -118,34 +119,36 @@ class AudioCaptureManager(private val context: Context) {
 
     // Processing state (thread-safe via volatile fields)
     val state = ProcessingState()
+    private val processingClock = AudioProcessingClock()
+
+    /** Queue UI resets so the processing thread supplies the correct epoch. */
+    fun requestClimaxReset() = processingClock.requestClimaxReset()
 
     // Audio source
-    private var sourceMode: AudioSourceMode = AudioSourceMode.SystemAudio
-    private var visualizer: Visualizer? = null
-    private var audioRecord: AudioRecord? = null
+    @Volatile var sourceMode: AudioSourceMode = AudioSourceMode.SystemAudio
+        private set
+    @Volatile private var visualizer: Visualizer? = null
+    @Volatile private var audioRecord: AudioRecord? = null
 
     // Processing thread
-    private var processingThread: Thread? = null
+    @Volatile private var processingThread: Thread? = null
+    @Volatile private var microphoneThread: Thread? = null
     @Volatile private var running = false
 
     // Latest captured samples (written by capture, read by processing)
     private val sampleLock = Object()
     private var capturedSamples = FloatArray(0)
-    private var hasFreshSamples = false
+    private val captureCadence = AudioFrameCadence()
     @Volatile private var lastSampleTimeMs = 0L
 
     // Visualizer FFT magnitude data (linear, 0.0-1.0 per bin, Rust-parity)
     private var capturedMagnitudes = FloatArray(0)
-    private var hasFreshMagnitudes = false
     @Volatile private var useVisualizerFft = false
     @Volatile private var visualizerSampleRate = 48000
 
-    // Silence / stall detection for Visualizer fallback
-    @Volatile private var silentFrameCount = 0
+    // Silent audio is valid input. Only missing callbacks trigger recovery.
     private companion object {
-        const val SILENT_FRAMES_BEFORE_FALLBACK = 240
         const val STALL_TIMEOUT_MS = 3000L
-        const val VISUALIZER_FRAME_HOLD_MS = 120L
         const val TARGET_FRAME_MS = 16L
     }
 
@@ -250,7 +253,8 @@ class AudioCaptureManager(private val context: Context) {
     var onOutputUpdate: ((Float) -> Unit)? = null
     /** Dual-motor callback: (motor1, motor2) for devices with independent motors. */
     var onDualOutputUpdate: ((Float, Float) -> Unit)? = null
-    @Volatile private var lastSentOutput: Float = 0f
+    @Volatile var hasRecentInput: Boolean = false
+        private set
     private var outputLevel: Float = 0f
     private var outputLevel2: Float = 0f
 
@@ -311,9 +315,28 @@ class AudioCaptureManager(private val context: Context) {
      * @param mode which audio source to use
      * @return true if started successfully
      */
+    @Synchronized
     fun start(mode: AudioSourceMode = AudioSourceMode.SystemAudio): Boolean {
         if (running) return true
+        // A stopped producer may still be unwinding a platform callback.
+        // Never let it share engine state with a new processing thread.
+        if (processingThread?.isAlive == true) return false
         sourceMode = mode
+        synchronized(sampleLock) {
+            capturedSamples = FloatArray(0)
+            capturedMagnitudes = FloatArray(0)
+            captureCadence.clear()
+        }
+        state.envelope.reset()
+        state.beatDetector = BeatDetector()
+        state.gate = Gate()
+        state.analyzer = SpectralAnalyzer(48000f)
+        state.lastSpectralData = SpectralData()
+        outputLevel = 0f
+        outputLevel2 = 0f
+        hasRecentInput = false
+        visualizerRestartFailures = 0
+        running = true // The microphone worker must see this before it starts.
 
         Log.i("ChloeVibes", "Starting audio capture in mode: $mode")
         val started = when (mode) {
@@ -321,6 +344,7 @@ class AudioCaptureManager(private val context: Context) {
             AudioSourceMode.Microphone -> startMicrophone()
         }
 
+        processingClock.onCaptureStartResult(started)
         if (started) {
             running = true
             // Arm heartbeat before the first frame so the Application watchdog
@@ -333,29 +357,41 @@ class AudioCaptureManager(private val context: Context) {
             }
             Log.i("ChloeVibes", "Audio capture started successfully")
         } else {
+            running = false
             Log.w("ChloeVibes", "Audio capture failed to start in mode: $mode")
         }
         return started
     }
 
     /** Stop audio capture and processing. */
+    @Synchronized
     fun stop() {
         Log.i("ChloeVibes", "Stopping audio capture")
         running = false
-        processingThread?.join(500)
-        processingThread = null
-
-        visualizer?.apply {
-            enabled = false
-            release()
+        processingThread?.interrupt()
+        val (oldVisualizer, oldRecord) = synchronized(sampleLock) {
+            val old = Pair(visualizer, audioRecord)
+            visualizer = null
+            audioRecord = null
+            captureCadence.clear()
+            old
         }
-        visualizer = null
-
-        audioRecord?.apply {
-            stop()
-            release()
-        }
-        audioRecord = null
+        val oldMicThread = microphoneThread
+        microphoneThread = null
+        useVisualizerFft = false
+        // Fence callbacks before releasing resources. Platform AudioRecord.stop
+        // may wait for an in-flight read, so cleanup must not block the UI.
+        oldMicThread?.interrupt()
+        Thread({
+            runCatching { oldVisualizer?.enabled = false }
+            runCatching { oldVisualizer?.release() }
+            runCatching { oldRecord?.stop() }
+            oldMicThread?.join(500L)
+            runCatching { oldRecord?.release() }
+        }, "ChloeVibes-CaptureCleanup").apply { isDaemon = true; start() }
+        synchronized(sampleLock) { captureCadence.clear() }
+        state.lastFinalOutput = 0f
+        hasRecentInput = false
         lastPipelineHeartbeatMs = 0L
     }
 
@@ -370,8 +406,10 @@ class AudioCaptureManager(private val context: Context) {
             != PackageManager.PERMISSION_GRANTED
         ) return false
 
+        var pendingVisualizer: Visualizer? = null
         return try {
             val viz = Visualizer(0) // session 0 = system audio output mix
+            pendingVisualizer = viz
             val maxCapture = Visualizer.getCaptureSizeRange()[1]
             viz.captureSize = maxCapture.coerceAtMost(FFT_SIZE)
             viz.setDataCaptureListener(
@@ -389,11 +427,7 @@ class AudioCaptureManager(private val context: Context) {
                         fft: ByteArray,
                         samplingRate: Int
                     ) {
-                        // Android Visualizer FFT format: [DC_real, DC_imag,
-                        // bin1_real, bin1_imag, ...]. Convert to magnitudes
-                        // normalized to 0.0-1.0, matching the Web Audio
-                        // AnalyserNode's getByteFrequencyData() output that
-                        // the original HTML ChloeVibes used.
+                        if (!running || visualizer !== this@AudioCaptureManager.visualizer || fft.size < 4) return
                         val numBins = fft.size / 2
                         val mags = FloatArray(numBins)
                         // Linear magnitudes (no dB conversion). Matches Rust
@@ -403,29 +437,45 @@ class AudioCaptureManager(private val context: Context) {
                         // peaks around 181; normalize by captureSize/2 (matches
                         // Rust's 2.0/FFT_SIZE convention) and clamp.
                         val linearScale = 2f / numBins.toFloat()
-                        for (i in 0 until numBins) {
+                        // Visualizer FFT layout: fft[0] = Re(DC), fft[1] =
+                        // Re(Nyquist), then Re/Im pairs for bins 1..N/2-1.
+                        // Treating [0]/[1] as a complex pair mixed DC with
+                        // Nyquist energy in bin 0.
+                        mags[0] = (kotlin.math.abs(fft[0].toFloat()) * linearScale)
+                            .coerceIn(0f, 1f)
+                        for (i in 1 until numBins) {
                             val re = fft[2 * i].toFloat()
                             val im = fft[2 * i + 1].toFloat()
                             val mag = kotlin.math.sqrt(re * re + im * im) * linearScale
                             mags[i] = mag.coerceIn(0f, 1f)
                         }
                         synchronized(sampleLock) {
+                            if (!running || visualizer !== this@AudioCaptureManager.visualizer) return
                             capturedMagnitudes = mags
-                            hasFreshMagnitudes = true
+                            captureCadence.received(SystemClock.elapsedRealtime())
+                            visualizerSampleRate = samplingRate / 1000
+                            lastSampleTimeMs = SystemClock.elapsedRealtime()
                         }
-                        visualizerSampleRate = samplingRate / 1000 // API gives milliHz
-                        lastSampleTimeMs = System.currentTimeMillis()
                     }
                 },
                 Visualizer.getMaxCaptureRate(),
                 false, // waveform — not needed
                 true   // fft — use this instead
             )
-            viz.enabled = true
-            visualizer = viz
-            useVisualizerFft = true
+            synchronized(sampleLock) {
+                if (!running) {
+                    viz.release()
+                    return false
+                }
+                visualizer = viz
+                useVisualizerFft = true
+                viz.enabled = true
+            }
+            lastSampleTimeMs = SystemClock.elapsedRealtime()
             true
         } catch (e: Exception) {
+            if (visualizer === pendingVisualizer) visualizer = null
+            runCatching { pendingVisualizer?.release() }
             Log.e("ChloeVibes", "Visualizer initialization failed", e)
             false
         }
@@ -435,11 +485,26 @@ class AudioCaptureManager(private val context: Context) {
     // AudioRecord (microphone fallback)
     // -----------------------------------------------------------------------
 
+    /**
+     * True while telephony or VoIP audio is active. The silence/stall fallback
+     * must never open the microphone mid-call and turn a private conversation
+     * into toy output. AudioManager.mode needs no extra permission.
+     */
+    private fun isCallActive(): Boolean {
+        val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        return am != null &&
+            (am.mode == AudioManager.MODE_IN_CALL ||
+                am.mode == AudioManager.MODE_IN_COMMUNICATION ||
+                am.mode == AudioManager.MODE_RINGTONE)
+    }
+
     private fun startMicrophone(): Boolean {
+        if (isCallActive()) return false
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO)
             != PackageManager.PERMISSION_GRANTED
         ) return false
 
+        var pendingRecord: AudioRecord? = null
         return try {
             val sampleRate = 48000
             val bufferSize = AudioRecord.getMinBufferSize(
@@ -456,6 +521,7 @@ class AudioCaptureManager(private val context: Context) {
                 AudioFormat.ENCODING_PCM_FLOAT,
                 bufferSize
             )
+            pendingRecord = record
 
             if (record.state != AudioRecord.STATE_INITIALIZED) {
                 record.release()
@@ -464,19 +530,32 @@ class AudioCaptureManager(private val context: Context) {
 
             record.startRecording()
             audioRecord = record
+            useVisualizerFft = false
+            lastSampleTimeMs = SystemClock.elapsedRealtime()
 
             // Mic capture runs on its own thread feeding samples
-            Thread({
+            microphoneThread = Thread({
                 val buffer = FloatArray(FFT_SIZE)
-                while (running) {
-                    val read = record.read(buffer, 0, buffer.size, AudioRecord.READ_BLOCKING)
-                    if (read > 0) {
-                        val samples = buffer.copyOf(read)
-                        synchronized(sampleLock) {
-                            capturedSamples = samples
-                            hasFreshSamples = true
+                try {
+                    while (running && audioRecord === record) {
+                        val read = record.read(buffer, 0, buffer.size, AudioRecord.READ_BLOCKING)
+                        if (read < 0) {
+                            Log.w("ChloeVibes", "Microphone read failed: $read")
+                            break
+                        }
+                        if (read > 0) {
+                            val samples = buffer.copyOf(read)
+                            synchronized(sampleLock) {
+                                if (running && audioRecord === record) {
+                                    capturedSamples = samples
+                                    captureCadence.received(SystemClock.elapsedRealtime())
+                                    lastSampleTimeMs = SystemClock.elapsedRealtime()
+                                }
+                            }
                         }
                     }
+                } catch (e: Exception) {
+                    if (running && audioRecord === record) Log.w("ChloeVibes", "Microphone read stopped", e)
                 }
             }, "ChloeVibes-MicCapture").apply {
                 isDaemon = true
@@ -485,12 +564,14 @@ class AudioCaptureManager(private val context: Context) {
 
             true
         } catch (e: Exception) {
+            if (audioRecord === pendingRecord) audioRecord = null
+            runCatching { pendingRecord?.release() }
             Log.w("ChloeVibes", "Microphone capture initialization failed", e)
             false
         }
     }
 
-    // Visualizer restart failure counter (Fix 13)
+    // A failed recovery stays on the selected source; it never activates a mic.
     private var visualizerRestartFailures = 0
 
     // -----------------------------------------------------------------------
@@ -498,8 +579,8 @@ class AudioCaptureManager(private val context: Context) {
     // -----------------------------------------------------------------------
 
     private fun processingLoop() {
-        val startMs = System.nanoTime() / 1_000_000f
-        lastSampleTimeMs = System.currentTimeMillis()
+        var captureWasMissing = true
+        val outputDispatch = AudioOutputDispatch()
         var consecutiveErrors = 0
         var lastFrameNs = System.nanoTime()
 
@@ -509,79 +590,63 @@ class AudioCaptureManager(private val context: Context) {
             val deltaTimeS = ((frameStartNs - lastFrameNs).toFloat() / 1_000_000_000f)
                 .coerceIn(0.001f, 0.1f)
             lastFrameNs = frameStartNs
-            val currentTimeMs = System.nanoTime() / 1_000_000f - startMs
+            val currentTimeMs = processingClock.elapsedMs(frameStartNs)
+            processingClock.applyPendingClimaxReset(state.climaxEngine, frameStartNs)
 
             // Read all parameters once per frame for a consistent snapshot
             val params = paramsRef.get()
 
-            val spectralData: SpectralData
-            val energy: Float
-
-            if (useVisualizerFft) {
-                // ---- Visualizer FFT path ----
-                // Use pre-computed magnitude data (dB-normalized to 0-1),
-                // matching the Web Audio AnalyserNode used by the HTML version.
-                var mags = FloatArray(0)
-                var hadFreshMagnitudeFrame = false
-                val nowWallMs = System.currentTimeMillis()
-                synchronized(sampleLock) {
-                    if (hasFreshMagnitudes) {
-                        mags = capturedMagnitudes.copyOf()
-                        hasFreshMagnitudes = false
-                        hadFreshMagnitudeFrame = true
-                    } else if (capturedMagnitudes.isNotEmpty() &&
-                        nowWallMs - lastSampleTimeMs <= VISUALIZER_FRAME_HOLD_MS
-                    ) {
-                        // Visualizer callbacks are often slower than the 60Hz
-                        // haptic loop. Re-use the most recent FFT briefly
-                        // instead of injecting zero frames between callbacks.
-                        mags = capturedMagnitudes.copyOf()
-                    }
-                }
-
-                // Stall detection for Visualizer
-                if (sourceMode == AudioSourceMode.SystemAudio) {
-                    val stalled = visualizer != null &&
-                        (nowWallMs - lastSampleTimeMs) > STALL_TIMEOUT_MS
-                    val isSilent = hadFreshMagnitudeFrame &&
-                            mags.isNotEmpty() &&
-                            mags.all { it < 0.001f }
-                    if (isSilent) {
-                        silentFrameCount++
-                    } else if (hadFreshMagnitudeFrame) {
-                        silentFrameCount = 0
-                    }
-                    if (stalled || silentFrameCount >= SILENT_FRAMES_BEFORE_FALLBACK) {
-                        silentFrameCount = 0
-                        try { visualizer?.apply { enabled = false; release() } } catch (_: Exception) {}
-                        visualizer = null
-                        useVisualizerFft = false
-                        synchronized(sampleLock) {
-                            capturedMagnitudes = FloatArray(0)
-                            hasFreshMagnitudes = false
-                        }
-                        val restarted = startVisualizer()
-                        if (restarted) {
-                            visualizerRestartFailures = 0
-                        } else {
-                            visualizerRestartFailures++
-                            if (visualizerRestartFailures >= 3) {
-                                Log.w("ChloeVibes", "Visualizer restart failed 3 times, falling back to mic mode")
-                                visualizerRestartFailures = 0
-                                startMicrophone()
-                            }
-                        }
-                        lastSampleTimeMs = System.currentTimeMillis()
-                    }
-                }
-
-                if (mags.isEmpty()) {
-                    spectralData = SpectralData()
-                    energy = 0f
+            val nowCaptureMs = SystemClock.elapsedRealtime()
+            if (sourceMode == AudioSourceMode.Microphone && isCallActive()) {
+                running = false
+                onPipelineFailClosed?.invoke()
+                break
+            }
+            if (nowCaptureMs - lastSampleTimeMs > STALL_TIMEOUT_MS) {
+                if (sourceMode == AudioSourceMode.SystemAudio && visualizerRestartFailures < 3) {
+                    visualizerRestartFailures++
+                    val oldVisualizer = visualizer
+                    visualizer = null
+                    runCatching { oldVisualizer?.enabled = false }
+                    runCatching { oldVisualizer?.release() }
+                    synchronized(sampleLock) { captureCadence.clear() }
+                    startVisualizer()
+                    lastSampleTimeMs = nowCaptureMs
                 } else {
+                    Log.w("ChloeVibes", "Selected audio source stopped delivering frames")
+                    running = false
+                    onPipelineFailClosed?.invoke()
+                    break
+                }
+            }
+
+            val frameStatus: AudioFrameCadence.Frame
+            val samples: FloatArray
+            val mags: FloatArray
+            val frameSampleRate: Int
+            synchronized(sampleLock) {
+                frameStatus = captureCadence.poll(SystemClock.elapsedRealtime())
+                samples = capturedSamples
+                mags = capturedMagnitudes
+                frameSampleRate = visualizerSampleRate
+            }
+            val freshCapture = frameStatus == AudioFrameCadence.Frame.Fresh
+            val missingCapture = frameStatus == AudioFrameCadence.Frame.Missing
+            hasRecentInput = !missingCapture
+            if (freshCapture) visualizerRestartFailures = 0
+            if (missingCapture && !captureWasMissing) {
+                state.gate = Gate()
+                state.beatDetector = BeatDetector()
+                state.analyzer = SpectralAnalyzer(48000f)
+            }
+            captureWasMissing = missingCapture
+            val spectralData = when {
+                missingCapture -> SpectralData()
+                !freshCapture -> state.lastSpectralData
+                useVisualizerFft && mags.isNotEmpty() -> {
                     // Build SpectralData from Visualizer magnitudes.
                     // Bin resolution depends on capture size and sample rate.
-                    val sr = visualizerSampleRate.toFloat()
+                    val sr = frameSampleRate.toFloat()
                     val captureSize = mags.size * 2
                     val binRes = sr / captureSize
 
@@ -603,9 +668,12 @@ class AudioCaptureManager(private val context: Context) {
                     for (m in mags) rmsSum += m * m
                     val rmsPower = kotlin.math.sqrt(rmsSum / mags.size)
 
-                    // Spectral centroid
+                    // Spectral centroid — skip the DC bin, mirroring
+                    // SpectralAnalyzer and the Rust engine (skip(1)): DC
+                    // magnitude inflates totalMag and biases the centroid
+                    // downward. This path missed the 2026-05-29 fix.
                     var wSum = 0f; var tMag = 0f
-                    for (i in mags.indices) {
+                    for (i in 1 until mags.size) {
                         val freq = i * binRes
                         wSum += freq * mags[i]; tMag += mags[i]
                     }
@@ -614,70 +682,57 @@ class AudioCaptureManager(private val context: Context) {
                     // Spectral flux (use previous data stored in analyzer)
                     val flux = state.analyzer.computeFluxFrom(mags)
 
-                    spectralData = SpectralData(
+                    SpectralData(
                         bandEnergies = bandEnergies,
                         rmsPower = rmsPower,
                         spectralCentroid = centroid,
                         spectralFlux = flux,
                         dominantFrequency = 0f
                     )
-
-                    // Match the Rust desktop GUI path: normalize capture energy
-                    // before volume so the gate slider has a wider useful range.
-                    val captureEnergy = SpectralAnalyzer.extractEnergy(spectralData, params.frequencyMode, params.targetFrequency)
-                    energy = normalizeCaptureEnergy(captureEnergy) * params.mainVolume
                 }
-            } else {
-                // ---- Raw sample path (mic or fallback) ----
-                // Do NOT apply volume before FFT so the gate sees true
-                // pre-volume energy (matching the Visualizer path and
-                // Rust desktop behavior). Volume is applied to energy
-                // after extractEnergy() below.
-                val samples: FloatArray
-                synchronized(sampleLock) {
-                    if (!hasFreshSamples) {
-                        samples = FloatArray(FFT_SIZE)
-                    } else {
-                        samples = capturedSamples
-                        hasFreshSamples = false
-                    }
-                }
-                spectralData = state.analyzer.analyze(samples, 1)
-                val captureEnergy = SpectralAnalyzer.extractEnergy(spectralData, params.frequencyMode, params.targetFrequency)
-                energy = normalizeCaptureEnergy(captureEnergy) * params.mainVolume
+                else -> state.analyzer.analyze(samples, 1)
             }
-
-            // Raw energy (0-1 normalized, no volume) for the gate so the
-            // threshold slider maps cleanly: 0% = always open, 100% = closed.
-            // Volume-boosted energy feeds the envelope for dynamics.
-            val rawEnergy = if (params.mainVolume > 0.001f) (energy / params.mainVolume).coerceIn(0f, 1f) else 0f
+            val captureEnergy = SpectralAnalyzer.extractEnergy(
+                spectralData, params.frequencyMode, params.targetFrequency
+            )
+            val rawEnergy = normalizeCaptureEnergy(captureEnergy)
+            val energy = sanitizeUnit(rawEnergy * params.mainVolume)
 
             state.lastSpectralData = spectralData
             state.lastEnergy = energy
 
             // Step 3: Gate (uses raw energy so threshold isn't defeated by volume)
-            val gateOpen = state.gate.process(
-                rawEnergy, params.gateThreshold, params.autoGateAmount, params.gateSmoothing
-            )
+            val gateOpen = when {
+                missingCapture -> false
+                freshCapture -> state.gate.process(
+                    rawEnergy, params.gateThreshold, params.autoGateAmount, params.gateSmoothing
+                )
+                else -> state.lastGateOpen
+            }
             val effectiveThreshold = state.gate.effectiveThreshold(
                 params.gateThreshold, params.autoGateAmount
             )
             state.lastGateOpen = gateOpen
 
             // Step 4: Beat detection
-            val (detectedOnset, onsetStrength) = state.beatDetector.process(
-                spectralData.spectralFlux, currentTimeMs
-            )
+            val (detectedOnset, onsetStrength) = if (freshCapture) {
+                state.beatDetector.process(spectralData.spectralFlux, currentTimeMs)
+            } else {
+                state.beatDetector.advanceTime(currentTimeMs)
+                Pair(false, 0f)
+            }
 
             // Predictive onset: takePrefire injects strength floor + one-shot
             // latch (mirrors Rust BeatDetector::take_prefire). Confidence
             // decays without onsets so stale locks cannot ghost-fire.
-            var isOnset = detectedOnset
+            var isOnset = detectedOnset && !state.beatDetector.isPrefiredOnset(currentTimeMs)
             var onsetStr = onsetStrength
-            if (!isOnset && gateOpen) {
+            var syntheticPrefire = false
+            if (!detectedOnset && gateOpen && !missingCapture) {
                 val preStr = state.beatDetector.takePrefire(currentTimeMs)
                 if (preStr != null) {
                     isOnset = true
+                    syntheticPrefire = true
                     onsetStr = preStr
                 }
             }
@@ -710,6 +765,9 @@ class AudioCaptureManager(private val context: Context) {
                 releaseCurve = params.releaseCurve,
                 spectralCentroid = spectralData.spectralCentroid
             )
+            if (syntheticPrefire && isOnset && envelopeOutput > 0f && state.envelope.triggeredAt(currentTimeMs)) {
+                state.beatDetector.confirmPrefire(currentTimeMs)
+            }
             state.lastEnvelopeOutput = envelopeOutput
             state.lastEnvelopeState = state.envelope.state
 
@@ -742,7 +800,7 @@ class AudioCaptureManager(private val context: Context) {
             val isSilent = energy < 0.005f &&
                     !gateOpen &&
                     state.envelope.state == EnvelopeState.Idle
-            val silenceClass = isSilent
+            val silenceClass = missingCapture || isSilent
                     || state.envelope.silenceEvent
                     || state.climaxEngine.silenceEvent
             val targetOutput = mapOutput(
@@ -755,50 +813,30 @@ class AudioCaptureManager(private val context: Context) {
             } else {
                 smoothOutput(outputLevel, targetOutput, deltaTimeS, params.outputSlewMs)
             }
-            val finalOutput = outputLevel.coerceIn(0f, 1f)
+            val finalOutput = outputLevel.coerceIn(0f, sanitizeUnit(params.maxVibe))
             state.lastFinalOutput = finalOutput
 
-            // Notify listener -- skip redundant Vibrate:0 commands so the BLE
-            // write gate is clear when a real trigger arrives.  Send the stop
-            // command once when output drops to zero, then go silent.
-            if (finalOutput > 0.001f || lastSentOutput > 0.001f) {
-                // Motor 2: climax ON → ClimaxEngine.motor2Output (spatial arc);
-                // climax OFF → treble spectral shadow of motor 1 (music path).
-                // Mirrors Rust desktop motor2 derivation in gui.rs.
+            // Compute both motors even when motor 1 is already at zero.
+            val motor2Target = if (silenceClass) {
+                0f
+            } else if (params.climaxEnabled) {
+                mapOutput(state.climaxEngine.motor2Output, params.minVibe,
+                    params.maxVibe, params.outputGain, false)
+            } else {
+                val be = spectralData.bandEnergies
+                val lowE = be[0] + be[1] + be[2] + be[3]
+                val highE = be[4] + be[5] + be[6] + be[7]
+                val total = lowE + highE
+                val trebleWeight = if (total > 1e-9f) (3f * highE / total).coerceIn(0f, 1f) else 0f
+                finalOutput * trebleWeight
+            }
+            outputLevel2 = if (silenceClass || motor2Target <= 0.001f) 0f else
+                smoothOutput(outputLevel2, motor2Target, deltaTimeS, params.outputSlewMs)
+            val motor2Final = outputLevel2.coerceIn(0f, sanitizeUnit(params.maxVibe))
+            if (running && outputDispatch.shouldSend(finalOutput, motor2Final)) {
                 val dualCb = onDualOutputUpdate
-                if (dualCb != null) {
-                    val motor2Target = if (silenceClass || isSilent) {
-                        0f
-                    } else if (params.climaxEnabled) {
-                        mapOutput(
-                            state.climaxEngine.motor2Output,
-                            params.minVibe,
-                            params.maxVibe,
-                            params.outputGain,
-                            false
-                        )
-                    } else {
-                        // Bands 0..3 = Sub/Bass/Lo-Mid/Mid, 4..7 = Hi-Mid/Pres/Brill/Air.
-                        val be = spectralData.bandEnergies
-                        val lowE = be[0] + be[1] + be[2] + be[3]
-                        val highE = be[4] + be[5] + be[6] + be[7]
-                        val total = lowE + highE
-                        val trebleFrac = if (total > 1e-9f) highE / total else 0f
-                        val trebleWeight = (trebleFrac * 3.0f).coerceIn(0f, 1f)
-                        (finalOutput * trebleWeight).coerceIn(0f, 1f)
-                    }
-                    outputLevel2 = if (motor2Target <= 0.001f || silenceClass) {
-                        0f
-                    } else {
-                        smoothOutput(outputLevel2, motor2Target, deltaTimeS, params.outputSlewMs)
-                    }
-                    val motor2Final = outputLevel2.coerceIn(0f, 1f)
-                    dualCb.invoke(finalOutput, motor2Final)
-                } else {
-                    outputLevel2 = finalOutput
-                    onOutputUpdate?.invoke(finalOutput)
-                }
-                lastSentOutput = finalOutput
+                if (dualCb != null) dualCb.invoke(finalOutput, motor2Final)
+                else onOutputUpdate?.invoke(finalOutput)
             }
 
             // Frame completed successfully -- stamp dead-man heartbeat and
@@ -831,7 +869,7 @@ class AudioCaptureManager(private val context: Context) {
                   running = false
                   outputLevel = 0f
                   outputLevel2 = 0f
-                  lastSentOutput = 0f
+                  outputDispatch.reset()
                   state.lastFinalOutput = 0f
                   try {
                       val dualCb = onDualOutputUpdate
@@ -882,8 +920,12 @@ internal fun mapOutput(
     gain: Float,
     isSilent: Boolean
 ): Float {
-    if (isSilent || shaped <= 0.001f) return 0f
-    return ((minVibe + shaped * (maxVibe - minVibe)) * gain).coerceIn(0f, 1f)
+    if (isSilent || shaped <= 0.001f || !shaped.isFinite() ||
+        !minVibe.isFinite() || !maxVibe.isFinite() || !gain.isFinite()) return 0f
+    val ceiling = maxVibe.coerceIn(0f, 1f)
+    val floor = minVibe.coerceIn(0f, ceiling)
+    return ((floor + shaped * (ceiling - floor)) * gain.coerceAtLeast(0f))
+        .coerceIn(0f, ceiling)
 }
 
 /**

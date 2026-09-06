@@ -53,7 +53,7 @@ const VALID_ENERGY: f32 = 0.002;
 /// main_volume, output_gain, min_vibe, max_vibe, climax intensity/cycle,
 /// and trim_ms are deliberately absent: the supervisor cannot raise the
 /// user's consent ceiling, only reshape the boom inside it.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LockParams {
     frequency_mode: FrequencyMode,
     target_frequency: f32,
@@ -73,6 +73,9 @@ pub struct LockParams {
     /// Kick-open / trough-close threshold (pre-volume energy domain).
     gate_threshold: f32,
     gate_smoothing: f32,
+    auto_gate_amount: f32,
+    climax_mode_enabled: bool,
+    current_preset_name: String,
 }
 
 impl LockParams {
@@ -95,11 +98,13 @@ impl LockParams {
             output_slew_ms: s.output_slew_ms,
             gate_threshold: s.gate_threshold,
             gate_smoothing: s.gate_smoothing,
+            auto_gate_amount: s.auto_gate_amount,
+            climax_mode_enabled: s.climax_mode_enabled,
+            current_preset_name: s.current_preset_name.clone(),
         }
     }
 
-    /// Write these values into Settings. Forces climax off (boom path).
-    /// Does not touch current_preset_name.
+    /// Apply a complete snapshot of the fields the tuner owns.
     pub fn apply(&self, s: &mut Settings) {
         s.frequency_mode = self.frequency_mode;
         s.target_frequency = self.target_frequency;
@@ -119,8 +124,9 @@ impl LockParams {
         s.output_slew_ms = self.output_slew_ms;
         s.gate_threshold = self.gate_threshold;
         s.gate_smoothing = self.gate_smoothing;
-        s.auto_gate_amount = 0.0; // manual threshold we just fitted
-        s.climax_mode_enabled = false;
+        s.auto_gate_amount = self.auto_gate_amount;
+        s.climax_mode_enabled = self.climax_mode_enabled;
+        s.current_preset_name.clone_from(&self.current_preset_name);
     }
 
     fn diverged_from(&self, s: &Settings) -> bool {
@@ -142,7 +148,9 @@ impl LockParams {
             || (self.output_slew_ms - s.output_slew_ms).abs() > EPS
             || (self.gate_threshold - s.gate_threshold).abs() > EPS
             || (self.gate_smoothing - s.gate_smoothing).abs() > EPS
-            || s.climax_mode_enabled
+            || (self.auto_gate_amount - s.auto_gate_amount).abs() > EPS
+            || self.climax_mode_enabled != s.climax_mode_enabled
+            || self.current_preset_name != s.current_preset_name
     }
 
     fn lerp(a: &Self, b: &Self, t: f32) -> Self {
@@ -166,6 +174,9 @@ impl LockParams {
             output_slew_ms: l(a.output_slew_ms, b.output_slew_ms),
             gate_threshold: l(a.gate_threshold, b.gate_threshold),
             gate_smoothing: l(a.gate_smoothing, b.gate_smoothing),
+            auto_gate_amount: b.auto_gate_amount,
+            climax_mode_enabled: b.climax_mode_enabled,
+            current_preset_name: b.current_preset_name.clone(),
         }
     }
 }
@@ -210,7 +221,6 @@ pub struct AutoLock {
     pub state: AutoLockState,
     frames: VecDeque<FrameSample>,
     onsets: VecDeque<f32>,
-    last_band_bits: [u32; N_BANDS],
     /// Pre-lock user settings, restored by revert and used by the
     /// persistence guard so eframe auto-save can never persist a lock.
     snapshot: Option<LockParams>,
@@ -233,7 +243,6 @@ impl AutoLock {
             state: AutoLockState::Idle,
             frames: VecDeque::with_capacity(512),
             onsets: VecDeque::with_capacity(64),
-            last_band_bits: [0; N_BANDS],
             snapshot: None,
             glide: None,
             expected: None,
@@ -244,7 +253,7 @@ impl AutoLock {
 
     /// Pre-lock snapshot for the persistence guard, if a lock is active.
     pub fn pre_lock_snapshot(&self) -> Option<LockParams> {
-        self.snapshot
+        self.snapshot.clone()
     }
 
     pub fn live_params(&self, settings: &Settings) -> LockParams {
@@ -272,7 +281,11 @@ impl AutoLock {
 
     /// Keep the locked values as the new normal (explicit consent — this is
     /// the only way a lock outlives the session without the snapshot guard).
-    pub fn keep(&mut self, _settings: &mut Settings) {
+    pub fn keep(&mut self, settings: &mut Settings) {
+        if let Some(glide) = self.glide.take() {
+            glide.to.apply(settings);
+            settings.sanitize();
+        }
         self.cancel();
     }
 
@@ -312,8 +325,14 @@ impl AutoLock {
         }
     }
 
-    pub fn is_locked(&self) -> bool {
+    #[cfg(test)]
+    fn is_locked(&self) -> bool {
         matches!(self.state, AutoLockState::Locked { .. })
+    }
+
+    /// Re-listening or cancelling a new listen does not discard an earlier lock.
+    pub fn can_revert(&self) -> bool {
+        self.snapshot.is_some()
     }
 
     /// One-line summary after a successful lock, e.g.
@@ -344,15 +363,21 @@ impl AutoLock {
         _envelope_output: f32,
         using_rms_fallback: bool,
         engine_tempo_confidence: f32,
+        fresh_spectral: bool,
         settings: &mut Settings,
     ) {
-        self.record_frame(
-            now_ms,
-            spectral,
-            pre_volume_energy,
-            onset_ok,
-            using_rms_fallback,
-        );
+        if !now_ms.is_finite() {
+            return;
+        }
+        if fresh_spectral {
+            self.record_frame(
+                now_ms,
+                spectral,
+                pre_volume_energy,
+                onset_ok,
+                using_rms_fallback,
+            );
+        }
 
         // User-override / preset-race guard: if any whitelisted field no
         // longer matches what we last wrote, the user (or apply_preset)
@@ -398,9 +423,17 @@ impl AutoLock {
         onset_ok: bool,
         using_rms_fallback: bool,
     ) {
+        // Freshness comes from capture, not contents: identical silence frames
+        // are distinct observations. Reject out-of-order publications.
+        if !now_ms.is_finite() || self.frames.back().is_some_and(|last| now_ms <= last.t_ms) {
+            return;
+        }
+        let finite_frame = pre_volume_energy.is_finite()
+            && spectral.spectral_centroid.is_finite()
+            && spectral.band_energies.iter().all(|v| v.is_finite());
         // Merged-onset record (predictive pre-fire + detected onset arrive as
         // a pair up to ~76ms apart; treat them as one beat).
-        if onset_ok {
+        if onset_ok && finite_frame && !using_rms_fallback {
             let is_new = self
                 .onsets
                 .back()
@@ -414,25 +447,20 @@ impl AutoLock {
             }
         }
 
-        // Bitwise dedupe: update() repaints faster than the capture thread
-        // produces frames, so identical snapshots must not be re-counted.
-        let mut bits = [0u32; N_BANDS];
-        for (i, b) in bits.iter_mut().enumerate() {
-            *b = spectral.band_energies[i].to_bits();
-        }
-        if bits == self.last_band_bits && !self.frames.is_empty() {
-            return;
-        }
-        self.last_band_bits = bits;
-
         let mut band_energies = [0.0f32; N_BANDS];
-        band_energies.copy_from_slice(&spectral.band_energies[..N_BANDS]);
+        if finite_frame {
+            band_energies.copy_from_slice(&spectral.band_energies[..N_BANDS]);
+        }
         self.frames.push_back(FrameSample {
             t_ms: now_ms,
             band_energies,
-            pre_volume_energy,
-            centroid: spectral.spectral_centroid,
-            valid: !using_rms_fallback && pre_volume_energy > VALID_ENERGY,
+            pre_volume_energy: if finite_frame { pre_volume_energy } else { 0.0 },
+            centroid: if finite_frame {
+                spectral.spectral_centroid
+            } else {
+                0.0
+            },
+            valid: !using_rms_fallback && finite_frame && pre_volume_energy > VALID_ENERGY,
         });
 
         while let Some(front) = self.frames.front() {
@@ -457,8 +485,9 @@ impl AutoLock {
             if pair[1].t_ms < self.listen_from_ms {
                 continue;
             }
-            if pair[1].valid {
-                total += pair[1].t_ms - pair[0].t_ms;
+            let span = pair[1].t_ms - pair[0].t_ms.max(self.listen_from_ms);
+            if pair[0].valid && pair[1].valid && (0.0..=100.0).contains(&span) {
+                total += span;
             }
         }
         total
@@ -524,6 +553,7 @@ impl AutoLock {
         // Enums switch immediately; floats glide from current values.
         settings.frequency_mode = target.frequency_mode;
         settings.trigger_mode = target.trigger_mode;
+        settings.auto_gate_amount = target.auto_gate_amount;
         settings.climax_mode_enabled = false;
         settings.current_preset_name = String::from("Auto Boom");
         settings.sanitize();
@@ -531,7 +561,7 @@ impl AutoLock {
         self.glide = Some(Glide {
             started_ms: now_ms,
             from,
-            to: target,
+            to: target.clone(),
         });
 
         let beat_ms = Self::fold_to_perceptual_beat(features.ioi_median);
@@ -853,6 +883,9 @@ impl AutoLock {
             output_slew_ms,
             gate_threshold,
             gate_smoothing,
+            auto_gate_amount: 0.0,
+            climax_mode_enabled: false,
+            current_preset_name: String::from("Auto Boom"),
         }
     }
 }
@@ -922,11 +955,8 @@ mod tests {
     #[ignore]
     fn analyze_real_wav() {
         let path = std::env::var("CHLOE_WAV")
-            .unwrap_or_else(|_| r"C:\Users\coldb\Downloads\STA.wav".to_string());
-        let Ok(bytes) = std::fs::read(&path) else {
-            eprintln!("SKIP: {path} not found");
-            return;
-        };
+            .expect("Set CHLOE_WAV to a PCM16 WAV file before running this optional harness");
+        let bytes = std::fs::read(&path).expect("Could not read CHLOE_WAV");
         let (mono, rate) = parse_wav_mono(&bytes);
         eprintln!(
             "loaded {path}: {} samples @ {rate} Hz ({:.1}s)",
@@ -1032,6 +1062,7 @@ mod tests {
                     energy,
                     false,
                     beat.tempo_confidence,
+                    k == 0,
                     &mut settings,
                 );
             }
@@ -1106,8 +1137,16 @@ mod tests {
         ioi_ms: f32,
         pulse: f32,
     ) -> (AutoLock, Settings, f32) {
+        run_synthetic_from_settings(beat_band, ioi_ms, pulse, Settings::default())
+    }
+
+    fn run_synthetic_from_settings(
+        beat_band: usize,
+        ioi_ms: f32,
+        pulse: f32,
+        mut settings: Settings,
+    ) -> (AutoLock, Settings, f32) {
         let mut al = AutoLock::new();
-        let mut settings = Settings::default();
         al.on_button(0.0);
 
         let frame_ms = 20.0;
@@ -1117,8 +1156,6 @@ mod tests {
         while now < 16_000.0 {
             now += frame_ms;
             let mut bands = [0.02f32; N_BANDS];
-            // Slight per-frame wiggle so bitwise dedupe doesn't drop frames
-            bands[7] = 0.02 + (now / 1000.0).sin().abs() * 0.001;
             let mut onset = false;
             if now >= next_beat {
                 bands[beat_band] = pulse;
@@ -1134,6 +1171,7 @@ mod tests {
                 if onset { 0.5 } else { 0.1 },
                 false,
                 0.9,
+                true,
                 &mut settings,
             );
         }
@@ -1163,6 +1201,7 @@ mod tests {
                 0.1,
                 false,
                 0.9,
+                true,
                 &mut settings,
             );
         }
@@ -1213,6 +1252,7 @@ mod tests {
                 0.4,
                 false,
                 0.9,
+                true,
                 &mut probe,
             );
         }
@@ -1245,6 +1285,7 @@ mod tests {
                 0.0,
                 false,
                 0.0,
+                true,
                 &mut settings,
             );
         }
@@ -1276,6 +1317,7 @@ mod tests {
                 0.0,
                 false,
                 0.0,
+                true,
                 &mut settings,
             );
         }
@@ -1293,6 +1335,7 @@ mod tests {
             0.0,
             false,
             0.0,
+            true,
             &mut settings,
         );
         assert!(
@@ -1323,6 +1366,7 @@ mod tests {
                 0.4,
                 false,
                 0.9,
+                true,
                 &mut settings,
             );
         }
@@ -1347,6 +1391,7 @@ mod tests {
             0.1,
             false,
             0.9,
+            true,
             &mut settings,
         );
         assert_eq!(al.state, AutoLockState::Idle);
@@ -1363,6 +1408,180 @@ mod tests {
         assert_eq!(settings.decay_ms, defaults.decay_ms);
         assert_eq!(settings.frequency_mode, defaults.frequency_mode);
         assert_eq!(al.state, AutoLockState::Idle);
+    }
+
+    #[test]
+    fn revert_and_save_restore_auto_gate_climax_and_preset_name() {
+        let original = Settings {
+            auto_gate_amount: 0.73,
+            climax_mode_enabled: true,
+            current_preset_name: String::from("My performance"),
+            ..Default::default()
+        };
+        let before = LockParams::capture(&original);
+        let (mut al, mut settings, _) = run_synthetic_from_settings(1, 500.0, 0.8, original);
+        assert!(al.is_locked());
+        assert_eq!(settings.auto_gate_amount, 0.0);
+        assert!(!settings.climax_mode_enabled);
+        let live = LockParams::capture(&settings);
+        // Mirror GuiApp.save's temporary restore/serialize/live-restore path.
+        al.pre_lock_snapshot().unwrap().apply(&mut settings);
+        assert_eq!(LockParams::capture(&settings), before);
+        live.apply(&mut settings);
+        assert_eq!(LockParams::capture(&settings), live);
+        al.revert(&mut settings);
+        assert_eq!(LockParams::capture(&settings), before);
+        assert!(!al.can_revert());
+    }
+
+    #[test]
+    fn changing_auto_gate_releases_the_tuner_without_overwriting_user() {
+        let (mut al, mut settings, now) = run_synthetic_session(1, 500.0, 0.8);
+        settings.auto_gate_amount = 0.8;
+        al.tick(
+            now + 20.0,
+            &SpectralData::default(),
+            0.0,
+            false,
+            0.0,
+            false,
+            0.9,
+            false,
+            &mut settings,
+        );
+        assert_eq!(al.state, AutoLockState::Idle);
+        assert_eq!(settings.auto_gate_amount, 0.8);
+        assert!(!al.can_revert());
+    }
+
+    #[test]
+    fn cancelling_relisten_preserves_access_to_original_snapshot() {
+        let (mut al, mut settings, now) = run_synthetic_session(1, 500.0, 0.8);
+        let before = al.pre_lock_snapshot().unwrap();
+        al.on_button(now);
+        assert!(matches!(al.state, AutoLockState::Listening { .. }));
+        assert!(al.can_revert());
+        al.on_button(now + 100.0);
+        assert_eq!(al.state, AutoLockState::Idle);
+        assert!(al.can_revert());
+        al.revert(&mut settings);
+        assert_eq!(LockParams::capture(&settings), before);
+    }
+
+    #[test]
+    fn keep_during_glide_applies_the_complete_target() {
+        let (mut al, mut settings, now) = run_synthetic_session(1, 500.0, 0.8);
+        let target = LockParams::capture(&settings);
+        let original = al.pre_lock_snapshot().unwrap();
+        original.apply(&mut settings);
+        al.glide = Some(Glide {
+            started_ms: now,
+            from: original,
+            to: target.clone(),
+        });
+        al.keep(&mut settings);
+        assert_eq!(LockParams::capture(&settings), target);
+        assert!(al.glide.is_none());
+        assert!(!al.can_revert());
+    }
+
+    #[test]
+    fn fresh_identical_frames_count_but_ui_repeats_and_capture_gaps_do_not() {
+        let mut al = AutoLock::new();
+        let mut settings = Settings::default();
+        al.on_button(0.0);
+        let audio = spectral_with_bands([0.2; N_BANDS]);
+        for now in [0.0, 20.0, 40.0] {
+            al.tick(
+                now,
+                &audio,
+                0.2,
+                false,
+                0.2,
+                false,
+                0.9,
+                true,
+                &mut settings,
+            );
+            for offset in [1.0, 2.0, 3.0] {
+                al.tick(
+                    now + offset,
+                    &audio,
+                    0.2,
+                    false,
+                    0.2,
+                    false,
+                    0.9,
+                    false,
+                    &mut settings,
+                );
+            }
+        }
+        assert_eq!(al.frames.len(), 3);
+        assert_eq!(al.valid_window_ms(), 40.0);
+        // Two silence frames must both exist, and silence -> audio cannot
+        // retroactively claim the silent interval as valid listening.
+        al.tick(
+            60.0,
+            &SpectralData::default(),
+            0.0,
+            false,
+            0.0,
+            false,
+            0.9,
+            true,
+            &mut settings,
+        );
+        al.tick(
+            80.0,
+            &SpectralData::default(),
+            0.0,
+            false,
+            0.0,
+            false,
+            0.9,
+            true,
+            &mut settings,
+        );
+        al.tick(
+            5000.0,
+            &audio,
+            0.2,
+            true,
+            0.2,
+            false,
+            0.9,
+            true,
+            &mut settings,
+        );
+        assert_eq!(al.frames.len(), 6);
+        assert_eq!(al.valid_window_ms(), 40.0);
+        assert!(matches!(al.state, AutoLockState::Listening { .. }));
+    }
+
+    #[test]
+    fn corrupt_capture_frames_do_not_poison_a_later_tuning_estimate() {
+        let (mut al, mut settings, now) = run_synthetic_session(1, 500.0, 0.8);
+        let prior_onsets = al.onsets.len();
+        al.tick(
+            now + 20.0,
+            &spectral_with_bands([f32::INFINITY; N_BANDS]),
+            f32::NAN,
+            true,
+            0.0,
+            false,
+            0.9,
+            true,
+            &mut settings,
+        );
+        assert_eq!(al.onsets.len(), prior_onsets);
+        assert!(!al.frames.back().unwrap().valid);
+        let features = al
+            .estimate(0.0)
+            .expect("valid earlier material still estimates");
+        let target = AutoLock::map_features(&features, &settings);
+        assert!(target.gate_threshold.is_finite());
+        assert!(target.decay_ms.is_finite());
     }
 
     #[test]
@@ -1464,6 +1683,7 @@ mod tests {
                 0.4,
                 false,
                 0.9,
+                true,
                 &mut settings,
             );
         }

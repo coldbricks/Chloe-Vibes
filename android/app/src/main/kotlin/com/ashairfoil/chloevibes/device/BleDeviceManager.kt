@@ -23,6 +23,7 @@ import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import java.util.UUID
 import kotlin.math.pow
@@ -58,9 +59,11 @@ class BleDeviceManager(private val context: Context) {
     private val bluetoothAdapter: BluetoothAdapter? = bluetoothManager?.adapter
     private val scanner: BluetoothLeScanner? = bluetoothAdapter?.bluetoothLeScanner
 
-    private var gatt: BluetoothGatt? = null
-    private var writeCharacteristic: BluetoothGattCharacteristic? = null
-    private var notifyCharacteristic: BluetoothGattCharacteristic? = null
+    // Written on BLE binder callback threads, read from the audio processing
+    // thread in sendCommand() — volatile for cross-thread visibility.
+    @Volatile private var gatt: BluetoothGatt? = null
+    @Volatile private var writeCharacteristic: BluetoothGattCharacteristic? = null
+    @Volatile private var notifyCharacteristic: BluetoothGattCharacteristic? = null
 
     // State
     @Volatile var connectionState: ConnectionState = ConnectionState.Disconnected
@@ -75,14 +78,19 @@ class BleDeviceManager(private val context: Context) {
     // Stops/true-zeros bypass the interval so rest troughs are not delayed
     // behind a stale peak packet still in flight.
     @Volatile private var writeInFlight = false
-    private var pendingCommand: String? = null
+    private val commandQueue = BleCommandQueue()
+    private var inFlightCommand: String? = null
+    private var writeEpoch = 0L
+    private var writeTicket = 0L
+    private var writeFailures = 0
     private val writeLock = Object()
     private var lastWriteMs: Long = 0
     private val minWriteIntervalMs = 28L  // ~36Hz steady-state; stops may go faster
     private val stopWriteIntervalMs = 12L // allow rest to win over peak backlog
-    private val writeTimeoutMs = 120L
+    private val writeTimeoutMs = 500L
     private var pendingDrainScheduled = false
-    private var writeWatchdogScheduled = false
+    private var pendingDrainAtMs = 0L
+    private var pendingDrainTicket = 0L
     // Peak hold only preserves punch transients — long holds filled Domi
     // rest troughs. WAVE-002: ~20–25 ms; large down-steps bypass entirely.
     private val peakHoldMs = 22L
@@ -260,70 +268,122 @@ class BleDeviceManager(private val context: Context) {
 
     /** Connect to a device by address. */
     fun connect(address: String): Boolean {
-        handler.removeCallbacks(reconnectRunnable)
-        userRequestedDisconnect = false
-        reconnectAttempts = 0
-        lastConnectAddress = address
-        return connectInternal(address)
+        synchronized(writeLock) {
+            handler.removeCallbacks(reconnectRunnable)
+            userRequestedDisconnect = false
+            reconnectAttempts = 0
+            lastConnectAddress = address
+            return connectInternal(address)
+        }
     }
 
     private fun connectInternal(address: String): Boolean {
-        // Scanning while a connection attempt is in flight starves the link
-        // layer on many stacks and is a common cause of GATT error 133. This
-        // lives here (not in connect()) so auto-reconnect attempts get the
-        // same guard — the user may have started a scan mid-backoff.
-        stopScan()
-        resetWriteState()
-        // Fresh session: dual + feel defaults until DeviceType confirms.
-        // Stale rest/gamma from a prior toy must not leak across reconnect.
-        isDualMotor = false
-        applyMotorFeel(LovenseProtocol.MotorFeel.Generic)
-        closeGatt()
-        val device = bluetoothAdapter?.getRemoteDevice(address) ?: return false
-        Log.d("ChloeVibes", "BLE connecting to device: $address")
-        connectionState = ConnectionState.Connecting
-        onConnectionStateChanged?.invoke(connectionState)
-        // Provisional curves from advertised name so the first hits after
-        // Ready feel right before DeviceType reply lands.
-        val provisionalName = device.name
-            ?: discoveredDevices[address]?.name
-        if (provisionalName != null) {
-            applyMotorFeel(LovenseProtocol.MotorFeel.fromAdvertisedName(provisionalName))
-            Log.d("ChloeVibes", "Provisional motor feel from name='$provisionalName' rest=$motorRestFloor gamma=$motorFeelGamma")
-        }
+        synchronized(writeLock) {
+            // Scanning while a connection attempt is in flight starves the link
+            // layer on many stacks and is a common cause of GATT error 133. This
+            // lives here (not in connect()) so auto-reconnect attempts get the
+            // same guard — the user may have started a scan mid-backoff.
+            stopScan()
+            resetWriteState()
+            // Fresh session: dual + feel defaults until DeviceType confirms.
+            // Stale rest/gamma from a prior toy must not leak across reconnect.
+            isDualMotor = false
+            applyMotorFeel(LovenseProtocol.MotorFeel.Generic)
+            closeGatt()
+            val device = try { bluetoothAdapter?.getRemoteDevice(address) } catch (_: Exception) { null }
+                ?: return false
+            Log.d("ChloeVibes", "BLE connecting to device: $address")
+            connectionState = ConnectionState.Connecting
+            onConnectionStateChanged?.invoke(connectionState)
+            // Provisional curves from advertised name so the first hits after
+            // Ready feel right before DeviceType reply lands.
+            val provisionalName = device.name
+                ?: discoveredDevices[address]?.name
+            if (provisionalName != null) {
+                applyMotorFeel(LovenseProtocol.MotorFeel.fromAdvertisedName(provisionalName))
+                Log.d("ChloeVibes", "Provisional motor feel from name='$provisionalName' rest=$motorRestFloor gamma=$motorFeelGamma")
+            }
 
-        gatt = device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
-        return gatt != null
+            gatt = try {
+                device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+            } catch (e: Exception) {
+                Log.w("ChloeVibes", "BLE connection could not start", e)
+                null
+            }
+            if (gatt == null) {
+                connectionState = ConnectionState.Disconnected
+                onConnectionStateChanged?.invoke(connectionState)
+            }
+            return gatt != null
+        }
     }
 
     /** Release the current GATT client interface, if any. */
     private fun closeGatt() {
-        gatt?.let {
+        val oldGatt = synchronized(writeLock) {
+            val old = gatt
+            gatt = null
+            writeCharacteristic = null
+            notifyCharacteristic = null
+            old
+        }
+        oldGatt?.let {
             try { it.disconnect() } catch (_: Exception) { }
             try { it.close() } catch (_: Exception) { }
         }
-        gatt = null
-        writeCharacteristic = null
-        notifyCharacteristic = null
+    }
+
+    /** Retire an unresponsive client even if Android never reports disconnect. */
+    private fun recoverGatt(client: BluetoothGatt, reason: String) {
+        synchronized(writeLock) {
+            if (!isCurrentGatt(client)) return
+            Log.w("ChloeVibes", reason)
+            closeGatt()
+            resetWriteState()
+            connectedDeviceName = null
+            batteryLevel = -1
+            if (!userRequestedDisconnect && lastConnectAddress != null &&
+                reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+                scheduleReconnect()
+            } else {
+                connectionState = ConnectionState.Disconnected
+                handler.post { onConnectionStateChanged?.invoke(ConnectionState.Disconnected) }
+            }
+        }
     }
 
     /** Disconnect from the current device. */
     fun disconnect() {
-        Log.d("ChloeVibes", "BLE disconnecting from device: ${connectedDeviceName ?: "unknown"}")
-        userRequestedDisconnect = true
-        lastConnectAddress = null
-        handler.removeCallbacks(reconnectRunnable)
-        // Best-effort zero before tearing the link so the toy does not keep
-        // spinning on the last intensity after we drop GATT.
-        try { stopMotors() } catch (_: Exception) { }
-        closeGatt()
-        resetWriteState()
-        connectionState = ConnectionState.Disconnected
-        connectedDeviceName = null
-        batteryLevel = -1
-        isDualMotor = false
-        applyMotorFeel(LovenseProtocol.MotorFeel.Generic)
-        onConnectionStateChanged?.invoke(connectionState)
+        synchronized(writeLock) {
+            Log.d("ChloeVibes", "BLE disconnecting from device: ${connectedDeviceName ?: "unknown"}")
+            userRequestedDisconnect = true
+            lastConnectAddress = null
+            handler.removeCallbacks(reconnectRunnable)
+            val client = gatt
+            if (client != null && connectionState == ConnectionState.Ready) {
+                // Keep the link long enough to submit a zero behind an in-flight
+                // write. Positive commands are fenced once disconnect is asked.
+                commandQueue.clear()
+                stopMotors()
+                handler.postDelayed({ finishDisconnect(client) }, writeTimeoutMs)
+            } else {
+                finishDisconnect(client)
+            }
+        }
+    }
+
+    private fun finishDisconnect(client: BluetoothGatt?) {
+        synchronized(writeLock) {
+            if (!userRequestedDisconnect || gatt !== client) return
+            closeGatt()
+            resetWriteState()
+            connectionState = ConnectionState.Disconnected
+            connectedDeviceName = null
+            batteryLevel = -1
+            isDualMotor = false
+            applyMotorFeel(LovenseProtocol.MotorFeel.Generic)
+            handler.post { onConnectionStateChanged?.invoke(ConnectionState.Disconnected) }
+        }
     }
 
     /**
@@ -345,18 +405,20 @@ class BleDeviceManager(private val context: Context) {
     }
 
     private fun attemptReconnect() {
-        if (userRequestedDisconnect) return
-        if (connectionState == ConnectionState.Connected || connectionState == ConnectionState.Ready) return
-        val address = lastConnectAddress ?: return
-        if (!connectInternal(address)) {
-            // Synchronous failure (adapter off/null): no GATT callback will
-            // ever fire, so drive the retry/give-up path from here or the
-            // state machine is stuck showing Connecting forever.
-            if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-                scheduleReconnect()
-            } else {
-                connectionState = ConnectionState.Disconnected
-                handler.post { onConnectionStateChanged?.invoke(connectionState) }
+        synchronized(writeLock) {
+            if (userRequestedDisconnect) return
+            if (connectionState == ConnectionState.Connected || connectionState == ConnectionState.Ready) return
+            val address = lastConnectAddress ?: return
+            if (!connectInternal(address)) {
+                // Synchronous failure (adapter off/null): no GATT callback will
+                // ever fire, so drive the retry/give-up path from here or the
+                // state machine is stuck showing Connecting forever.
+                if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+                    scheduleReconnect()
+                } else {
+                    connectionState = ConnectionState.Disconnected
+                    handler.post { onConnectionStateChanged?.invoke(connectionState) }
+                }
             }
         }
     }
@@ -365,161 +427,187 @@ class BleDeviceManager(private val context: Context) {
      * Whether a callback's gatt is the one this manager currently owns. A
      * superseded client's late callbacks (especially STATE_DISCONNECTED after
      * a re-connect) must not clobber the live connection's state. The
-     * null-while-Connecting case covers the tiny window between
-     * connectGatt() registering the callback and the field assignment.
+     * A reconnect backoff has no current client; late callbacks must not adopt it.
      */
     private fun isCurrentGatt(g: BluetoothGatt): Boolean {
         val current = gatt
-        return current === g ||
-            (current == null && connectionState == ConnectionState.Connecting)
+        return current === g
     }
 
     private val gattCallback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
-            if (!isCurrentGatt(gatt)) {
-                Log.d("ChloeVibes", "Ignoring callback from superseded GATT client (newState=$newState)")
-                try { gatt.close() } catch (_: Exception) { }
-                return
-            }
-            if (status != BluetoothGatt.GATT_SUCCESS) {
-                Log.e("ChloeVibes", "GATT error: status=$status, newState=$newState")
-            }
-            when (newState) {
-                BluetoothGatt.STATE_CONNECTED -> {
-                    Log.d("ChloeVibes", "BLE connected to: ${gatt.device.name ?: gatt.device.address}")
-                    connectionState = ConnectionState.Connected
-                    connectedDeviceName = gatt.device.name
-                    // Refresh provisional feel once the stack exposes the name
-                    // (often null at connectInternal time).
-                    gatt.device.name?.let { name ->
-                        applyMotorFeel(LovenseProtocol.MotorFeel.fromAdvertisedName(name))
-                    }
-                    // Dual-motor capability is detected from the DeviceType
-                    // response once services are ready (see parseLovenseResponse).
-                    // Lovense advertises as "LVS-XXXX", so the model name is never
-                    // in the BLE name -- the old name-substring check never fired.
-                    handler.post { onConnectionStateChanged?.invoke(connectionState) }
-                    try { gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH) } catch (_: Exception) { }
-                    // Request a larger MTU first (the dual-motor
-                    // "Vibrate1:..;Vibrate2:..;" command is 24 bytes, over the
-                    // 20-byte default payload), THEN discover services from
-                    // onMtuChanged. Issuing requestMtu() and discoverServices()
-                    // back-to-back makes the second GATT op get dropped on many
-                    // stacks, so onServicesDiscovered never fires and the peer
-                    // drops the link after ~10s (GATT status 19). Fall back to
-                    // discovering immediately only if the MTU request won't start.
-                    val mtuRequested = try { gatt.requestMtu(185) } catch (_: Exception) { false }
-                    if (!mtuRequested) {
-                        gatt.discoverServices()
-                    }
-                }
-                BluetoothGatt.STATE_DISCONNECTED -> {
-                    Log.d("ChloeVibes", "BLE disconnected (status=$status)")
-                    // ALWAYS close the client interface here. Android caps the
-                    // process at ~32 GATT clients; leaking one per dropped or
-                    // failed connection eventually makes every connectGatt()
-                    // fail until the app is killed ("works after a restart").
+            synchronized(writeLock) {
+                if (!isCurrentGatt(gatt)) {
+                    Log.d("ChloeVibes", "Ignoring callback from superseded GATT client (newState=$newState)")
                     try { gatt.close() } catch (_: Exception) { }
-                    if (this@BleDeviceManager.gatt === gatt) {
-                        this@BleDeviceManager.gatt = null
-                    }
-                    connectedDeviceName = null
-                    writeCharacteristic = null
-                    notifyCharacteristic = null
-                    resetWriteState()
-                    if (!userRequestedDisconnect && lastConnectAddress != null &&
-                        reconnectAttempts < MAX_RECONNECT_ATTEMPTS
-                    ) {
-                        scheduleReconnect()
-                    } else {
-                        connectionState = ConnectionState.Disconnected
+                    return
+                }
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    Log.e("ChloeVibes", "GATT error: status=$status, newState=$newState")
+                }
+                when (newState) {
+                    BluetoothGatt.STATE_CONNECTED -> {
+                        Log.d("ChloeVibes", "BLE connected to: ${gatt.device.name ?: gatt.device.address}")
+                        connectionState = ConnectionState.Connected
+                        connectedDeviceName = gatt.device.name
+                        // Refresh provisional feel once the stack exposes the name
+                        // (often null at connectInternal time).
+                        gatt.device.name?.let { name ->
+                            applyMotorFeel(LovenseProtocol.MotorFeel.fromAdvertisedName(name))
+                        }
+                        // Dual-motor capability is detected from the DeviceType
+                        // response once services are ready (see parseLovenseResponse).
+                        // Lovense advertises as "LVS-XXXX", so the model name is never
+                        // in the BLE name -- the old name-substring check never fired.
                         handler.post { onConnectionStateChanged?.invoke(connectionState) }
+                        try { gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH) } catch (_: Exception) { }
+                        // Request a larger MTU first (the dual-motor
+                        // "Vibrate1:..;Vibrate2:..;" command is 24 bytes, over the
+                        // 20-byte default payload), THEN discover services from
+                        // onMtuChanged. Issuing requestMtu() and discoverServices()
+                        // back-to-back makes the second GATT op get dropped on many
+                        // stacks, so onServicesDiscovered never fires and the peer
+                        // drops the link after ~10s (GATT status 19). Fall back to
+                        // discovering immediately only if the MTU request won't start.
+                        val mtuRequested = try { gatt.requestMtu(185) } catch (_: Exception) { false }
+                        if (!mtuRequested) {
+                            gatt.discoverServices()
+                        }
+                        handler.postDelayed({
+                            if (isCurrentGatt(gatt) && connectionState != ConnectionState.Ready) {
+                                recoverGatt(gatt, "BLE setup timed out; reconnecting")
+                            }
+                        }, 5_000L)
+                    }
+                    BluetoothGatt.STATE_DISCONNECTED -> {
+                        Log.d("ChloeVibes", "BLE disconnected (status=$status)")
+                        // ALWAYS close the client interface here. Android caps the
+                        // process at ~32 GATT clients; leaking one per dropped or
+                        // failed connection eventually makes every connectGatt()
+                        // fail until the app is killed ("works after a restart").
+                        try { gatt.close() } catch (_: Exception) { }
+                        if (this@BleDeviceManager.gatt === gatt) {
+                            this@BleDeviceManager.gatt = null
+                        }
+                        connectedDeviceName = null
+                        writeCharacteristic = null
+                        notifyCharacteristic = null
+                        resetWriteState()
+                        if (!userRequestedDisconnect && lastConnectAddress != null &&
+                            reconnectAttempts < MAX_RECONNECT_ATTEMPTS
+                        ) {
+                            scheduleReconnect()
+                        } else {
+                            connectionState = ConnectionState.Disconnected
+                            handler.post { onConnectionStateChanged?.invoke(connectionState) }
+                        }
                     }
                 }
             }
         }
 
         override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
-            if (!isCurrentGatt(gatt)) return
-            // MTU exchange finished (success or not) -- now it's safe to issue the
-            // next GATT op. Discover services here so it isn't dropped.
-            Log.d("ChloeVibes", "MTU changed: mtu=$mtu status=$status; discovering services")
-            gatt.discoverServices()
+            synchronized(writeLock) {
+                if (!isCurrentGatt(gatt)) return
+                // MTU exchange finished (success or not) -- now it's safe to issue the
+                // next GATT op. Discover services here so it isn't dropped.
+                Log.d("ChloeVibes", "MTU changed: mtu=$mtu status=$status; discovering services")
+                gatt.discoverServices()
+            }
         }
 
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-            if (!isCurrentGatt(gatt)) return
-            if (status != BluetoothGatt.GATT_SUCCESS) {
-                Log.w("ChloeVibes", "onServicesDiscovered failed: status=$status")
-                // Drop the link instead of sitting half-connected; the
-                // disconnect callback closes the client and retries.
+            synchronized(writeLock) {
+                if (!isCurrentGatt(gatt)) return
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    Log.w("ChloeVibes", "onServicesDiscovered failed: status=$status")
+                    // Drop the link instead of sitting half-connected; the
+                    // disconnect callback closes the client and retries.
+                    gatt.disconnect()
+                    return
+                }
+                Log.d("ChloeVibes", "Services discovered: ${gatt.services.size}")
+
+                // Try each known Lovense UUID set
+                for (uuids in KNOWN_SERVICES) {
+                    val service = gatt.getService(uuids.service) ?: continue
+                    val tx = service.getCharacteristic(uuids.tx) ?: continue
+                    val rx = service.getCharacteristic(uuids.rx) ?: continue
+                    writeCharacteristic = tx
+                    notifyCharacteristic = rx
+                    Log.d("ChloeVibes", "Matched Lovense service ${uuids.service} tx=${uuids.tx} props=${tx.properties}")
+                    enableNotificationsAndFinish(gatt, rx)
+                    return
+                }
+
+                // Fallback: scan ALL services for a writable + notifiable pair
+                // (covers unknown firmware revisions)
+                for (service in gatt.services) {
+                    var txCandidate: BluetoothGattCharacteristic? = null
+                    var rxCandidate: BluetoothGattCharacteristic? = null
+                    for (c in service.characteristics) {
+                        val props = c.properties
+                        if (props and BluetoothGattCharacteristic.PROPERTY_WRITE != 0 ||
+                            props and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0
+                        ) {
+                            txCandidate = c
+                        }
+                        if (props and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0) {
+                            rxCandidate = c
+                        }
+                    }
+                    if (txCandidate != null && rxCandidate != null) {
+                        writeCharacteristic = txCandidate
+                        notifyCharacteristic = rxCandidate
+                        Log.d("ChloeVibes", "Fallback match: service ${service.uuid} tx=${txCandidate.uuid} props=${txCandidate.properties}")
+                        enableNotificationsAndFinish(gatt, rxCandidate)
+                        return
+                    }
+                }
+
+                // No compatible service/characteristic found -- incompatible
+                // device, so do not auto-reconnect to it.
+                Log.w("ChloeVibes", "No compatible GATT characteristics found for device")
+                lastConnectAddress = null
+                connectionState = ConnectionState.Disconnected
+                handler.post { onConnectionStateChanged?.invoke(ConnectionState.Disconnected) }
+                gatt.disconnect()
+                gatt.close()
+            }
+        }
+
+        @Suppress("DEPRECATION") // API 26-32 compatibility; submission is serialized.
+        private fun enableNotificationsAndFinish(gatt: BluetoothGatt, rxChar: BluetoothGattCharacteristic) {
+            if (!gatt.setCharacteristicNotification(rxChar, true)) {
                 gatt.disconnect()
                 return
             }
-            Log.d("ChloeVibes", "Services discovered: ${gatt.services.size}")
-
-            // Try each known Lovense UUID set
-            for (uuids in KNOWN_SERVICES) {
-                val service = gatt.getService(uuids.service) ?: continue
-                val tx = service.getCharacteristic(uuids.tx) ?: continue
-                val rx = service.getCharacteristic(uuids.rx) ?: continue
-                writeCharacteristic = tx
-                notifyCharacteristic = rx
-                Log.d("ChloeVibes", "Matched Lovense service ${uuids.service} tx=${uuids.tx} props=${tx.properties}")
-                enableNotificationsAndFinish(gatt, rx)
+            val descriptor = rxChar.getDescriptor(CCCD_UUID)
+            if (descriptor == null) {
+                gatt.disconnect()
                 return
             }
-
-            // Fallback: scan ALL services for a writable + notifiable pair
-            // (covers unknown firmware revisions)
-            for (service in gatt.services) {
-                var txCandidate: BluetoothGattCharacteristic? = null
-                var rxCandidate: BluetoothGattCharacteristic? = null
-                for (c in service.characteristics) {
-                    val props = c.properties
-                    if (props and BluetoothGattCharacteristic.PROPERTY_WRITE != 0 ||
-                        props and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0
-                    ) {
-                        txCandidate = c
-                    }
-                    if (props and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0) {
-                        rxCandidate = c
-                    }
-                }
-                if (txCandidate != null && rxCandidate != null) {
-                    writeCharacteristic = txCandidate
-                    notifyCharacteristic = rxCandidate
-                    Log.d("ChloeVibes", "Fallback match: service ${service.uuid} tx=${txCandidate.uuid} props=${txCandidate.properties}")
-                    enableNotificationsAndFinish(gatt, rxCandidate)
-                    return
-                }
-            }
-
-            // No compatible service/characteristic found -- incompatible
-            // device, so do not auto-reconnect to it.
-            Log.w("ChloeVibes", "No compatible GATT characteristics found for device")
-            lastConnectAddress = null
-            connectionState = ConnectionState.Disconnected
-            handler.post { onConnectionStateChanged?.invoke(ConnectionState.Disconnected) }
-            gatt.disconnect()
-            gatt.close()
+            descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+            if (!gatt.writeDescriptor(descriptor)) gatt.disconnect()
         }
 
-        private fun enableNotificationsAndFinish(gatt: BluetoothGatt, rxChar: BluetoothGattCharacteristic) {
-            gatt.setCharacteristicNotification(rxChar, true)
-            val descriptor = rxChar.getDescriptor(CCCD_UUID)
-            descriptor?.let {
-                it.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                gatt.writeDescriptor(it)
+        override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
+            synchronized(writeLock) {
+                if (!isCurrentGatt(gatt) || descriptor.uuid != CCCD_UUID) return
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    gatt.disconnect()
+                    return
+                }
+                connectionState = ConnectionState.Ready
+                reconnectAttempts = 0
+                Log.d("ChloeVibes", "Connection Ready; requesting DeviceType + battery")
+                handler.post { onConnectionStateChanged?.invoke(connectionState) }
+                // Ask the device what it is first -- the DeviceType reply drives
+                // dual-motor detection (parseLovenseResponse) -- then poll battery.
+                stopMotors()
+                sendCommand(LovenseProtocol.deviceType())
+                sendCommand(LovenseProtocol.battery())
             }
-            connectionState = ConnectionState.Ready
-            reconnectAttempts = 0
-            Log.d("ChloeVibes", "Connection Ready; requesting DeviceType + battery")
-            handler.post { onConnectionStateChanged?.invoke(connectionState) }
-            // Ask the device what it is first -- the DeviceType reply drives
-            // dual-motor detection (parseLovenseResponse) -- then poll battery.
-            handler.postDelayed({ sendCommand(LovenseProtocol.deviceType()) }, 300)
-            handler.postDelayed({ sendCommand(LovenseProtocol.battery()) }, 700)
         }
 
         override fun onCharacteristicWrite(
@@ -527,21 +615,43 @@ class BleDeviceManager(private val context: Context) {
             characteristic: BluetoothGattCharacteristic,
             status: Int
         ) {
+            if (!isCurrentGatt(gatt) || characteristic !== writeCharacteristic) return
             synchronized(writeLock) {
-                writeWatchdogScheduled = false
+                if (!isCurrentGatt(gatt) || characteristic !== writeCharacteristic) return
+                val completed = inFlightCommand
+                if (userRequestedDisconnect && status == BluetoothGatt.GATT_SUCCESS &&
+                    completed != null && LovenseProtocol.isStopCommand(completed)) {
+                    finishDisconnect(gatt)
+                    return
+                }
+                if (status != BluetoothGatt.GATT_SUCCESS && completed != null) {
+                    commandQueue.retry(completed)
+                    writeFailures++
+                } else if (status == BluetoothGatt.GATT_SUCCESS) {
+                    writeFailures = 0
+                }
+                writeInFlight = false
+                inFlightCommand = null
+                if (writeFailures >= 3) {
+                    connectionState = ConnectionState.Connected
+                    handler.post { recoverGatt(gatt, "Repeated BLE write failures; reconnecting") }
+                }
             }
             // Previous write completed — flush any queued command
             flushPendingWrite()
         }
 
+        @Suppress("DEPRECATION") // Legacy callback required on API 26-32.
         override fun onCharacteristicChanged(
             gatt: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic
         ) {
-            if (characteristic.uuid == notifyCharacteristic?.uuid) {
-                val response = characteristic.getStringValue(0) ?: return
-                Log.d("ChloeVibes", "RX '$response'")
-                parseLovenseResponse(response)
+            synchronized(writeLock) {
+                if (isCurrentGatt(gatt) && characteristic.uuid == notifyCharacteristic?.uuid) {
+                    val response = characteristic.getStringValue(0) ?: return
+                    Log.d("ChloeVibes", "RX '$response'")
+                    parseLovenseResponse(response)
+                }
             }
         }
     }
@@ -555,151 +665,109 @@ class BleDeviceManager(private val context: Context) {
      * Respects BLE write gating — only one write in flight at a time.
      */
     fun sendCommand(command: String): Boolean {
-        val characteristic = writeCharacteristic
-        if (characteristic == null) {
-            if (!command.startsWith("Vibrate")) {
-                Log.w("ChloeVibes", "sendCommand('$command') dropped: not ready (no characteristic)")
-            }
-            return false
-        }
-        val g = gatt ?: return false
-        val isStop = LovenseProtocol.isStopCommand(command)
-        val intervalMs = if (isStop) stopWriteIntervalMs else minWriteIntervalMs
-
-        var shouldWrite = false
-        var queueBecauseInFlight = false
-        var pendingDelayMs = 0L
-
         synchronized(writeLock) {
-            val now = System.currentTimeMillis()
-            // Auto-clear writeInFlight if the BLE callback hasn't arrived
-            // within timeout.  When the app is backgrounded, Android may delay
-            // onCharacteristicWrite callbacks, leaving writeInFlight stuck and
-            // blocking all subsequent vibration commands.
-            if (writeInFlight && (now - lastWriteMs) > writeTimeoutMs) {
-                writeInFlight = false
-            }
-
-            if (writeInFlight) {
-                // Latest intensity always wins (including kick after a queued
-                // stop). Stop commands still use a shorter interval so rest
-                // is not delayed behind a peak that just left the radio.
-                pendingCommand = command
-                queueBecauseInFlight = true
-            } else {
-                val sinceLast = now - lastWriteMs
-                if (sinceLast < intervalMs) {
-                    pendingCommand = command
-                    pendingDelayMs = intervalMs - sinceLast
-                } else {
-                    writeInFlight = true
-                    lastWriteMs = now
-                    shouldWrite = true
-                }
-            }
+            if (connectionState != ConnectionState.Ready || gatt == null || writeCharacteristic == null) return false
+            if (userRequestedDisconnect && !LovenseProtocol.isStopCommand(command)) return false
+            commandQueue.offer(command)
         }
+        return flushPendingWrite()
+    }
 
-        if (queueBecauseInFlight) {
-            scheduleWriteWatchdog()
-            return false
+    /** One lock owns the pending queue, characteristic value and GATT submission. */
+    @Suppress("DEPRECATION") // API 26-32 compatibility; characteristic mutation is locked.
+    private fun flushPendingWrite(): Boolean = synchronized(writeLock) {
+        if (writeInFlight || connectionState != ConnectionState.Ready) return@synchronized false
+        val g = gatt ?: return@synchronized false
+        val characteristic = writeCharacteristic ?: return@synchronized false
+        val next = commandQueue.peek() ?: return@synchronized false
+        val intervalMs = if (LovenseProtocol.isStopCommand(next)) stopWriteIntervalMs else minWriteIntervalMs
+        val now = SystemClock.elapsedRealtime()
+        val waitMs = intervalMs - (now - lastWriteMs)
+        if (waitMs > 0) {
+            schedulePendingDrain(waitMs)
+            return@synchronized false
         }
-        if (!shouldWrite) {
-            schedulePendingDrain(pendingDelayMs)
-            return false
-        }
-
+        val command = commandQueue.take() ?: return@synchronized false
+        writeInFlight = true
+        inFlightCommand = command
+        lastWriteMs = now
+        writeTicket++
+        val ticket = writeTicket
+        val epoch = writeEpoch
         characteristic.value = command.toByteArray(Charsets.US_ASCII)
-        // Use write-with-response only if the characteristic advertises it; many
-        // Lovense TX characteristics are WRITE_NO_RESPONSE only, and writing with
-        // the wrong type silently never reaches the device.
         characteristic.writeType =
-            if (characteristic.properties and BluetoothGattCharacteristic.PROPERTY_WRITE != 0) {
+            if (characteristic.properties and BluetoothGattCharacteristic.PROPERTY_WRITE != 0)
                 BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-            } else {
-                BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-            }
-        val started = g.writeCharacteristic(characteristic)
-        if (!command.startsWith("Vibrate") || isStop) {
-            Log.d("ChloeVibes", "TX '$command' started=$started wt=${characteristic.writeType}")
+            else BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+        val started = try {
+            g.writeCharacteristic(characteristic)
+        } catch (e: Exception) {
+            Log.w("ChloeVibes", "BLE command submission failed", e)
+            false
         }
         if (!started) {
-            synchronized(writeLock) {
-                writeInFlight = false
-                pendingCommand = command
-            }
-            schedulePendingDrain(intervalMs)
-        } else {
-            scheduleWriteWatchdog()
-        }
-        return started
-    }
-
-    /** Flush pending command after a write completes. */
-    private fun flushPendingWrite() {
-        val cmd: String?
-        synchronized(writeLock) {
             writeInFlight = false
-            cmd = pendingCommand
-            pendingCommand = null
+            inFlightCommand = null
+            commandQueue.retry(command)
+            writeFailures++
+            if (writeFailures >= 3) {
+                connectionState = ConnectionState.Connected
+                handler.post { recoverGatt(g, "Repeated BLE write submission failures; reconnecting") }
+            } else {
+                schedulePendingDrain(intervalMs)
+            }
+        } else {
+            // A timed-out response makes subsequent callbacks ambiguous. Drop
+            // this client instead of letting its late callback clear a new write.
+            handler.postDelayed({
+                val timedOut = synchronized(writeLock) {
+                    if (epoch != writeEpoch || ticket != writeTicket || !writeInFlight || gatt !== g) {
+                        false
+                    } else {
+                        connectionState = ConnectionState.Connected
+                        true
+                    }
+                }
+                if (timedOut) {
+                    recoverGatt(g, "BLE write callback timed out; reconnecting")
+                }
+            }, writeTimeoutMs)
         }
-        cmd?.let { sendCommand(it) }
+        started
     }
 
-    /** Schedules pending command flush once min write interval has elapsed. */
     private fun schedulePendingDrain(delayMs: Long) {
-        val shouldSchedule = synchronized(writeLock) {
-            if (pendingDrainScheduled) {
-                false
-            } else {
-                pendingDrainScheduled = true
-                true
-            }
+        val delay = delayMs.coerceAtLeast(1L)
+        val scheduled = synchronized(writeLock) {
+            val deadline = SystemClock.elapsedRealtime() + delay
+            if (pendingDrainScheduled && pendingDrainAtMs <= deadline) return
+            pendingDrainScheduled = true
+            pendingDrainAtMs = deadline
+            pendingDrainTicket++
+            Pair(writeEpoch, pendingDrainTicket)
         }
-        if (!shouldSchedule) return
-
         handler.postDelayed({
-            synchronized(writeLock) {
-                pendingDrainScheduled = false
-            }
-            flushPendingWrite()
-        }, delayMs.coerceAtLeast(1L))
-    }
-
-    /** Watchdog for missing onCharacteristicWrite callbacks. */
-    private fun scheduleWriteWatchdog() {
-        val shouldSchedule = synchronized(writeLock) {
-            if (writeWatchdogScheduled) {
-                false
-            } else {
-                writeWatchdogScheduled = true
-                true
-            }
-        }
-        if (!shouldSchedule) return
-
-        handler.postDelayed({
-            var shouldFlush = false
-            synchronized(writeLock) {
-                writeWatchdogScheduled = false
-                val now = System.currentTimeMillis()
-                if (writeInFlight && (now - lastWriteMs) > writeTimeoutMs) {
-                    writeInFlight = false
-                    shouldFlush = pendingCommand != null
+            val current = synchronized(writeLock) {
+                if (scheduled.first != writeEpoch || scheduled.second != pendingDrainTicket) false else {
+                    pendingDrainScheduled = false
+                    true
                 }
             }
-            if (shouldFlush) {
-                flushPendingWrite()
-            }
-        }, writeTimeoutMs)
+            if (current) flushPendingWrite()
+        }, delay)
     }
 
     private fun resetWriteState() {
         synchronized(writeLock) {
             writeInFlight = false
-            pendingCommand = null
+            commandQueue.clear()
+            inFlightCommand = null
+            writeFailures = 0
+            writeEpoch++
             lastWriteMs = 0L
             pendingDrainScheduled = false
-            writeWatchdogScheduled = false
+            pendingDrainAtMs = 0L
+            pendingDrainTicket++
         }
         ditherErrorMain = 0f
         ditherErrorMotor1 = 0f
@@ -837,7 +905,7 @@ class BleDeviceManager(private val context: Context) {
         // Coalesce the queue to stop before attempting the live write so an
         // in-flight vibrate completion cannot flush a later intensity first.
         synchronized(writeLock) {
-            pendingCommand = stopCmd
+            commandQueue.offer(stopCmd)
         }
         if (connectionState == ConnectionState.Ready) {
             sendCommand(stopCmd)
@@ -854,7 +922,7 @@ class BleDeviceManager(private val context: Context) {
         if (level <= 0) {
             return Triple(0, 0, 0L)
         }
-        val now = System.currentTimeMillis()
+        val now = SystemClock.elapsedRealtime()
         // Large drop toward rest: do not keep the old peak alive.
         if (heldLevel - level >= peakHoldDropBypassSteps) {
             return Triple(level, level, 0L)

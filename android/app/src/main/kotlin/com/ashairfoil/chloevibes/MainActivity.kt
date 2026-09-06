@@ -42,6 +42,8 @@ class MainActivity : ComponentActivity() {
     private val uiUpdateRunnable = object : Runnable {
         override fun run() {
             uiState.isCapturing = audioCaptureManager.isRunning
+            uiState.hasRecentAudio = audioCaptureManager.hasRecentInput
+            applyKeepScreenOn(uiState.isCapturing)
             if (audioCaptureManager.isRunning) {
                 val state = audioCaptureManager.state
                 uiState.currentOutput = state.lastFinalOutput
@@ -72,6 +74,7 @@ class MainActivity : ComponentActivity() {
 
         chloeVibesApplication = application as ChloeVibesApplication
         audioCaptureManager = chloeVibesApplication.audioCaptureManager
+        uiState.audioSource = audioCaptureManager.sourceMode
         bleDeviceManager = chloeVibesApplication.bleDeviceManager
         uiState.connectionState = bleDeviceManager.connectionState
         uiState.connectedDeviceName = bleDeviceManager.connectedDeviceName
@@ -127,9 +130,7 @@ class MainActivity : ComponentActivity() {
             audioCaptureManager.applyPreset(defaultPreset)
         }
 
-        // Start UI update loop
-        handler.post(uiUpdateRunnable)
-
+        // UI update loop starts in onStart so it pauses while backgrounded.
         setContent {
             ChloeVibesTheme {
                 MainScreen(
@@ -152,9 +153,7 @@ class MainActivity : ComponentActivity() {
                         bleDeviceManager.disconnect()
                     },
                     onClimaxReset = {
-                        audioCaptureManager.state.climaxEngine.reset(
-                            System.currentTimeMillis().toFloat()
-                        )
+                        audioCaptureManager.requestClimaxReset()
                         uiState.climaxPhase = 0f
                     },
                     discoveredDevices = discoveredDevices,
@@ -162,6 +161,19 @@ class MainActivity : ComponentActivity() {
                 )
             }
         }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        // Signal processing and BLE keep running while backgrounded; only the
+        // 30Hz UI mirror pauses, since there is nothing on screen to feed.
+        handler.removeCallbacks(uiUpdateRunnable)
+        handler.post(uiUpdateRunnable)
+    }
+
+    override fun onStop() {
+        handler.removeCallbacks(uiUpdateRunnable)
+        super.onStop()
     }
 
     override fun onDestroy() {
@@ -196,7 +208,7 @@ class MainActivity : ComponentActivity() {
 
     private fun startCapture() {
         syncParamsToCapture()
-        uiState.isCapturing = chloeVibesApplication.startAudioCapture()
+        uiState.isCapturing = chloeVibesApplication.startAudioCapture(uiState.audioSource)
         if (uiState.isCapturing) {
             // Successful re-arm clears a prior dead-man banner.
             uiState.watchdogTripped = false
@@ -267,6 +279,7 @@ class MainActivity : ComponentActivity() {
             minVibe = uiState.minVibe
             maxVibe = uiState.maxVibe
             outputGain = uiState.outputGain
+            outputSlewMs = uiState.outputSlewMs
             climaxEnabled = uiState.climaxEnabled
             climaxIntensity = uiState.climaxIntensity
             climaxBuildUpMs = uiState.climaxBuildUpMs

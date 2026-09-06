@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     env, fs,
     path::PathBuf,
     sync::{
@@ -25,6 +26,62 @@ use buttplug::{
 };
 
 const DEFAULT_SERVER_ADDR: &str = "ws://127.0.0.1:12345";
+
+pub const NO_CAPTURE_PACKET: u64 = u64::MAX;
+pub const CAPTURE_STALE_MS: u64 = 250;
+
+/// The GUI being alive is not evidence that the audio source is alive.
+pub fn capture_is_fresh(now_ms: u64, last_packet_ms: u64) -> bool {
+    last_packet_ms != NO_CAPTURE_PACKET && now_ms.saturating_sub(last_packet_ms) < CAPTURE_STALE_MS
+}
+
+/// Apply the current user ceiling after any delay or smoothing history.
+pub fn limit_output(level: f32, ceiling: f32) -> f32 {
+    if !level.is_finite() || !ceiling.is_finite() {
+        return 0.0;
+    }
+    level.clamp(0.0, ceiling.clamp(0.0, 1.0))
+}
+
+/// Delay in elapsed time, independent of repaint rate. A changed delay starts
+/// a new timeline rather than replaying output from the previous setting.
+#[derive(Default)]
+pub struct OutputDelay {
+    samples: VecDeque<(f64, f32)>,
+    delay_ms: f32,
+}
+
+impl OutputDelay {
+    pub fn clear(&mut self) {
+        self.samples.clear();
+    }
+
+    pub fn push(&mut self, now_ms: f64, level: f32, delay_ms: f32) -> f32 {
+        let delay_ms = if delay_ms.is_finite() {
+            delay_ms.clamp(0.0, 500.0)
+        } else {
+            0.0
+        };
+        if self.delay_ms != delay_ms || self.samples.back().is_some_and(|(time, _)| *time > now_ms)
+        {
+            self.clear();
+            self.delay_ms = delay_ms;
+        }
+        if delay_ms == 0.0 {
+            self.clear();
+            return level;
+        }
+        self.samples.push_back((now_ms, level));
+        let due_ms = now_ms - f64::from(delay_ms);
+        while self.samples.len() > 1 && self.samples[1].0 <= due_ms {
+            self.samples.pop_front();
+        }
+        self.samples
+            .front()
+            .filter(|(time, _)| *time <= due_ms)
+            .map_or(0.0, |(_, value)| *value)
+    }
+}
 
 async fn connect_remote(
     client_name: &str,
@@ -294,6 +351,65 @@ impl MinCutoff for f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_health_requires_packets_even_if_the_ui_keeps_ticking() {
+        assert!(!capture_is_fresh(0, NO_CAPTURE_PACKET));
+        assert!(capture_is_fresh(1_000, 1_000));
+        assert!(capture_is_fresh(1_249, 1_000));
+        for now in [1_250, 1_500, 2_000, 20_000] {
+            assert!(!capture_is_fresh(now, 1_000));
+        }
+        assert!(capture_is_fresh(20_001, 20_001));
+    }
+
+    #[test]
+    fn delay_uses_timestamps_across_irregular_frames_and_preserves_rests() {
+        let mut delay = OutputDelay::default();
+        assert_eq!(delay.push(0.0, 0.8, 100.0), 0.0);
+        assert_eq!(delay.push(20.0, 0.4, 100.0), 0.0);
+        assert_eq!(delay.push(70.0, 0.0, 100.0), 0.0);
+        assert_eq!(delay.push(99.0, 0.2, 100.0), 0.0);
+        assert_eq!(delay.push(100.0, 0.3, 100.0), 0.8);
+        assert_eq!(delay.push(160.0, 0.6, 100.0), 0.4);
+        assert_eq!(delay.push(175.0, 0.7, 100.0), 0.0);
+    }
+
+    #[test]
+    fn capture_stop_or_delay_change_cannot_replay_an_old_peak() {
+        let mut delay = OutputDelay::default();
+        delay.push(0.0, 1.0, 100.0);
+        delay.clear();
+        assert_eq!(delay.push(150.0, 0.0, 100.0), 0.0);
+        assert_eq!(delay.push(300.0, 0.0, 100.0), 0.0);
+        delay.push(400.0, 1.0, 100.0);
+        assert_eq!(delay.push(500.0, 0.0, 200.0), 0.0);
+        assert_eq!(delay.push(550.0, 0.5, 0.0), 0.5);
+    }
+
+    #[test]
+    fn both_motor_delays_share_one_timeline() {
+        let mut primary = OutputDelay::default();
+        let mut secondary = OutputDelay::default();
+        for now in [0.0, 16.0, 39.0, 65.0, 82.0, 110.0] {
+            let value = if now < 39.0 { 0.8 } else { 0.0 };
+            let a = primary.push(now, value, 50.0);
+            let b = secondary.push(now, value * 0.5, 50.0);
+            assert_eq!(a * 0.5, b);
+        }
+    }
+
+    #[test]
+    fn lowering_ceiling_immediately_bounds_a_queued_peak_and_slew_tail() {
+        let mut delay = OutputDelay::default();
+        delay.push(0.0, 0.8, 500.0);
+        let queued_peak = delay.push(500.0, 0.1, 500.0);
+        assert_eq!(queued_peak, 0.8);
+        assert_eq!(limit_output(queued_peak, 0.2), 0.2);
+        assert_eq!(limit_output(0.7, 0.2), 0.2);
+        assert_eq!(limit_output(queued_peak, 0.0), 0.0);
+        assert_eq!(limit_output(f32::NAN, 0.8), 0.0);
+    }
 
     #[test]
     fn test_shared_f32_round_trip() {

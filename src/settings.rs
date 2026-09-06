@@ -80,7 +80,7 @@ pub struct Settings {
     pub input_fall_ms: f32,
     /// Final output slew time (ms). Lower = tighter rhythm.
     pub output_slew_ms: f32,
-    /// Timing trim in milliseconds (positive = delay haptics, negative = advance).
+    /// Additional output delay in milliseconds, applied to both motor channels.
     pub trim_ms: f32,
 
     // -- Frequency Mode --
@@ -210,40 +210,186 @@ impl Settings {
 
     /// Clamp all numeric settings to valid ranges (guards against corrupted storage)
     pub fn sanitize(&mut self) {
-        self.main_volume = self.main_volume.clamp(0.0, 5.0);
-        self.gate_threshold = self.gate_threshold.clamp(0.0, 1.0);
-        self.auto_gate_amount = self.auto_gate_amount.clamp(0.0, 1.0);
-        self.gate_smoothing = self.gate_smoothing.clamp(0.0, 1.0);
-        self.binary_level = self.binary_level.clamp(0.0, 1.0);
-        self.hybrid_blend = self.hybrid_blend.clamp(0.0, 1.0);
-        self.threshold_knee = self.threshold_knee.clamp(0.0, 1.0);
-        self.dynamic_curve = self.dynamic_curve.clamp(0.1, 5.0);
-        self.attack_ms = self.attack_ms.clamp(0.5, 5000.0);
-        self.decay_ms = self.decay_ms.clamp(0.5, 5000.0);
-        self.sustain_level = self.sustain_level.clamp(0.0, 1.0);
-        self.release_ms = self.release_ms.clamp(0.5, 5000.0);
-        self.attack_curve = self.attack_curve.clamp(0.1, 5.0);
-        self.decay_curve = self.decay_curve.clamp(0.1, 5.0);
-        self.release_curve = self.release_curve.clamp(0.1, 5.0);
-        self.min_vibe = self.min_vibe.clamp(0.0, 1.0);
-        self.max_vibe = self.max_vibe.clamp(0.0, 1.0);
-        self.output_gain = self.output_gain.clamp(0.0, 5.0);
-        self.input_rise_ms = self.input_rise_ms.clamp(1.0, 1000.0);
-        self.input_fall_ms = self.input_fall_ms.clamp(1.0, 1000.0);
+        let defaults = Self::default();
+        self.main_volume = if self.main_volume.is_finite() {
+            self.main_volume.clamp(0.0, 5.0)
+        } else {
+            defaults.main_volume
+        };
+        self.gate_threshold = if self.gate_threshold.is_finite() {
+            self.gate_threshold.clamp(0.0, 1.0)
+        } else {
+            defaults.gate_threshold
+        };
+        self.auto_gate_amount = if self.auto_gate_amount.is_finite() {
+            self.auto_gate_amount.clamp(0.0, 1.0)
+        } else {
+            defaults.auto_gate_amount
+        };
+        self.gate_smoothing = if self.gate_smoothing.is_finite() {
+            self.gate_smoothing.clamp(0.0, 1.0)
+        } else {
+            defaults.gate_smoothing
+        };
+        self.binary_level = if self.binary_level.is_finite() {
+            self.binary_level.clamp(0.0, 1.0)
+        } else {
+            defaults.binary_level
+        };
+        self.hybrid_blend = if self.hybrid_blend.is_finite() {
+            self.hybrid_blend.clamp(0.0, 1.0)
+        } else {
+            defaults.hybrid_blend
+        };
+        self.threshold_knee = if self.threshold_knee.is_finite() {
+            self.threshold_knee.clamp(0.0, 1.0)
+        } else {
+            defaults.threshold_knee
+        };
+        self.dynamic_curve = if self.dynamic_curve.is_finite() {
+            self.dynamic_curve.clamp(0.1, 5.0)
+        } else {
+            defaults.dynamic_curve
+        };
+        self.attack_ms = if self.attack_ms.is_finite() {
+            self.attack_ms.clamp(0.5, 5000.0)
+        } else {
+            defaults.attack_ms
+        };
+        self.decay_ms = if self.decay_ms.is_finite() {
+            self.decay_ms.clamp(0.5, 5000.0)
+        } else {
+            defaults.decay_ms
+        };
+        self.sustain_level = if self.sustain_level.is_finite() {
+            self.sustain_level.clamp(0.0, 1.0)
+        } else {
+            defaults.sustain_level
+        };
+        self.release_ms = if self.release_ms.is_finite() {
+            self.release_ms.clamp(0.5, 5000.0)
+        } else {
+            defaults.release_ms
+        };
+        self.attack_curve = if self.attack_curve.is_finite() {
+            self.attack_curve.clamp(0.1, 5.0)
+        } else {
+            defaults.attack_curve
+        };
+        self.decay_curve = if self.decay_curve.is_finite() {
+            self.decay_curve.clamp(0.1, 5.0)
+        } else {
+            defaults.decay_curve
+        };
+        self.release_curve = if self.release_curve.is_finite() {
+            self.release_curve.clamp(0.1, 5.0)
+        } else {
+            defaults.release_curve
+        };
+        self.min_vibe = if self.min_vibe.is_finite() {
+            self.min_vibe.clamp(0.0, 1.0)
+        } else {
+            defaults.min_vibe
+        };
+        self.max_vibe = if self.max_vibe.is_finite() {
+            self.max_vibe.clamp(0.0, 1.0)
+        } else {
+            defaults.max_vibe
+        };
+        self.output_gain = if self.output_gain.is_finite() {
+            self.output_gain.clamp(0.0, 5.0)
+        } else {
+            defaults.output_gain
+        };
+        self.input_rise_ms = if self.input_rise_ms.is_finite() {
+            self.input_rise_ms.clamp(1.0, 1000.0)
+        } else {
+            defaults.input_rise_ms
+        };
+        self.input_fall_ms = if self.input_fall_ms.is_finite() {
+            self.input_fall_ms.clamp(1.0, 1000.0)
+        } else {
+            defaults.input_fall_ms
+        };
         // Floor at 1ms: log-scale UI sliders panic/assert on 0.
-        self.output_slew_ms = self.output_slew_ms.clamp(1.0, 500.0);
-        self.trim_ms = self.trim_ms.clamp(-500.0, 500.0);
-        self.target_frequency = self.target_frequency.clamp(20.0, 20000.0);
-        self.climax_intensity = self.climax_intensity.clamp(0.0, 1.0);
+        self.output_slew_ms = if self.output_slew_ms.is_finite() {
+            self.output_slew_ms.clamp(1.0, 500.0)
+        } else {
+            defaults.output_slew_ms
+        };
+        self.trim_ms = if self.trim_ms.is_finite() {
+            self.trim_ms.clamp(0.0, 500.0)
+        } else {
+            defaults.trim_ms
+        };
+        self.target_frequency = if self.target_frequency.is_finite() {
+            self.target_frequency.clamp(20.0, 20000.0)
+        } else {
+            defaults.target_frequency
+        };
+        self.climax_intensity = if self.climax_intensity.is_finite() {
+            self.climax_intensity.clamp(0.0, 1.0)
+        } else {
+            defaults.climax_intensity
+        };
         // Match the ClimaxEngine's own clamp (audio.rs: build_up_ms.clamp(8_000, 240_000))
         // so a persisted value is never silently re-interpreted by the engine.
-        self.climax_build_up_ms = self.climax_build_up_ms.clamp(8_000.0, 240_000.0);
-        self.climax_tease_ratio = self.climax_tease_ratio.clamp(0.0, 1.0);
-        self.climax_tease_drop = self.climax_tease_drop.clamp(0.0, 1.0);
+        self.climax_build_up_ms = if self.climax_build_up_ms.is_finite() {
+            self.climax_build_up_ms.clamp(8_000.0, 240_000.0)
+        } else {
+            defaults.climax_build_up_ms
+        };
+        self.climax_tease_ratio = if self.climax_tease_ratio.is_finite() {
+            self.climax_tease_ratio.clamp(0.0, 1.0)
+        } else {
+            defaults.climax_tease_ratio
+        };
+        self.climax_tease_drop = if self.climax_tease_drop.is_finite() {
+            self.climax_tease_drop.clamp(0.0, 1.0)
+        } else {
+            defaults.climax_tease_drop
+        };
         // Engine accepts up to 1.5 (audio.rs surge path); clamping to 1.0 here would
         // silently destroy the "Break Me" preset's intentional 1.2 surge on reload.
-        self.climax_surge_boost = self.climax_surge_boost.clamp(0.0, 1.5);
-        self.climax_pulse_depth = self.climax_pulse_depth.clamp(0.0, 1.0);
+        self.climax_surge_boost = if self.climax_surge_boost.is_finite() {
+            self.climax_surge_boost.clamp(0.0, 1.5)
+        } else {
+            defaults.climax_surge_boost
+        };
+        self.climax_pulse_depth = if self.climax_pulse_depth.is_finite() {
+            self.climax_pulse_depth.clamp(0.0, 1.0)
+        } else {
+            defaults.climax_pulse_depth
+        };
+        self.min_vibe = self.min_vibe.min(self.max_vibe);
+        self.low_pass_freq.store(finite_range(
+            self.low_pass_freq.load(),
+            20.0,
+            20_000.0,
+            defaults::LOW_PASS_FREQ,
+        ));
+        self.polling_rate_ms.store(finite_range(
+            self.polling_rate_ms.load(),
+            1.0,
+            100.0,
+            defaults::POLLING_RATE_MS,
+        ));
+        self.hold_delay_ms = finite_range(self.hold_delay_ms, 0.0, 500.0, defaults::HOLD_DELAY_MS);
+        self.decay_rate_per_sec = finite_range(
+            self.decay_rate_per_sec,
+            0.01,
+            4.0,
+            defaults::DECAY_RATE_PER_SEC,
+        );
+        for device in self.device_settings.values_mut() {
+            sanitize_device_range(&mut device.multiplier, &mut device.min, &mut device.max);
+            for motor in &mut device.vibrators {
+                sanitize_device_range(&mut motor.multiplier, &mut motor.min, &mut motor.max);
+            }
+            for motor in &mut device.oscillators {
+                sanitize_device_range(&mut motor.multiplier, &mut motor.min, &mut motor.max);
+            }
+        }
     }
 }
 
@@ -665,5 +811,88 @@ impl Settings {
             names::CURRENT_PRESET_NAME,
             &self.current_preset_name,
         );
+    }
+}
+
+fn finite_range(value: f32, min: f32, max: f32, fallback: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(min, max)
+    } else {
+        fallback
+    }
+}
+
+fn sanitize_device_range(multiplier: &mut f32, min: &mut f32, max: &mut f32) {
+    *multiplier = finite_range(*multiplier, 0.05, 5.0, 1.0);
+    *max = finite_range(*max, 0.0, 1.0, 0.0);
+    *min = finite_range(*min, 0.0, *max, 0.0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn corrupt_persisted_controls_cannot_reach_log_sliders_or_device_clamps() {
+        let mut settings = Settings {
+            attack_ms: f32::NAN,
+            output_slew_ms: f32::NEG_INFINITY,
+            min_vibe: 0.9,
+            max_vibe: 0.3,
+            trim_ms: -200.0,
+            ..Settings::default()
+        };
+        settings.polling_rate_ms.store(f32::INFINITY);
+        settings.low_pass_freq.store(f32::NAN);
+        settings.device_settings.insert(
+            "saved device".into(),
+            DeviceSettings {
+                max: f32::NAN,
+                min: 1.0,
+                multiplier: f32::NAN,
+                vibrators: vec![VibratorSettings {
+                    max: -1.0,
+                    min: 1.0,
+                    multiplier: 10.0,
+                    is_enabled: true,
+                }],
+                ..DeviceSettings::default()
+            },
+        );
+        settings.sanitize();
+        assert_eq!(settings.attack_ms, defaults::ATTACK_MS);
+        assert_eq!(settings.output_slew_ms, defaults::OUTPUT_SLEW_MS);
+        assert_eq!(settings.trim_ms, 0.0);
+        assert_eq!(settings.min_vibe, 0.3);
+        assert!(settings.polling_rate_ms.load().is_finite());
+        assert!(settings.low_pass_freq.load() > 0.0);
+        let device = &settings.device_settings["saved device"];
+        assert_eq!((device.min, device.max), (0.0, 0.0));
+        assert_eq!(
+            (device.vibrators[0].min, device.vibrators[0].max),
+            (0.0, 0.0)
+        );
+        assert_eq!(device.vibrators[0].multiplier, 5.0);
+    }
+
+    #[test]
+    fn valid_custom_settings_and_positive_output_delay_survive_sanitizing() {
+        let mut settings = Settings {
+            attack_ms: 150.0,
+            decay_ms: 900.0,
+            sustain_level: 0.6,
+            release_ms: 1500.0,
+            trim_ms: 175.0,
+            climax_surge_boost: 1.2,
+            ..Settings::default()
+        };
+        settings.sanitize();
+        assert_eq!(
+            (settings.attack_ms, settings.decay_ms, settings.release_ms),
+            (150.0, 900.0, 1500.0)
+        );
+        assert_eq!(settings.sustain_level, 0.6);
+        assert_eq!(settings.trim_ms, 175.0);
+        assert_eq!(settings.climax_surge_boost, 1.2);
     }
 }

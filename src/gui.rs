@@ -43,6 +43,7 @@ use crate::{
         BAND_NAMES,
     },
     auto_lock::{AutoLock, AutoLockState},
+    device_dispatch::{actuator_output, DeviceDispatchState, DeviceOutput},
     presets::{self, PresetCategory},
     settings::{defaults, DeviceSettings, OscillatorSettings, Settings, VibratorSettings},
     util::{self, MinCutoff, SharedF32},
@@ -403,6 +404,7 @@ struct GuiApp {
     // Written every update() with app_now_ms(); device tasks stop output when
     // it goes stale (dead-man watchdog).
     pipeline_heartbeat: Arc<AtomicU64>,
+    capture_heartbeat: Arc<AtomicU64>,
     // Definitive result of the last scan start/stop op.
     scan_result: Arc<Mutex<Option<ScanOpResult>>>,
     // True while a scan start/stop op is in flight (button disabled).
@@ -439,7 +441,7 @@ struct GuiApp {
 
     // Fresh-spectral-frame detection: gate + beat detector must be ticked
     // once per capture frame, not once per UI repaint.
-    last_spectral_sig: u64,
+    last_spectral_sequence: u64,
     last_onset_strength: f32,
 
     // NEW: cached spectral data for UI display
@@ -454,7 +456,8 @@ struct GuiApp {
     smoothed_energy: f32,
     raw_energy: f32,
     using_rms_fallback: bool,
-    output_delay: VecDeque<f32>,
+    output_delay: util::OutputDelay,
+    output_delay_2: util::OutputDelay,
 
     // Preset UI state
     selected_preset_category: PresetCategory,
@@ -594,6 +597,18 @@ fn panic_stop_devices() {
 // (subsystem windows) looks like a silent "app just vanished" crash.
 impl Drop for GuiApp {
     fn drop(&mut self) {
+        // Stop command producers before the final stop RPC, otherwise a live
+        // dispatch task can re-arm a motor while shutdown is awaiting its reply.
+        self.processed_output.store(0.0);
+        self.processed_output_2.store(0.0);
+        for device in self.devices.values() {
+            device
+                .props
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_enabled = false;
+            device.abort_tasks();
+        }
         let Some(client) = self.client.take() else {
             return;
         };
@@ -626,6 +641,7 @@ fn capture_thread(
     use_polling_rate: Arc<AtomicBool>,
     use_advanced: Arc<AtomicBool>,
     capture_status: Arc<Mutex<String>>,
+    capture_heartbeat: Arc<AtomicU64>,
 ) -> ! {
     // WASAPI loopback buffer. Duration::ZERO made the third-party crate
     // unwrap-panic on Initialize (WinError 0x88890008 / unsupported format)
@@ -633,6 +649,9 @@ fn capture_thread(
     const CAPTURE_BUFFER: Duration = Duration::from_millis(80);
 
     loop {
+        capture_heartbeat.store(util::NO_CAPTURE_PACKET, Ordering::Relaxed);
+        sound_power.store(0.0);
+        spectral_shared.store(SpectralData::default());
         set_capture_status(&capture_status, "audio: initializing");
 
         // This audio-capture crate unwraps WinErrors (panics) on init/read.
@@ -672,12 +691,14 @@ fn capture_thread(
         let sample_rate = (format.sample_rate as f32).max(1.0);
         let channels = (format.channels as usize).max(1);
 
-        // Poll near half-buffer cadence, but never faster than 5ms.
+        // The WASAPI buffer is capacity, not a latency target. Poll often
+        // enough to publish each 1024-frame analysis hop instead of waiting
+        // half an 80ms buffer and merging distinct transients.
         let estimated_period =
             Duration::from_secs_f32(capture.buffer_frame_size as f32 / sample_rate);
         let mut default_poll = (estimated_period / 2).max(Duration::from_millis(5));
-        if default_poll > Duration::from_millis(40) {
-            default_poll = Duration::from_millis(40);
+        if default_poll > Duration::from_millis(10) {
+            default_poll = Duration::from_millis(10);
         }
         let sample_dt = Duration::from_secs_f32(1.0 / sample_rate);
 
@@ -699,6 +720,8 @@ fn capture_thread(
         // material (measured: IOI IQR 21ms at this hop vs 130ms per-poll).
         let analysis_hop_frames = (audio::FFT_SIZE / 2).max(1);
         let mut last_status_time = Instant::now();
+        let mut last_packet_time = Instant::now();
+        let mut starved = false;
 
         if let Err(e) = capture.start() {
             eprintln!("Audio start failed: {e}");
@@ -756,6 +779,32 @@ fn capture_thread(
                     break;
                 }
             }
+            if frames_read_this_tick == 0 {
+                if last_packet_time.elapsed() >= Duration::from_millis(util::CAPTURE_STALE_MS) {
+                    // WASAPI can return no packets during pause/device changes.
+                    // Never turn the retained PCM window into fresh music.
+                    sound_power.store(0.0);
+                    if !starved {
+                        starved = true;
+                        buf.clear();
+                        frames_since_analysis = 0;
+                        analyzer = SpectralAnalyzer::new(sample_rate);
+                        spectral_shared.store(SpectralData::default());
+                        set_capture_status(
+                            &capture_status,
+                            "audio: waiting for playback — output stopped",
+                        );
+                    }
+                    if last_packet_time.elapsed() >= Duration::from_secs(2) {
+                        set_capture_status(&capture_status, "audio: reconnecting playback source…");
+                        break;
+                    }
+                }
+                continue;
+            }
+            last_packet_time = Instant::now();
+            capture_heartbeat.store(app_now_ms(), Ordering::Relaxed);
+            starved = false;
             total_frames_read += frames_read_this_tick as u64;
 
             let samples = buf.make_contiguous();
@@ -800,7 +849,7 @@ fn capture_thread(
             // NEW: Full spectral analysis via FFT, on the fixed hop cadence
             frames_since_analysis += frames_read_this_tick;
             if frames_since_analysis >= analysis_hop_frames {
-                frames_since_analysis = 0;
+                frames_since_analysis %= analysis_hop_frames;
                 let spectral = analyzer.analyze(samples, channels);
                 spectral_shared.store(spectral);
             }
@@ -863,6 +912,25 @@ fn install_fonts(ctx: &egui::Context) {
 }
 
 impl GuiApp {
+    fn reset_audio_response(&mut self) {
+        self.gate = Gate::new();
+        self.beat_detector = BeatDetector::new();
+        self.envelope.reset();
+        self.gate_is_open = false;
+        self.last_onset_strength = 0.0;
+        self.last_spectral = SpectralData::default();
+        self.smoothed_energy = 0.0;
+        self.raw_energy = 0.0;
+        self.input_level = 0.0;
+        self.vibration_level = 0.0;
+        self.motor2_level = 0.0;
+        self.hold_start_time = None;
+        self.output_delay.clear();
+        self.output_delay_2.clear();
+        self.processed_output.store(0.0);
+        self.processed_output_2.store(0.0);
+    }
+
     fn new(server_addr: Option<String>, ctx: &CreationContext) -> Self {
         install_fonts(&ctx.egui_ctx);
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -882,6 +950,8 @@ impl GuiApp {
         let processed_output_2 = SharedF32::new(0.0);
         let capture_status = Arc::new(Mutex::new(String::from("audio: starting")));
         let capture_status2 = capture_status.clone();
+        let capture_heartbeat = Arc::new(AtomicU64::new(util::NO_CAPTURE_PACKET));
+        let capture_heartbeat2 = capture_heartbeat.clone();
         let pipeline_heartbeat = Arc::new(AtomicU64::new(app_now_ms()));
 
         // Debug diagnostic: log heartbeat age so pipeline stalls (minimize,
@@ -901,9 +971,9 @@ impl GuiApp {
 
         let mut settings = ctx.storage.map(Settings::load).unwrap_or_default();
         settings.sanitize();
-        // Desktop WASAPI is already low-latency; a leftover trim/delay from
-        // older sessions only makes people think they need "timing" knobs.
-        settings.trim_ms = 0.0;
+        // Migrate the old ineffective negative nudge to a real delay-only
+        // control, preserving a user's chosen positive delay across restarts.
+        settings.trim_ms = settings.trim_ms.clamp(0.0, 500.0);
         // Recover from a stored preset name that no longer maps to a real preset:
         // legacy "Default" files, or a preset renamed/removed across versions.
         // An empty name means "custom" (user-edited) and must be left untouched.
@@ -948,6 +1018,7 @@ impl GuiApp {
                     use_polling_rate,
                     use_advanced_capture,
                     capture_status2,
+                    capture_heartbeat2,
                 )
             })
             .expect("failed to spawn audio capture thread");
@@ -982,6 +1053,7 @@ impl GuiApp {
             devices,
             recent_disconnects: HashMap::new(),
             pipeline_heartbeat,
+            capture_heartbeat,
             scan_result: Arc::new(Mutex::new(None)),
             scan_op_in_flight: Arc::new(AtomicBool::new(false)),
             stop_all_error: Arc::new(Mutex::new(None)),
@@ -1004,7 +1076,7 @@ impl GuiApp {
             beat_detector: BeatDetector::new(),
             climax_engine: ClimaxEngine::new(),
             auto_lock: AutoLock::new(),
-            last_spectral_sig: 0,
+            last_spectral_sequence: 0,
             last_onset_strength: 0.0,
             last_spectral: SpectralData::default(),
             gate_is_open: false,
@@ -1017,7 +1089,8 @@ impl GuiApp {
             smoothed_energy: 0.0,
             raw_energy: 0.0,
             using_rms_fallback: false,
-            output_delay: VecDeque::with_capacity(512),
+            output_delay: util::OutputDelay::default(),
+            output_delay_2: util::OutputDelay::default(),
 
             // Preset UI
             selected_preset_category: PresetCategory::Init,
@@ -1085,8 +1158,15 @@ impl eframe::App for GuiApp {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Sync advanced processing flag with capture thread
-        self.use_advanced_shared
-            .store(self.settings.use_advanced_processing, Ordering::Relaxed);
+        let mode_changed = self
+            .use_advanced_shared
+            .swap(self.settings.use_advanced_processing, Ordering::Relaxed)
+            != self.settings.use_advanced_processing;
+        if mode_changed {
+            self.auto_lock.cancel();
+            self.reset_audio_response();
+            self.sound_power.store(0.0);
+        }
 
         // Apply the EFIS / pro-console theme: near-black glass, one cyan data
         // accent, green for engaged, hairline structure, low corner radius and
@@ -1337,6 +1417,9 @@ impl eframe::App for GuiApp {
                             .monospace(),
                     );
                 }
+                if !util::capture_is_fresh(app_now_ms(), self.capture_heartbeat.load(Ordering::Relaxed)) {
+                    ui.colored_label(palette::AMBER, "Waiting for audio · output stopped");
+                }
                 if let Ok(status) = self.capture_status.lock() {
                     ui.label(
                         RichText::new(format!("Audio: {}", *status))
@@ -1375,7 +1458,7 @@ impl eframe::App for GuiApp {
                          Listens ~4–8s, locks band + gate + boom decay\n\
                          for maximum dynamic contrast. Then tweak freely.",
                     );
-                    if self.auto_lock.is_locked() {
+                    if self.auto_lock.can_revert() {
                         if ui.small_button("Revert").clicked() {
                             self.auto_lock.revert(&mut self.settings);
                         }
@@ -1394,7 +1477,7 @@ impl eframe::App for GuiApp {
                 }
 
                 let stop_w = 120.0;
-                ui.add_space(ui.available_width() - stop_w);
+                ui.add_space((ui.available_width() - stop_w).max(0.0));
 
                 let stop_btn = Button::new(
                     RichText::new("Stop all devices").color(Color32::BLACK),
@@ -1440,12 +1523,23 @@ impl eframe::App for GuiApp {
             // ============================================================
             let delta_time = ctx.input(|x| x.stable_dt);
             let main_mul = self.settings.main_volume;
+            let mut undelayed_primary = 0.0;
 
-            if self.settings.use_advanced_processing {
+            let capture_fresh = util::capture_is_fresh(
+                app_now_ms(), self.capture_heartbeat.load(Ordering::Relaxed),
+            );
+            if !capture_fresh {
+                self.reset_audio_response();
+                if self.settings.use_advanced_processing {
+                    self.auto_lock.tick(current_time_ms, &self.last_spectral,
+                        0.0, false, 0.0, false, 0.0, false, &mut self.settings);
+                }
+            } else if self.settings.use_advanced_processing {
                 // ====== NEW PIPELINE (ChloeVibes-derived) ======
 
                 // 1. Read spectral data from capture thread
-                self.last_spectral = self.spectral_data.load();
+                let spectral_frame = self.spectral_data.load_frame();
+                self.last_spectral = spectral_frame.data;
 
                 // 2. Extract energy based on frequency mode
                 let spectral_energy = SpectralAnalyzer::extract_energy(
@@ -1489,15 +1583,8 @@ impl eframe::App for GuiApp {
                 // Fresh-frame guard: UI repaints far faster than capture
                 // (~240fps vs ~90Hz). Re-feeding duplicate flux compresses the
                 // detector's 43-frame window (~6x onset jitter on real music).
-                let spectral_sig = {
-                    let mut sig = self.last_spectral.spectral_flux.to_bits() as u64;
-                    for b in &self.last_spectral.band_energies {
-                        sig = sig.rotate_left(7) ^ b.to_bits() as u64;
-                    }
-                    sig
-                };
-                let fresh_spectral = spectral_sig != self.last_spectral_sig;
-                self.last_spectral_sig = spectral_sig;
+                let fresh_spectral = spectral_frame.sequence != self.last_spectral_sequence;
+                self.last_spectral_sequence = spectral_frame.sequence;
 
                 // 4. Gate FIRST (frozen chain: Spectral → Gate → Beat → …).
                 // Uses raw pre-volume energy so threshold is volume-independent
@@ -1520,20 +1607,25 @@ impl eframe::App for GuiApp {
                     self.last_onset_strength = strength;
                     (onset, strength)
                 } else {
+                    self.beat_detector.advance_time(current_time_ms);
                     (false, self.last_onset_strength)
                 };
 
                 // Predictive onset: tempo-locked pre-trigger so attack lands
                 // on-beat. take_prefire injects strength floor + one-shot latch.
                 // Uses THIS frame's gate (not stale prior-frame).
-                let (is_onset, onset_strength) = if !detected_onset && self.gate_is_open {
+                let real_envelope_onset = detected_onset
+                    && !self.beat_detector.is_prefired_onset(current_time_ms);
+                let (is_onset, onset_strength) = if !detected_onset && self.gate_is_open
+                    && energy > self.settings.gate_threshold * 0.40
+                {
                     if let Some(pre_str) = self.beat_detector.take_prefire(current_time_ms) {
                         (true, pre_str)
                     } else {
                         (false, onset_strength)
                     }
                 } else {
-                    (detected_onset, onset_strength)
+                    (real_envelope_onset, onset_strength)
                 };
 
                 // Single onset threshold 1.05 (matches envelope drive; kills
@@ -1572,6 +1664,10 @@ impl eframe::App for GuiApp {
                     self.settings.release_curve,
                     self.last_spectral.spectral_centroid,
                 );
+
+                if !detected_onset && onset_ok && self.envelope.triggered_at(current_time_ms) {
+                    self.beat_detector.confirm_prefire(current_time_ms);
+                }
 
                 // 7. Optional climax modulation layer
                 let shaped_output = self.climax_engine.process(
@@ -1617,40 +1713,14 @@ impl eframe::App for GuiApp {
                     self.settings.output_gain,
                     silence_class_pre,
                 );
+                undelayed_primary = final_intensity;
 
-                // Apply timing trim (delay/advance) via small ring buffer
-                let dt = delta_time.max(0.0001);
-                let trim_ms = self.settings.trim_ms.clamp(-500.0, 500.0);
-                let trim_frames =
-                    ((trim_ms.abs() / (dt * 1000.0)).round() as usize).min(400);
-                self.output_delay.push_back(final_intensity);
-                if self.output_delay.len() > 1024 {
-                    self.output_delay.pop_front();
-                }
-                let trimmed_intensity = if trim_ms >= 1.0 {
-                    if self.output_delay.len() > trim_frames {
-                        let idx = self.output_delay.len() - 1 - trim_frames;
-                        self.output_delay.get(idx).copied().unwrap_or(final_intensity)
-                    } else {
-                        final_intensity
-                    }
-                } else if trim_ms <= -1.0 {
-                    // Advance: drop some history to reduce latency
-                    for _ in 0..trim_frames.min(self.output_delay.len()) {
-                        self.output_delay.pop_front();
-                    }
-                    final_intensity
-                } else {
-                    final_intensity
-                };
-
-                // Silence-class events (envelope micro-pauses) and true rest
-                // targets hard-snap past the slew so the motor actually stops.
-                // Large upward jumps take a snappier rise so kick punch is not
-                // eaten by the 0.35× rise ratio on every frame.
-                let silence_class = self.envelope.silence_event
-                    || self.climax_engine.silence_event
-                    || trimmed_intensity <= 0.001;
+                // Delay the complete shaped phrase in elapsed time, including
+                // its rests, instead of converting milliseconds into repaint counts.
+                let trimmed_intensity = self.output_delay.push(
+                    f64::from(current_time_ms), final_intensity, self.settings.trim_ms,
+                );
+                let silence_class = trimmed_intensity <= 0.001;
                 if silence_class {
                     self.vibration_level = 0.0;
                 } else {
@@ -1714,10 +1784,11 @@ impl eframe::App for GuiApp {
                     current_time_ms,
                     &self.last_spectral,
                     raw_energy_for_gate,
-                    onset_ok,
+                    detected_onset,
                     envelope_output,
                     using_rms_fallback,
                     self.beat_detector.tempo_confidence,
+                    fresh_spectral,
                     &mut self.settings,
                 );
             } else {
@@ -1783,9 +1854,16 @@ impl eframe::App for GuiApp {
                     persistent_level = persistent_level.max(0.0);
                 }
                 self.vibration_level = persistent_level.clamp(0.0, 1.0);
+                undelayed_primary = self.vibration_level;
             }
 
             // Store processed output for device tasks
+            let final_ceiling = if self.settings.use_advanced_processing {
+                self.settings.max_vibe
+            } else {
+                1.0
+            };
+            self.vibration_level = util::limit_output(self.vibration_level, final_ceiling);
             self.processed_output.store(self.vibration_level);
 
             // Secondary motor (motor 2):
@@ -1796,7 +1874,7 @@ impl eframe::App for GuiApp {
             let is_silent = self.raw_energy < 0.005
                 && !self.gate_is_open
                 && self.envelope.state == audio::EnvelopeState::Idle;
-            let m2_silence = is_silent
+            let m2_silence = !capture_fresh || is_silent
                 || self.envelope.silence_event
                 || self.climax_engine.silence_event;
             let motor2_target = if m2_silence {
@@ -1817,12 +1895,14 @@ impl eframe::App for GuiApp {
                 let total = low_e + high_e;
                 let treble_frac = if total > 1e-9 { high_e / total } else { 0.0 };
                 let treble_weight = (treble_frac * 3.0).clamp(0.0, 1.0);
-                (self.vibration_level * treble_weight).clamp(0.0, 1.0)
+                (undelayed_primary * treble_weight).clamp(0.0, 1.0)
             };
-            if motor2_target <= 0.001
-                || self.envelope.silence_event
-                || self.climax_engine.silence_event
-            {
+            let motor2_target = if capture_fresh {
+                self.output_delay_2.push(f64::from(current_time_ms), motor2_target, self.settings.trim_ms)
+            } else {
+                0.0
+            };
+            if motor2_target <= 0.001 {
                 self.motor2_level = 0.0;
             } else {
                 let jump_up = motor2_target - self.motor2_level;
@@ -1842,7 +1922,7 @@ impl eframe::App for GuiApp {
                     self.motor2_level = 0.0;
                 }
             }
-            self.motor2_level = self.motor2_level.clamp(0.0, 1.0);
+            self.motor2_level = util::limit_output(self.motor2_level, final_ceiling);
             self.processed_output_2.store(self.motor2_level);
 
             // Push to visualization history
@@ -2191,7 +2271,10 @@ impl eframe::App for GuiApp {
                                 .corner_radius(CornerRadius::same(4));
                             let response = ui.add(btn);
                             if response.clicked() {
+                                self.auto_lock.cancel();
                                 self.settings.apply_preset(preset);
+                                self.reset_audio_response();
+                                self.climax_engine.reset(current_time_ms);
                             }
                             response.on_hover_text(preset.description);
                         }
@@ -2213,7 +2296,7 @@ impl eframe::App for GuiApp {
                         self.settings.use_advanced_processing = true;
                         self.settings.climax_mode_enabled = false;
                         self.auto_lock.cancel();
-                        self.envelope.reset();
+                        self.reset_audio_response();
                         self.climax_engine.reset(current_time_ms);
                     }
                     if ui.button("Deep 90").clicked() {
@@ -2222,7 +2305,7 @@ impl eframe::App for GuiApp {
                             ChloeRhythmProfile::Loose,
                         );
                         self.auto_lock.cancel();
-                        self.envelope.reset();
+                        self.reset_audio_response();
                         self.climax_engine.reset(current_time_ms);
                     }
                     if ui.button("Club 125").clicked() {
@@ -2231,7 +2314,7 @@ impl eframe::App for GuiApp {
                             ChloeRhythmProfile::Medium,
                         );
                         self.auto_lock.cancel();
-                        self.envelope.reset();
+                        self.reset_audio_response();
                         self.climax_engine.reset(current_time_ms);
                     }
                     if ui.button("Hard 140").clicked() {
@@ -2240,7 +2323,7 @@ impl eframe::App for GuiApp {
                             ChloeRhythmProfile::Ultimate,
                         );
                         self.auto_lock.cancel();
-                        self.envelope.reset();
+                        self.reset_audio_response();
                         self.climax_engine.reset(current_time_ms);
                     }
                 });
@@ -2280,6 +2363,8 @@ impl eframe::App for GuiApp {
                     );
                 });
 
+                ui.collapsing("Shape the response · full ADSR & tuning", |ui| {
+                ui.label("Choose a preset or use FIND BOOM to start. Tune any part of the response here.");
                 ui.horizontal(|ui| {
                     section_label(ui, "FREQ", palette::TEXT_DIM);
                     ComboBox::from_id_salt("freq_mode")
@@ -2495,7 +2580,7 @@ impl eframe::App for GuiApp {
                 // ==========================================================
                 // Plain string header — RichText headers have glitched collapse
                 // state recovery on some egui versions.
-                ui.collapsing("OVERRIDE (expert — leave closed)", |ui| {
+                ui.collapsing("Trigger, curves & timing", |ui| {
                         ui.label(
                             RichText::new(
                                 "FIND BOOM / presets already set these. Only open if you need to hand-tune.",
@@ -2681,14 +2766,14 @@ impl eframe::App for GuiApp {
                             let trim = ui.add(
                                 Slider::new(
                                     &mut self.settings.trim_ms,
-                                    -250.0..=250.0,
+                                    0.0..=500.0,
                                 )
                                 .suffix("ms")
-                                .text("Sync nudge"),
+                                .text("Output delay"),
                             );
                             let trim = trim.on_hover_text(
-                                "Not needed on desktop (already low latency).\n\
-                                 Only if haptics feel early/late vs the music.",
+                                "Delays both motor channels when haptics arrive before the audio.\n\
+                                 Zero adds no delay. Beat prediction handles anticipation separately.",
                             );
                             if trim.changed() {
                                 mark_custom(&mut self.settings);
@@ -2698,7 +2783,7 @@ impl eframe::App for GuiApp {
                             }
                             if ui
                                 .button("Reset sync")
-                                .on_hover_text("Force sync nudge to 0 (desktop default)")
+                                .on_hover_text("Remove added output delay")
                                 .clicked()
                             {
                                 self.settings.trim_ms = 0.0;
@@ -2929,6 +3014,8 @@ impl eframe::App for GuiApp {
                 ui.add_space(2.0);
 
                 // ==========================================================
+                });
+
                 // OUTPUT RANGE - Final output floor and ceiling
                 // ==========================================================
                 ui.horizontal(|ui| {
@@ -3143,21 +3230,10 @@ impl eframe::App for GuiApp {
                             let processed = self.processed_output.clone();
                             let processed2 = self.processed_output_2.clone();
                             let heartbeat = self.pipeline_heartbeat.clone();
+                            let capture_heartbeat = self.capture_heartbeat.clone();
                             async move {
-                                // Rate limiter state (from Gemini/ChloeVibes approach)
-                                let mut last_sent: f64 = -1.0;
-                                let mut last_sent_m2: f64 = -1.0;
-                                // 0.5% dead-band: the Domi 2 has decent granularity.
-                                // Finer resolution captures subtle dynamics that
-                                // make the difference between "buzzing" and "alive".
-                                let resolution: f64 = 0.005;
+                                let mut dispatch = DeviceDispatchState::default();
                                 let mut consecutive_errors: u32 = 0;
-                                // Enable-state signature: a toggle must force
-                                // a send even when the computed level is
-                                // steady, otherwise disabling a device (or
-                                // the stop-all fallback flipping is_enabled)
-                                // sends nothing and the motor keeps running.
-                                let mut last_enable_sig: u64 = u64::MAX;
 
                                 loop {
                                     // Dead-man watchdog: if the pipeline stops
@@ -3167,8 +3243,10 @@ impl eframe::App for GuiApp {
                                     // heartbeat resumes.
                                     let heartbeat_age = app_now_ms()
                                         .saturating_sub(heartbeat.load(Ordering::Relaxed));
-                                    if heartbeat_age > WATCHDOG_TIMEOUT_MS {
-                                        if last_sent > 0.0 || last_sent_m2 > 0.0 {
+                                    if heartbeat_age > WATCHDOG_TIMEOUT_MS
+                                        || !util::capture_is_fresh(app_now_ms(), capture_heartbeat.load(Ordering::Relaxed))
+                                    {
+                                        if dispatch.needs_stop() {
                                             eprintln!(
                                                 "Pipeline heartbeat stale ({heartbeat_age}ms); stopping device"
                                             );
@@ -3176,13 +3254,12 @@ impl eframe::App for GuiApp {
                                             // a failed stop must be retried
                                             // on the next 250ms pass, not
                                             // forgotten while the motor runs.
-                                            match bp_device.stop().await {
-                                                Ok(_) => {
-                                                    last_sent = 0.0;
-                                                    last_sent_m2 = 0.0;
+                                            match tokio::time::timeout(Duration::from_millis(500), bp_device.stop()).await {
+                                                Ok(Ok(_)) => {
+                                                    dispatch.confirm_stop();
                                                 }
-                                                Err(e) => eprintln!(
-                                                    "Watchdog stop failed (will retry): {e}"
+                                                result => eprintln!(
+                                                    "Watchdog stop failed (will retry): {result:?}"
                                                 ),
                                             }
                                         }
@@ -3193,164 +3270,54 @@ impl eframe::App for GuiApp {
                                     let now = tokio::time::Instant::now();
                                     let vibration_level = processed.load();
                                     let vibration_level_2 = processed2.load();
-                                    let mut should_send = false;
-                                    let mut vibrate_cmd = None;
-                                    let mut oscillate_cmd = None;
-                                    {
+                                    // Compare the final per-actuator values, so changing
+                                    // a motor's multiplier or limit takes effect even
+                                    // during a steady note. Zero is never dead-banded.
+                                    let requested_output = {
                                         let guard = props.lock().unwrap_or_else(|e| e.into_inner());
-                                        // A disabled device drives zero, so a
-                                        // toggle at a steady level registers
-                                        // as a change (and a hard stop).
-                                        // Quantize near-rest to exact 0 so the
-                                        // device actually stops (no 1% hang).
-                                        // Slightly above one Domi step (1/20)
-                                        // after motor shaping so residual softs
-                                        // cannot re-arm a level-1 hum.
-                                        let near_rest = 0.008_f32;
-                                        let speed = if guard.is_enabled {
-                                            let s = guard.calculate_output(vibration_level);
-                                            if s < near_rest {
-                                                0.0
-                                            } else {
-                                                s
-                                            }
-                                        } else {
-                                            0.0
-                                        };
-                                        let speed_f64 = speed as f64;
-
-                                        // === RATE LIMITER ===
-                                        // Only send if:
-                                        //   a) intensity changed by more than 0.5%, OR
-                                        //   b) this is a hard stop (going to zero), OR
-                                        //   c) any enable toggle changed
-                                        let speed2 = if guard.is_enabled {
-                                            let s = guard.calculate_output(vibration_level_2);
-                                            if s < near_rest {
-                                                0.0
-                                            } else {
-                                                s
-                                            }
-                                        } else {
-                                            0.0
-                                        };
-                                        let speed2_f64 = speed2 as f64;
-                                        let change = (speed_f64 - last_sent).abs();
-                                        let change_m2 = (speed2_f64 - last_sent_m2).abs();
-                                        let is_hard_stop = speed_f64 < 0.008
-                                            && last_sent >= 0.008;
-                                        let mut enable_sig: u64 = guard.is_enabled as u64;
-                                        for v in &guard.vibrators {
-                                            enable_sig = (enable_sig << 1) | v.is_enabled as u64;
-                                        }
-                                        for o in &guard.oscillators {
-                                            enable_sig = (enable_sig << 1) | o.is_enabled as u64;
-                                        }
-
-                                        if change >= resolution
-                                            || change_m2 >= resolution
-                                            || is_hard_stop
-                                            || enable_sig != last_enable_sig
-                                        {
-                                            should_send = true;
-                                            last_sent = speed_f64;
-                                            last_sent_m2 = speed2_f64;
-                                            last_enable_sig = enable_sig;
-                                        }
-
-                                        if should_send {
-                                            if !guard.vibrators.is_empty() {
-                                                vibrate_cmd = Some(
-                                                    ScalarValueCommand::ScalarValueVec(
-                                                        guard
-                                                            .vibrators
-                                                            .iter()
-                                                            .enumerate()
-                                                            .map(|(idx, v)| {
-                                                                if v.is_enabled
-                                                                    && guard
-                                                                        .is_enabled
-                                                                {
-                                                                    // Motor 0 = primary signal.
-                                                                    // Motors 1+ = secondary motor
-                                                                    // signal from ClimaxEngine
-                                                                    // dual-motor phasing.
-                                                                    let src = if idx == 0 {
-                                                                        speed
-                                                                    } else {
-                                                                        guard.calculate_output(
-                                                                            vibration_level_2,
-                                                                        )
-                                                                    };
-                                                                    (src
-                                                                        * v.multiplier)
-                                                                        .clamp(
-                                                                            0.0,
-                                                                            v.max,
-                                                                        )
-                                                                        .min_cutoff(
-                                                                            v.min,
-                                                                        )
-                                                                        as f64
-                                                                } else {
-                                                                    0.0
-                                                                }
-                                                            })
-                                                            .collect(),
-                                                    ),
-                                                );
-                                            }
-                                            if !guard.oscillators.is_empty() {
-                                                oscillate_cmd = Some(
-                                                    ScalarValueCommand::ScalarValueVec(
-                                                        guard
-                                                            .oscillators
-                                                            .iter()
-                                                            .map(|o| {
-                                                                if o.is_enabled
-                                                                    && guard
-                                                                        .is_enabled
-                                                                {
-                                                                    (speed
-                                                                        * o.multiplier)
-                                                                        .clamp(
-                                                                            0.0,
-                                                                            o.max,
-                                                                        )
-                                                                        .min_cutoff(
-                                                                            o.min,
-                                                                        )
-                                                                        as f64
-                                                                } else {
-                                                                    0.0
-                                                                }
-                                                            })
-                                                            .collect(),
-                                                    ),
-                                                );
-                                            }
+                                        let levels = [vibration_level, vibration_level_2].map(|input| {
+                                            let level = if guard.is_enabled {
+                                                guard.calculate_output(input)
+                                            } else { 0.0 };
+                                            if level < 0.008 { 0.0 } else { level }
+                                        });
+                                        DeviceOutput {
+                                            vibrators: guard.vibrators.iter().enumerate().map(|(index, v)| {
+                                                actuator_output(levels[usize::from(index > 0)],
+                                                    v.multiplier, v.min, v.max.min(guard.max),
+                                                    guard.is_enabled && v.is_enabled)
+                                            }).collect(),
+                                            oscillators: guard.oscillators.iter().map(|o| {
+                                                actuator_output(levels[0], o.multiplier, o.min,
+                                                    o.max.min(guard.max), guard.is_enabled && o.is_enabled)
+                                            }).collect(),
                                         }
                                     };
+                                    let should_send = dispatch.should_send(&requested_output);
+                                    let vibrate_cmd = (!requested_output.vibrators.is_empty()).then(||
+                                        ScalarValueCommand::ScalarValueVec(requested_output.vibrators.clone()));
+                                    let oscillate_cmd = (!requested_output.oscillators.is_empty()).then(||
+                                        ScalarValueCommand::ScalarValueVec(requested_output.oscillators.clone()));
 
                                     // Only hit the BT stack when we have something new
                                     if should_send {
                                         let mut had_error = false;
                                         if let Some(cmd) = vibrate_cmd {
-                                            if let Err(e) =
-                                                bp_device.vibrate(&cmd).await
-                                            {
+                                            if !matches!(tokio::time::timeout(
+                                                Duration::from_millis(500), bp_device.vibrate(&cmd),
+                                            ).await, Ok(Ok(_))) {
                                                 eprintln!(
-                                                    "Vibrate error: {e}"
+                                                    "Vibrate command failed or timed out; retrying latest output"
                                                 );
                                                 had_error = true;
                                             }
                                         }
                                         if let Some(cmd) = oscillate_cmd {
-                                            if let Err(e) =
-                                                bp_device.oscillate(&cmd).await
-                                            {
+                                            if !matches!(tokio::time::timeout(
+                                                Duration::from_millis(500), bp_device.oscillate(&cmd),
+                                            ).await, Ok(Ok(_))) {
                                                 eprintln!(
-                                                    "Oscillate error: {e}"
+                                                    "Oscillate command failed or timed out; retrying latest output"
                                                 );
                                                 had_error = true;
                                             }
@@ -3371,6 +3338,10 @@ impl eframe::App for GuiApp {
                                         } else {
                                             consecutive_errors = 0;
                                         }
+                                        // A failed command is not an acknowledgment. Retry
+                                        // the current desired output on the next rate-limited
+                                        // pass, including unchanged zero/disable commands.
+                                        dispatch.complete(&requested_output, !had_error);
                                     }
 
                                     // 20ms = 50Hz max update rate.
@@ -4185,7 +4156,7 @@ fn device_widget(
                     }
                 });
                 if !props.vibrators.is_empty() {
-                    ui.push_id(format!("vibrators_{}", device.name()), |ui| {
+                    ui.push_id(("vibrators", device.index()), |ui| {
                         ui.collapsing("Vibrators", |ui| {
                             ui.group(|ui| {
                                 for (i, vibe) in props.vibrators.iter_mut().enumerate() {
@@ -4196,7 +4167,7 @@ fn device_widget(
                     });
                 }
                 if !props.oscillators.is_empty() {
-                    ui.push_id(format!("oscillators_{}", device.name()), |ui| {
+                    ui.push_id(("oscillators", device.index()), |ui| {
                         ui.collapsing("Oscillators", |ui| {
                             ui.group(|ui| {
                                 for (i, osc) in props.oscillators.iter_mut().enumerate() {

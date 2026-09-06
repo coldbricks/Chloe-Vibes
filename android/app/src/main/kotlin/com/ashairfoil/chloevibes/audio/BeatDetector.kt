@@ -61,13 +61,22 @@ class BeatDetector {
     @Volatile var predictedNextOnsetMs: Float = 0f
         private set
 
+    private var tempoConfidenceAtOnset: Float = 0f
+    private var pendingPrefire: Pair<Float, Float>? = null
+    private var playedPrefireMs: Float? = null
+    private var matchedPrefireOnsetMs: Float? = null
+
     /**
      * Process spectral flux and detect onsets.
      * @return Pair of (isOnset, onsetStrength)
      */
     fun process(spectralFlux: Float, currentTimeMs: Float): Pair<Boolean, Float> {
+        if (!currentTimeMs.isFinite()) return false to 0f
+        advanceTime(currentTimeMs)
+        // A corrupt capture frame must not poison the rolling statistics.
+        val flux = if (spectralFlux.isFinite()) spectralFlux.coerceAtLeast(0f) else 0f
         // Update history
-        fluxHistory[historyIndex] = spectralFlux
+        fluxHistory[historyIndex] = flux
         historyIndex = (historyIndex + 1) % fluxHistory.size
 
         // Calculate local statistics
@@ -84,17 +93,21 @@ class BeatDetector {
         val threshold = mean + adaptiveThreshold * stdDev
 
         // Detect onset
-        val isOnset = spectralFlux > threshold &&
+        val isOnset = flux > threshold &&
                 (currentTimeMs - lastOnsetTimeMs) > cooldownMs
 
         if (isOnset) {
+            matchedPrefireOnsetMs = playedPrefireMs?.let { expected ->
+                if (kotlin.math.abs(currentTimeMs - expected) <= PREFIRE_LEAD_MS) currentTimeMs else null
+            }
+            if (matchedPrefireOnsetMs != null) playedPrefireMs = null
             lastOnsetTimeMs = currentTimeMs
             // Moderate growth after onset (prevents rapid double-triggering)
             adaptiveThreshold = (adaptiveThreshold * 1.06f).coerceAtMost(1.8f)
 
             // Track onset velocity -- how much the flux exceeded threshold
             // gives us a "how hard was this hit" metric for envelope velocity
-            val rawStrength = if (threshold > 0f) spectralFlux / threshold else 0f
+            val rawStrength = if (threshold > 0f) flux / threshold else 0f
             recentOnsetStrength = recentOnsetStrength * 0.3f + rawStrength * 0.7f
 
             // Record timestamp for tempo tracking
@@ -114,7 +127,7 @@ class BeatDetector {
             decayTempoConfidence(currentTimeMs)
         }
 
-        val strength = if (threshold > 0f) spectralFlux / threshold else 0f
+        val strength = if (threshold > 0f) flux / threshold else 0f
 
         return Pair(isOnset, strength)
     }
@@ -127,11 +140,12 @@ class BeatDetector {
      * Requires a fresh tempo lock and a recent real onset (recency guard).
      */
     fun prefireOk(currentTimeMs: Float): Boolean {
+        if (!currentTimeMs.isFinite()) return false
         if (tempoConfidence <= 0.6f || tempoIntervalMs <= 0f) return false
         if (predictedNextOnsetMs <= 0f) return false
         // Recency: last real onset within ~1.75 beats (tightened from 2.0).
         val sinceOnset = currentTimeMs - lastOnsetTimeMs
-        if (sinceOnset > tempoIntervalMs * 1.75f) return false
+        if (sinceOnset < 0f || sinceOnset > tempoIntervalMs * 1.75f) return false
         val timeTo = predictedNextOnsetMs - currentTimeMs
         return timeTo in 0f..PREFIRE_LEAD_MS
     }
@@ -143,8 +157,27 @@ class BeatDetector {
      */
     fun takePrefire(currentTimeMs: Float): Float? {
         if (!prefireOk(currentTimeMs)) return null
+        pendingPrefire = currentTimeMs to predictedNextOnsetMs
         predictedNextOnsetMs += tempoIntervalMs.coerceAtLeast(1f)
         return recentOnsetStrength.coerceAtLeast(1.15f).coerceAtMost(1.35f)
+    }
+
+    /** Confirm only after the host's envelope accepted the synthetic trigger. */
+    fun confirmPrefire(currentTimeMs: Float) {
+        val pending = pendingPrefire ?: return
+        if (pending.first == currentTimeMs) {
+            playedPrefireMs = pending.second
+            pendingPrefire = null
+        }
+    }
+
+    /** Real onsets still train tempo; their envelope attack is already played. */
+    fun isPrefiredOnset(currentTimeMs: Float): Boolean =
+        matchedPrefireOnsetMs == currentTimeMs
+
+    /** Advance prediction age without adding a duplicate captured spectrum. */
+    fun advanceTime(currentTimeMs: Float) {
+        if (currentTimeMs.isFinite()) decayTempoConfidence(currentTimeMs)
     }
 
     /** Clear tempo lock and onset history so a dead lock cannot resurrect. */
@@ -155,23 +188,34 @@ class BeatDetector {
         onsetTsCount = 0
         onsetTsIndex = 0
         onsetTimestamps.fill(0f)
+        tempoConfidenceAtOnset = 0f
+        pendingPrefire = null
+        playedPrefireMs = null
+        matchedPrefireOnsetMs = null
     }
 
     private fun decayTempoConfidence(currentTimeMs: Float) {
         if (tempoConfidence <= 0f || tempoIntervalMs <= 0f) return
         val since = currentTimeMs - lastOnsetTimeMs
+        if (since >= tempoIntervalMs * 3f) {
+            clearTempoLock()
+            return
+        }
         val grace = tempoIntervalMs * 1.5f
         if (since <= grace) {
             if (tempoConfidence > 0.5f) {
                 val intervalsElapsed = (since / tempoIntervalMs).toInt()
+                // takePrefire already advances past the consumed beat. A quiet
+                // process frame must not rewind it to that same beat again.
                 predictedNextOnsetMs =
-                    lastOnsetTimeMs + (intervalsElapsed + 1) * tempoIntervalMs
+                    maxOf(predictedNextOnsetMs,
+                        lastOnsetTimeMs + (intervalsElapsed + 1) * tempoIntervalMs)
             }
             return
         }
         val staleBeats = (since - grace) / tempoIntervalMs.coerceAtLeast(1f)
         // Slightly faster bleed than 0.55 — stale locks die before the next track.
-        tempoConfidence = (tempoConfidence * 0.50f.pow(staleBeats)).coerceAtLeast(0f)
+        tempoConfidence = (tempoConfidenceAtOnset * 0.50f.pow(staleBeats)).coerceAtLeast(0f)
         if (tempoConfidence < 0.5f) {
             predictedNextOnsetMs = 0f
             if (tempoConfidence < 0.05f) {
@@ -180,7 +224,8 @@ class BeatDetector {
         } else {
             val intervalsElapsed = (since / tempoIntervalMs).toInt()
             predictedNextOnsetMs =
-                lastOnsetTimeMs + (intervalsElapsed + 1) * tempoIntervalMs
+                maxOf(predictedNextOnsetMs,
+                    lastOnsetTimeMs + (intervalsElapsed + 1) * tempoIntervalMs)
         }
     }
 
@@ -219,6 +264,7 @@ class BeatDetector {
         // Confidence: low coefficient of variation = high confidence
         val cv = if (mean > 0f) stdDev / mean else 1f
         tempoConfidence = (1f - cv * 4f).coerceIn(0f, 1f)
+        tempoConfidenceAtOnset = tempoConfidence
         tempoIntervalMs = mean
 
         if (tempoConfidence > 0.5f) {

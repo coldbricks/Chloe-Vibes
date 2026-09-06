@@ -3,6 +3,7 @@
 
 mod audio;
 mod auto_lock;
+mod device_dispatch;
 mod gui;
 mod presets;
 mod settings;

@@ -37,7 +37,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.BluetoothDisabled
-import androidx.compose.material.icons.filled.BluetoothSearching
+import androidx.compose.material.icons.automirrored.filled.BluetoothSearching
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.AlertDialog
@@ -63,6 +63,7 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -83,6 +84,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.ashairfoil.chloevibes.audio.BAND_NAMES
+import com.ashairfoil.chloevibes.audio.AudioSourceMode
 import com.ashairfoil.chloevibes.audio.ClimaxPattern
 import com.ashairfoil.chloevibes.audio.EnvelopeState
 import com.ashairfoil.chloevibes.audio.FrequencyMode
@@ -138,6 +140,7 @@ class MainScreenState {
     var minVibe by mutableFloatStateOf(0f)
     var maxVibe by mutableFloatStateOf(1f)
     var outputGain by mutableFloatStateOf(1f)
+    var outputSlewMs by mutableFloatStateOf(42f)
 
     // Climax
     var climaxEnabled by mutableStateOf(false)
@@ -162,6 +165,8 @@ class MainScreenState {
     var connectedDeviceName by mutableStateOf<String?>(null)
     var batteryLevel by mutableIntStateOf(-1)
     var isCapturing by mutableStateOf(false)
+    var audioSource by mutableStateOf(AudioSourceMode.SystemAudio)
+    var hasRecentAudio by mutableStateOf(false)
 
     // Safety (audio-path dead-man + emergency stop)
     var watchdogTripped by mutableStateOf(false)
@@ -170,6 +175,7 @@ class MainScreenState {
     fun applyPreset(preset: Preset) {
         selectedPresetName = preset.name
         mainVolume = preset.mainVolume
+        outputSlewMs = preset.outputSlewMs
         frequencyMode = preset.frequencyMode
         targetFrequency = preset.targetFrequency
         gateThreshold = preset.gateThreshold
@@ -221,7 +227,7 @@ fun MainScreen(
 ) {
     val scrollState = rememberScrollState()
     var showClimaxOffConfirm by remember { mutableStateOf(false) }
-    var expertOpen by remember { mutableStateOf(false) }
+    var expertOpen by rememberSaveable { mutableStateOf(false) }
     var climaxFineOpen by remember { mutableStateOf(false) }
 
     fun setClimaxEnabled(enabled: Boolean) {
@@ -287,6 +293,30 @@ fun MainScreen(
             Spacer(modifier = Modifier.height(12.dp))
 
             // Controls row: Start/Stop, Scan, Connect
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(
+                    selected = state.audioSource == AudioSourceMode.SystemAudio,
+                    onClick = { state.audioSource = AudioSourceMode.SystemAudio },
+                    enabled = !state.isCapturing,
+                    label = { Text("System audio") }
+                )
+                FilterChip(
+                    selected = state.audioSource == AudioSourceMode.Microphone,
+                    onClick = { state.audioSource = AudioSourceMode.Microphone },
+                    enabled = !state.isCapturing,
+                    label = { Text("Microphone") }
+                )
+            }
+            Text(
+                when {
+                    state.isCapturing && !state.hasRecentAudio -> "Waiting for audio; output is resting"
+                    state.audioSource == AudioSourceMode.Microphone -> "Microphone hears audio around your phone"
+                    else -> "System audio follows supported playback on your phone"
+                },
+                fontSize = 12.sp,
+                color = ChloeColors.OnSurfaceDim
+            )
+            Spacer(modifier = Modifier.height(8.dp))
             ControlsRow(
                 isCapturing = state.isCapturing,
                 connectionState = state.connectionState,
@@ -349,7 +379,19 @@ fun MainScreen(
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            // CLIMAX — primary path; fine knobs collapsed
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(selected = !expertOpen, onClick = { expertOpen = false }, label = { Text("Simple") })
+                FilterChip(selected = expertOpen, onClick = { expertOpen = true }, label = { Text("Full controls") })
+            }
+            Text(
+                if (expertOpen) "Shape every stage: frequency, gate, trigger, ADSR curves and output."
+                else "Choose a preset and intensity. Custom settings stay active when controls are hidden.",
+                fontSize = 12.sp,
+                color = ChloeColors.OnSurfaceDim
+            )
+            Spacer(modifier = Modifier.height(12.dp))
+
+            // Climax arming remains accessible in either view.
             SectionHeader("CLIMAX")
             ClimaxArmRow(
                 enabled = state.climaxEnabled,
@@ -359,7 +401,7 @@ fun MainScreen(
                 onReset = onClimaxReset
             )
 
-            if (state.climaxEnabled) {
+            if (state.climaxEnabled && expertOpen) {
                 Spacer(modifier = Modifier.height(8.dp))
                 ClimaxPatternSelector(state.climaxPattern) {
                     state.climaxPattern = it; onParameterChanged()
@@ -415,19 +457,6 @@ fun MainScreen(
             }
 
             Spacer(modifier = Modifier.height(12.dp))
-
-            // Expert path collapsed by default — less clutter mid-session
-            Text(
-                if (expertOpen) "Hide expert knobs ▴" else "Expert knobs (gate / ADSR / gain) ▾",
-                color = ChloeColors.OnSurfaceDim,
-                fontSize = 12.sp,
-                fontWeight = FontWeight.SemiBold,
-                letterSpacing = 0.5.sp,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clickable { expertOpen = !expertOpen }
-                    .padding(vertical = 10.dp)
-            )
 
             if (expertOpen) {
                 // INPUT section
@@ -493,13 +522,13 @@ fun MainScreen(
                 // ENVELOPE section (color-coded ADSR)
                 SectionHeader("ENVELOPE")
                 LabeledSlider(
-                    "Attack", state.attackMs, 0.5f, 500f, "%.0f ms", ChloeColors.Attack,
+                    "Attack", state.attackMs, 0.5f, 5000f, "%.0f ms", ChloeColors.Attack,
                     logarithmic = true
                 ) {
                     state.attackMs = it; state.selectedPresetName = "Custom"; onParameterChanged()
                 }
                 LabeledSlider(
-                    "Decay", state.decayMs, 1f, 1000f, "%.0f ms", ChloeColors.Decay,
+                    "Decay", state.decayMs, 0.5f, 5000f, "%.0f ms", ChloeColors.Decay,
                     logarithmic = true
                 ) {
                     state.decayMs = it; state.selectedPresetName = "Custom"; onParameterChanged()
@@ -508,7 +537,7 @@ fun MainScreen(
                     state.sustainLevel = it; state.selectedPresetName = "Custom"; onParameterChanged()
                 }
                 LabeledSlider(
-                    "Release", state.releaseMs, 1f, 2000f, "%.0f ms", ChloeColors.Release,
+                    "Release", state.releaseMs, 0.5f, 5000f, "%.0f ms", ChloeColors.Release,
                     logarithmic = true
                 ) {
                     state.releaseMs = it; state.selectedPresetName = "Custom"; onParameterChanged()
@@ -542,6 +571,9 @@ fun MainScreen(
 
                 // OUTPUT section (gain + floor; ceiling lives in INTENSITY)
                 SectionHeader("OUTPUT")
+                LabeledSlider("Output smoothing", state.outputSlewMs, 0f, 250f, "%.0f ms") {
+                    state.outputSlewMs = it; state.selectedPresetName = "Custom"; onParameterChanged()
+                }
                 LabeledSlider("Gain", state.outputGain, 0f, 20f, "%.1f", ChloeColors.Pink, taper = 3f) {
                     state.outputGain = it; state.selectedPresetName = "Custom"; onParameterChanged()
                 }
@@ -1097,7 +1129,7 @@ private fun ControlsRow(
                     .weight(1f)
                     .heightIn(min = 52.dp)
             ) {
-                Icon(Icons.Default.BluetoothSearching, contentDescription = null, modifier = Modifier.size(20.dp))
+                Icon(Icons.AutoMirrored.Filled.BluetoothSearching, contentDescription = null, modifier = Modifier.size(20.dp))
                 Spacer(modifier = Modifier.width(6.dp))
                 Text("Scan", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
             }

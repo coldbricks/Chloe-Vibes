@@ -5,7 +5,7 @@
 // existing build exactly. This file exists so that `tests/parity.rs`
 // can `use chloe_vibes::audio::*` without coupling to binary internals.
 //
-// Only the signal-processing module is exposed; GUI, settings and
+// Signal processing and pure device dispatch state are exposed; GUI, settings and
 // presets are intentionally left private since they aren't needed for
 // cross-platform parity testing.
 //
@@ -24,3 +24,4 @@
 )]
 
 pub mod audio;
+pub mod device_dispatch;

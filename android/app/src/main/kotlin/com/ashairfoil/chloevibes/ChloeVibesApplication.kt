@@ -92,7 +92,9 @@ class ChloeVibesApplication : Application() {
         // Fail-closed: persistent processing errors must zero motors.
         audioCaptureManager.onPipelineFailClosed = {
             mainHandler.post {
-                handleAudioDeadmanTrip("Processing loop fail-closed; motors stopped")
+                if (!audioCaptureManager.isRunning) {
+                    handleAudioDeadmanTrip("Audio capture stopped; zero output requested")
+                }
             }
         }
     }
@@ -115,7 +117,7 @@ class ChloeVibesApplication : Application() {
         }
     }
 
-    fun startAudioCapture(): Boolean {
+    fun startAudioCapture(mode: AudioSourceMode = AudioSourceMode.SystemAudio): Boolean {
         synchronized(outputLock) {
             if (outputOwner == OutputOwner.Companion) return false
             // Claim the route before starting the producer so the first frame
@@ -123,8 +125,7 @@ class ChloeVibesApplication : Application() {
             outputOwner = OutputOwner.Audio
             clearSafetyBannerLocked()
         }
-        val started = audioCaptureManager.start(AudioSourceMode.SystemAudio) ||
-            audioCaptureManager.start(AudioSourceMode.Microphone)
+        val started = audioCaptureManager.start(mode)
         var killOrphanProducer = false
         var ok = false
         synchronized(outputLock) {
@@ -136,7 +137,9 @@ class ChloeVibesApplication : Application() {
                 publishSafetyLocked(
                     SafetyUiState(
                         watchdogTripped = false,
-                        message = "Audio capture failed to start",
+                        message = if (mode == AudioSourceMode.SystemAudio)
+                            "System audio unavailable. Select Microphone to use room audio."
+                        else "Microphone unavailable. Check permission and close active calls.",
                         motorsForcedZero = true
                     )
                 )
@@ -188,7 +191,7 @@ class ChloeVibesApplication : Application() {
             publishSafetyLocked(
                 SafetyUiState(
                     watchdogTripped = false,
-                    message = if (stopped) "All devices stopped" else "Stop sent (verify device is still)",
+                    message = if (stopped) "Output stopped; device zero requested" else "Device zero request failed",
                     motorsForcedZero = true
                 )
             )
@@ -282,8 +285,9 @@ class ChloeVibesApplication : Application() {
             // Only the audio path is supervised by this watchdog. Companion
             // sessions use CompanionSessionController and must not be torn
             // down here if ownership already moved.
+            if (outputOwner != OutputOwner.Audio) return
             mainHandler.removeCallbacks(watchdogPoll)
-            stopProducer = outputOwner == OutputOwner.Audio
+            stopProducer = true
             if (stopProducer) {
                 // Revoke route first so a late processing frame cannot re-arm.
                 outputOwner = OutputOwner.Idle

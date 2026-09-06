@@ -1,86 +1,97 @@
-# AUTO-LOCK — Design (Phase 1)
+# FIND BOOM — Automatic response fitting
 
-One button that fits the signal chain to the playing material: the most
-rhythmic drive band, the punchiest trigger shape, and an envelope whose decay
-fits the tempo — maximum *contrast* within the user's ceiling. Produced by a
-grounded design study (engine-surface extraction → two independent design
-lenses → adversarial skeptic pass), 2026-07-03.
+Design reference for ChloeVibes **1.6.0**. The desktop implementation is
+[`src/auto_lock.rs`](../src/auto_lock.rs); its internal name is AUTO-LOCK.
+See the [technical reference](TECHNICAL_REFERENCE.md) for the shared signal
+engine and output controls.
+
+One button fits the signal chain to the playing material: a rhythmic drive
+band, trigger shape, and an envelope whose decay fits the detected tempo.
 
 ## Core principle
 
-"Most pleasurable" is not maximum intensity. Vibrotactile receptors adapt to
-constant stimulation; the engine already fights this (micro-pauses, Climax
-anti-adaptation). Auto-Lock maximizes contrast: pick the band that carries the
-rhythm, fit decay/release into the inter-onset interval so every hit fully
-blooms and the trough between hits is preserved.
+Auto-Lock targets contrast between hits and troughs. It selects a drive band
+and fits an envelope to the observed onset interval. The score describes
+audio features and timing confidence, not measured pleasure or physical force.
 
-## Target waveform (field brief, 2026-07-03)
+## Target waveform
 
-Think like a bass drum: **punch up instantly, one continuous musical decay
-down, and the decay LANDS exactly where the next beat begins.** A sawtooth
-metronome with an organic boom. Never a flat dead gap (mechanical), never a
-truncated cut (jolting). Concretely: instant attack (fast path), exponential
-decay (curve ~1.8) spanning ~78% of the perceptually folded beat, landing on
-a low sustain floor (~0.08) that doubles as the retrigger-ready state, with
-jitter margin before the next hit. Side effect exploited deliberately: the
-onset detector fires on the subdivision grid (eighth notes), and off-beat
-onsets arrive mid-Decay where the engine eats them — only the felt beat
-relaunches the punch.
+The fitted response follows a bass-drum shape: an immediate command peak,
+a curved decay spanning about 78% of the perceptually folded beat interval,
+and a low sustain level around 0.08. The decay curve is about 1.8, with
+timing margin before the next expected hit. Onsets arriving during Decay
+are absorbed, which can prevent detected subdivisions from retriggering
+the envelope. Actual timing depends on capture, detected rhythm, envelope
+state, and hardware response.
 
-Band selection is punch-first, not rhythm-first: per band, the median
-per-hit energy jump times hit reliability, divided by the between-hit floor.
-The kick's huge jump out of a quiet floor beats a loud-but-ticky hi-hat and
-a bassline-smeared band.
+Band selection combines the median per-hit energy jump, hit reliability,
+and a bounded contrast factor `hit / (hit + 3 * floor + epsilon)`. The floor
+is mean positive energy change between onset-aligned windows. This gives
+absolute hit size more weight than a tiny transient with an almost zero floor.
 
 ## Architecture
 
-A **supervising estimator-controller** (`src/auto_lock.rs`), owned by the App
-and ticked inside `update()`. It READS what the engine already publishes
-(band energies, spectral flux, centroid, onset events, tempo confidence,
-envelope output) and WRITES a whitelisted subset of existing `Settings`
-fields through a slew-limited glide. The engine is untouched on both
-platforms — Rust/Kotlin parity and the golden-CSV CI are preserved by
-construction.
+The App owns the supervisor and calls it inside `update()`. It reads
+published band energies, centroid, onset events, tempo confidence, and
+pre-volume energy, then updates a selected set of existing `Settings`
+fields through a 1.5-second glide. The supervisor is desktop-only and does
+not add a stage to the shared Rust/Kotlin DSP chain. The synthetic parity
+tests cover the engine, not this parameter-fitting controller.
 
-## Safety by construction
+## Parameter limits and rollback
 
-The write-struct simply lacks the fields Auto-Lock must never touch:
-`main_volume`, `output_gain`, `min_vibe`, `max_vibe`, per-device multipliers,
-all `climax_*`, `trim_ms` (user latency calibration), `gate_threshold` /
-`auto_gate_amount` (writing the gate creates a feedback loop with the onset
-veto). `binary_level` is seeded from the observed dynamic envelope p90 with a
-0.55 punch floor and a hard 0.85 cap — the USER's ceiling (`max_vibe`,
-`output_gain`, device multipliers) always binds downstream, so the consent
-boundary is structural, not statistical.
+The fitted fields are frequency focus, trigger parameters, envelope timing
+and curves, output slew, gate threshold, and gate smoothing. A fit sets
+auto-gate to zero and disables Climax to isolate the boom response. It does
+not adjust `main_volume`, `output_gain`, `min_vibe`, `max_vibe`, device
+multipliers, Climax intensity/cycle parameters, or timing delay.
+
+`binary_level` is derived from crest factor plus a kick-band boost and
+clamped to 0.70–0.88. It is not fitted to measured motor strength. Output
+mapping and per-device limits apply after the fitted envelope.
 
 ## State machine
 
 ```
 IDLE --press--> LISTENING (>=4s valid audio within a 15s budget;
-                            frozen while using_rms_fallback)
-      --enough signal--> COMMIT (enums immediately, floats glide 1-2s)
+                            RMS fallback frames do not count as valid audio)
+      --enough signal--> COMMIT (enums immediately, floats glide 1.5s)
                           -> LOCKED (score shown on the button)
       --not lockable---> NO_LOCK (honest message, nothing written)
 LOCKED --revert--> restore pre-lock snapshot (one press)
 LOCKED --keep----> dissolve lock into normal settings (explicit consent)
-LOCKED --any manual param change or preset click--> lock cancels itself
+LOCKED --manual fitted-parameter change or preset click--> lock cancels itself
 ```
+
+The snapshot includes auto-gate, the Climax enable flag, and preset name as
+well as the fitted numeric parameters. Revert restores those values; Keep
+applies the final fitted target even if the glide is still running. Revert
+and Keep remain available while retrying, after a failed retry, or after
+cancelling that retry. An initial cancelled listen has no changes to revert.
+Manual takeover leaves the current edited values in place and ends the
+autosave snapshot guard.
 
 ## Estimator (rolling ~8s, time-based, deduplicated frames)
 
+The host supplies a fresh-capture flag; identical newly captured spectra
+still count, while repeated UI reads do not. Valid listening time counts
+adjacent valid frames at most 100 ms apart and excludes time before the
+current listen. Missing callbacks cannot count as a long stretch of music.
+
 | Feature | How | Drives |
 |---|---|---|
-| Per-band rhythmic salience | Half-wave-rectified per-band energy delta accumulated at onset times | `frequency_mode` + `target_frequency` (needs >=1.3x margin over 2nd band, else Full) |
-| Median / IQR inter-onset interval | Onset timestamp diffs | `decay_ms`, `release_ms`, `output_slew_ms` (decay MUST fit inside the IOI — onsets during Decay are silently eaten; retrigger only fires from Sustain) |
-| Crest factor (PRE-volume energy) | p95/p50 of gate-side energy | `trigger_mode`, `hybrid_blend`, `dynamic_curve`, `threshold_knee`, input smoothing |
+| Per-band punch | Median onset-aligned positive energy jump × reliability × bounded contrast | `frequency_mode` + `target_frequency`; a >=1.3× lead selects the winning band, otherwise crest/low-band evidence can select bass, else Full |
+| Median / IQR inter-onset interval | Onset timestamp diffs | `decay_ms`, `release_ms`, `output_slew_ms`; decay fits within the folded interval to leave a retrigger window |
+| Crest factor (PRE-volume energy) | p95/p50 of gate-side energy | `trigger_mode`, `hybrid_blend`, `dynamic_curve`, `binary_level` |
 | Silence ratio | Fraction of near-zero frames | lock-score penalty |
-| Envelope output p90 | Observed dynamic path output | `binary_level` cap |
+| Hit/trough energy | Median pre-volume energy in and between onset-aligned windows | `gate_threshold` and gate smoothing |
 | Median spectral centroid | Engine-exact linear norm `(centroid-100)/4000` | pre-compensates the engine's frequency shaping of sustain/release |
 
-Lock score = f(tempo confidence, salience margin, silence penalty). Shown as
-"LOCKED NN%". Below threshold → NO_LOCK.
+Lock score combines tempo confidence, salience margin, silence ratio, and
+crest factor. Shown as "BOOM NN%"; it is an estimator score rather than a
+percentage of correct beats. Below threshold → NO_LOCK.
 
-## Verdict-mandated phase-1 requirements (not optional)
+## Implementation requirements
 
 1. **Persistence guard:** eframe auto-saves Settings. While a lock is active,
    `save()` must persist the PRE-LOCK snapshot values for whitelisted fields,
@@ -94,17 +105,9 @@ Lock score = f(tempo confidence, salience margin, silence penalty). Shown as
 5. **Time-based rings, not frame-count** — update() cadence is not a
    guaranteed 60Hz.
 
-## Explicitly out of phase 1
+## Current scope
 
-Continuous servo / auto re-lock (gated on the safety pass), per-band
-autocorrelation salience, onset-boundary enum scheduling, FLOW probe
-hysteresis, `trim_ms`, anything Climax, save-lock-as-preset (blocked: the
-Rust `Preset` struct lacks six supervisor-written fields), Android port,
-rolling-mean intensity guard (requires a shadow engine; unimplementable).
-
-## Later phases
-
-- **Phase 2:** re-lock on song-change detection (opt-in), FLOW fallback
-  profile for unlockable material, Android port of the supervisor.
-- **Phase 3:** preference learning — explicit thumbs up/down nudges the
-  feature→parameter mapping weights. Requires the safety phase complete.
+FIND BOOM is a desktop-only, one-shot tuner. It does not automatically
+re-lock when a song changes, calibrate timing delay, fit Climax parameters,
+save custom presets, or learn preferences. Those capabilities are possible
+extensions, not features of this implementation.

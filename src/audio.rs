@@ -130,21 +130,35 @@ impl Default for SpectralData {
 
 /// Thread-safe wrapper for SpectralData. The capture thread writes,
 /// the GUI thread reads. Mutex contention is negligible at these rates.
+#[derive(Clone, Default)]
+pub struct SpectralFrame {
+    pub sequence: u64,
+    pub data: SpectralData,
+}
+
 #[derive(Clone)]
-pub struct SharedSpectralData(Arc<Mutex<SpectralData>>);
+pub struct SharedSpectralData(Arc<Mutex<SpectralFrame>>);
 
 impl SharedSpectralData {
     pub fn new() -> Self {
-        Self(Arc::new(Mutex::new(SpectralData::default())))
+        Self(Arc::new(Mutex::new(SpectralFrame::default())))
     }
 
     pub fn store(&self, data: SpectralData) {
         if let Ok(mut guard) = self.0.lock() {
-            *guard = data;
+            guard.sequence = guard.sequence.wrapping_add(1);
+            guard.data = data;
         }
     }
 
+    #[allow(dead_code)] // Compatibility API for library consumers; GUI uses load_frame.
     pub fn load(&self) -> SpectralData {
+        self.load_frame().data
+    }
+
+    /// Sequence and spectrum are one coherent producer publication. Identical
+    /// captured frames remain fresh; repeated UI reads do not advance it.
+    pub fn load_frame(&self) -> SpectralFrame {
         self.0.lock().map(|g| g.clone()).unwrap_or_default()
     }
 }
@@ -566,7 +580,7 @@ impl EnvelopeProcessor {
             start_time_ms: 0.0,
             last_gate_open: false,
             min_retrigger_ms: 20.0,
-            last_trigger_time_ms: 0.0,
+            last_trigger_time_ms: f32::NEG_INFINITY,
             last_trigger_velocity: 0.0,
             next_micro_pause_ms: 0.0,
             micro_pause_until_ms: 0.0,
@@ -605,6 +619,14 @@ impl EnvelopeProcessor {
 
     /// Trigger the envelope (gate just opened or strong onset detected).
     pub fn trigger(&mut self, magnitude: f32, current_time_ms: f32, velocity: f32, attack_ms: f32) {
+        if !magnitude.is_finite()
+            || !current_time_ms.is_finite()
+            || !velocity.is_finite()
+            || !attack_ms.is_finite()
+        {
+            self.reset();
+            return;
+        }
         // Enforce minimum retrigger interval — but allow a real onset to
         // *upgrade* a gate-edge thump (velocity=1.0) that fired a few ms ago.
         // Without this, min_retrigger_ms steals kick overshoot on tight gates.
@@ -656,6 +678,11 @@ impl EnvelopeProcessor {
         self.last_trigger_time_ms = current_time_ms;
     }
 
+    /// Whether this frame actually started an envelope, including cooldown checks.
+    pub fn triggered_at(&self, current_time_ms: f32) -> bool {
+        current_time_ms.is_finite() && self.last_trigger_time_ms == current_time_ms
+    }
+
     /// Release the envelope (gate just closed).
     pub fn release(&mut self, current_time_ms: f32) {
         if self.state != EnvelopeState::Idle && self.state != EnvelopeState::Release {
@@ -702,44 +729,57 @@ impl EnvelopeProcessor {
         decay_curve: f32,
         release_curve: f32,
     ) -> f32 {
-        let elapsed = current_time_ms - self.start_time_ms;
         self.silence_event = false;
+
+        if [
+            current_time_ms,
+            attack_ms,
+            decay_ms,
+            sustain_level,
+            release_ms,
+            attack_curve,
+            decay_curve,
+            release_curve,
+        ]
+        .iter()
+        .any(|v| !v.is_finite())
+        {
+            self.reset();
+            self.silence_event = true;
+            return 0.0;
+        }
+
+        // Advance at scheduled phase boundaries, carrying any late-frame time
+        // into the next phase. A sparse host tick must not stretch the pulse.
+        let attack_duration = if attack_ms <= 0.5 { 0.0 } else { attack_ms };
+        if self.state == EnvelopeState::Attack
+            && current_time_ms - self.start_time_ms >= attack_duration
+        {
+            self.start_time_ms += attack_duration;
+            self.value = self.attack_target;
+            self.phase_start_value = self.attack_target;
+            self.state = EnvelopeState::Decay;
+        }
+        let decay_duration = if decay_ms <= 0.5 { 0.0 } else { decay_ms };
+        if self.state == EnvelopeState::Decay
+            && current_time_ms - self.start_time_ms >= decay_duration
+        {
+            self.enter_post_decay(sustain_level, self.start_time_ms + decay_duration);
+        }
+        let elapsed = (current_time_ms - self.start_time_ms).max(0.0);
 
         match self.state {
             EnvelopeState::Attack => {
-                if attack_ms <= 0.5 {
-                    // Instant attack — jump to peak (with velocity overshoot if any)
-                    self.value = self.attack_target;
-                    self.state = EnvelopeState::Decay;
-                    self.start_time_ms = current_time_ms;
-                    self.phase_start_value = self.attack_target;
-                } else {
-                    let progress = (elapsed / attack_ms).clamp(0.0, 1.0);
-                    let curved = apply_curve(progress, attack_curve);
-                    self.value = self.phase_start_value
-                        + (self.attack_target - self.phase_start_value) * curved;
-
-                    if progress >= 1.0 {
-                        self.value = self.attack_target;
-                        self.state = EnvelopeState::Decay;
-                        self.start_time_ms = current_time_ms;
-                        self.phase_start_value = self.attack_target;
-                    }
-                }
+                let progress = (elapsed / attack_ms).clamp(0.0, 1.0);
+                let curved = apply_curve(progress, attack_curve);
+                self.value =
+                    self.phase_start_value + (self.attack_target - self.phase_start_value) * curved;
             }
             EnvelopeState::Decay => {
-                if decay_ms <= 0.5 {
-                    self.enter_post_decay(sustain_level, current_time_ms);
-                } else {
-                    let progress = (elapsed / decay_ms).clamp(0.0, 1.0);
-                    let decay_factor = apply_curve(1.0 - progress, decay_curve);
-                    self.value =
-                        sustain_level + (self.phase_start_value - sustain_level) * decay_factor;
-
-                    if progress >= 1.0 {
-                        self.enter_post_decay(sustain_level, current_time_ms);
-                    }
-                }
+                let progress = (elapsed / decay_ms).clamp(0.0, 1.0);
+                let decay_factor = apply_curve(1.0 - progress, decay_curve);
+                self.value =
+                    sustain_level + (self.phase_start_value - sustain_level) * decay_factor;
             }
             EnvelopeState::Sustain => {
                 // Stochastic micro-pauses: true zero for 90–120 ms (time-based).
@@ -955,7 +995,10 @@ impl EnvelopeProcessor {
         self.value = 0.0;
         self.magnitude = 0.0;
         self.attack_target = 1.0;
-        self.last_trigger_time_ms = 0.0;
+        self.phase_start_value = 0.0;
+        self.start_time_ms = 0.0;
+        self.last_gate_open = false;
+        self.last_trigger_time_ms = f32::NEG_INFINITY;
         self.last_trigger_velocity = 0.0;
         self.micro_pause_until_ms = 0.0;
         self.next_micro_pause_ms = 0.0;
@@ -993,6 +1036,11 @@ pub struct BeatDetector {
     pub tempo_confidence: f32,
     /// Predicted time of next onset in ms (0 = no prediction).
     pub predicted_next_onset_ms: f32,
+    /// Confidence at the last measured onset; elapsed decay never compounds per poll.
+    tempo_confidence_at_onset: f32,
+    pending_prefire: Option<(f32, f32)>,
+    played_prefire_ms: Option<f32>,
+    matched_prefire_onset_ms: Option<f32>,
 }
 
 impl BeatDetector {
@@ -1014,12 +1062,26 @@ impl BeatDetector {
             tempo_interval_ms: 0.0,
             tempo_confidence: 0.0,
             predicted_next_onset_ms: 0.0,
+            tempo_confidence_at_onset: 0.0,
+            pending_prefire: None,
+            played_prefire_ms: None,
+            matched_prefire_onset_ms: None,
         }
     }
 
     /// Process spectral flux and detect onsets.
     /// Returns (is_onset, onset_strength).
     pub fn process(&mut self, spectral_flux: f32, current_time_ms: f32) -> (bool, f32) {
+        if !current_time_ms.is_finite() {
+            return (false, 0.0);
+        }
+        self.advance_time(current_time_ms);
+        // One broken capture frame must not poison the rolling statistics.
+        let spectral_flux = if spectral_flux.is_finite() {
+            spectral_flux.max(0.0)
+        } else {
+            0.0
+        };
         // Update history
         self.flux_history[self.history_index] = spectral_flux;
         self.history_index = (self.history_index + 1) % self.flux_history.len();
@@ -1042,6 +1104,13 @@ impl BeatDetector {
             && (current_time_ms - self.last_onset_time_ms) > self.cooldown_ms;
 
         if is_onset {
+            self.matched_prefire_onset_ms = self.played_prefire_ms.and_then(|expected_ms| {
+                ((current_time_ms - expected_ms).abs() <= Self::PREFIRE_LEAD_MS)
+                    .then_some(current_time_ms)
+            });
+            if self.matched_prefire_onset_ms.is_some() {
+                self.played_prefire_ms = None;
+            }
             self.last_onset_time_ms = current_time_ms;
             // Moderate growth after onset (prevents rapid double-triggering)
             self.adaptive_threshold = (self.adaptive_threshold * 1.06).min(1.8);
@@ -1092,6 +1161,9 @@ impl BeatDetector {
     /// Whether predictive pre-fire is allowed right now.
     /// Requires a fresh tempo lock and a recent real onset (recency guard).
     pub fn prefire_ok(&self, current_time_ms: f32) -> bool {
+        if !current_time_ms.is_finite() {
+            return false;
+        }
         if self.tempo_confidence <= 0.6 || self.tempo_interval_ms <= 0.0 {
             return false;
         }
@@ -1101,7 +1173,7 @@ impl BeatDetector {
         // Recency: last real onset within ~1.75 beats (tightened from 2.0 to
         // cut ghost pre-fires on residual gate after a drop-out).
         let since_onset = current_time_ms - self.last_onset_time_ms;
-        if since_onset > self.tempo_interval_ms * 1.75 {
+        if since_onset < 0.0 || since_onset > self.tempo_interval_ms * 1.75 {
             return false;
         }
         let time_to = self.predicted_next_onset_ms - current_time_ms;
@@ -1117,10 +1189,35 @@ impl BeatDetector {
         if !self.prefire_ok(current_time_ms) {
             return None;
         }
+        self.pending_prefire = Some((current_time_ms, self.predicted_next_onset_ms));
         // Push prediction past this beat's lead window (one-shot latch).
         self.predicted_next_onset_ms += self.tempo_interval_ms.max(1.0);
+        // Keep min/max's finite fallback for NaN; clamp would propagate NaN.
+        #[allow(clippy::manual_clamp)]
         let strength = self.recent_onset_strength.max(1.15).min(1.35);
         Some(strength)
+    }
+
+    /// Confirm only after the host's envelope accepted the synthetic trigger.
+    pub fn confirm_prefire(&mut self, current_time_ms: f32) {
+        if let Some((requested_ms, expected_ms)) = self.pending_prefire {
+            if requested_ms == current_time_ms {
+                self.played_prefire_ms = Some(expected_ms);
+                self.pending_prefire = None;
+            }
+        }
+    }
+
+    /// Real onsets still train tempo; their envelope attack is already played.
+    pub fn is_prefired_onset(&self, current_time_ms: f32) -> bool {
+        self.matched_prefire_onset_ms == Some(current_time_ms)
+    }
+
+    /// Advance prediction age without adding a duplicate captured spectrum.
+    pub fn advance_time(&mut self, current_time_ms: f32) {
+        if current_time_ms.is_finite() {
+            self.decay_tempo_confidence(current_time_ms);
+        }
     }
 
     /// Clear tempo lock and onset history so a dead lock cannot resurrect.
@@ -1131,6 +1228,10 @@ impl BeatDetector {
         self.onset_ts_count = 0;
         self.onset_ts_index = 0;
         self.onset_timestamps = [0.0; 16];
+        self.tempo_confidence_at_onset = 0.0;
+        self.pending_prefire = None;
+        self.played_prefire_ms = None;
+        self.matched_prefire_onset_ms = None;
     }
 
     fn decay_tempo_confidence(&mut self, current_time_ms: f32) {
@@ -1138,20 +1239,28 @@ impl BeatDetector {
             return;
         }
         let since = current_time_ms - self.last_onset_time_ms;
+        if since >= self.tempo_interval_ms * 3.0 {
+            self.clear_tempo_lock();
+            return;
+        }
         // After 1.5 missed beats, start bleeding confidence; by ~3 beats → zero.
         let grace = self.tempo_interval_ms * 1.5;
         if since <= grace {
             // Still advance the prediction so the next beat stays on-grid.
             if self.tempo_confidence > 0.5 {
                 let intervals_elapsed = (since / self.tempo_interval_ms) as u32;
-                self.predicted_next_onset_ms = self.last_onset_time_ms
+                let next = self.last_onset_time_ms
                     + (intervals_elapsed + 1) as f32 * self.tempo_interval_ms;
+                // take_prefire may already have consumed this deadline. A
+                // quiet analysis frame must not move it backward and rearm it.
+                self.predicted_next_onset_ms = self.predicted_next_onset_ms.max(next);
             }
             return;
         }
         let stale_beats = (since - grace) / self.tempo_interval_ms.max(1.0);
         // Slightly faster bleed than 0.55 — stale locks die before the next track.
-        self.tempo_confidence = (self.tempo_confidence * (0.50_f32).powf(stale_beats)).max(0.0);
+        self.tempo_confidence =
+            (self.tempo_confidence_at_onset * (0.50_f32).powf(stale_beats)).max(0.0);
         if self.tempo_confidence < 0.5 {
             self.predicted_next_onset_ms = 0.0;
             if self.tempo_confidence < 0.05 {
@@ -1159,8 +1268,9 @@ impl BeatDetector {
             }
         } else {
             let intervals_elapsed = (since / self.tempo_interval_ms) as u32;
-            self.predicted_next_onset_ms =
+            let next =
                 self.last_onset_time_ms + (intervals_elapsed + 1) as f32 * self.tempo_interval_ms;
+            self.predicted_next_onset_ms = self.predicted_next_onset_ms.max(next);
         }
     }
 
@@ -1200,6 +1310,7 @@ impl BeatDetector {
         // Confidence: low coefficient of variation = high confidence
         let cv = if mean > 0.0 { std_dev / mean } else { 1.0 };
         self.tempo_confidence = (1.0 - cv * 4.0).clamp(0.0, 1.0);
+        self.tempo_confidence_at_onset = self.tempo_confidence;
         self.tempo_interval_ms = mean;
 
         if self.tempo_confidence > 0.5 {
@@ -1446,8 +1557,7 @@ impl ClimaxEngine {
         // Rates above ~5 Hz are crushed by ERM physics; move budget into depth.
         let pulse_depth = (pulse_depth.clamp(0.0, 0.55) * (1.0 + 0.20 * ramp)).min(0.62);
         let max_pulse_hz = 5.0;
-        let pulse_rate_hz =
-            (1.6 + intensity * 1.8 + energy * 1.0 + ramp * 0.6).min(max_pulse_hz);
+        let pulse_rate_hz = (1.6 + intensity * 1.8 + energy * 1.0 + ramp * 0.6).min(max_pulse_hz);
         let detune1 = 0.07;
         let detune2 = 0.13;
         self.micro_phase = (self.micro_phase + dt * pulse_rate_hz * TAU).rem_euclid(TAU);
@@ -1526,7 +1636,12 @@ impl ClimaxEngine {
         let raw_output = if dry <= 0.001 {
             0.0
         } else {
-            (dry * arousal_gain * tease_factor * surge_factor * pulse * sub_resonance * chaos_mod
+            (dry * arousal_gain
+                * tease_factor
+                * surge_factor
+                * pulse
+                * sub_resonance
+                * chaos_mod
                 * breathing_mod
                 + gated_boost)
                 .clamp(0.0, peak_cap)
@@ -1634,10 +1749,17 @@ fn smooth_step(value: f32) -> f32 {
 /// stages and covered by the parity golden so the two cannot drift. The caller
 /// applies output slew (asymmetric smoothing) on top of this mapped target.
 pub fn map_output(shaped: f32, min_vibe: f32, max_vibe: f32, gain: f32, is_silent: bool) -> f32 {
-    if is_silent || shaped <= 0.001 {
+    if is_silent
+        || shaped <= 0.001
+        || [shaped, min_vibe, max_vibe, gain]
+            .iter()
+            .any(|v| !v.is_finite())
+    {
         return 0.0;
     }
-    ((min_vibe + shaped * (max_vibe - min_vibe)) * gain).clamp(0.0, 1.0)
+    let max_vibe = max_vibe.clamp(0.0, 1.0);
+    let min_vibe = min_vibe.clamp(0.0, max_vibe);
+    ((min_vibe + shaped * (max_vibe - min_vibe)) * gain.max(0.0)).clamp(0.0, max_vibe)
 }
 
 // ==========================================================================
@@ -1647,6 +1769,19 @@ pub fn map_output(shaped: f32, min_vibe: f32, max_vibe: f32, gain: f32, is_silen
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_ceiling_binds_after_gain_and_invalid_input_stops() {
+        assert_eq!(map_output(1.0, 0.0, 0.2, 2.0, false), 0.2);
+        assert_eq!(map_output(1.2, 0.0, 0.2, 4.0, false), 0.2);
+        assert_eq!(map_output(0.0, 0.1, 0.2, 4.0, false), 0.0);
+        assert_eq!(map_output(1.0, 0.1, 0.2, 4.0, true), 0.0);
+        assert_eq!(map_output(f32::NAN, 0.0, 1.0, 1.0, false), 0.0);
+        assert_eq!(map_output(1.0, 0.0, f32::NAN, 1.0, false), 0.0);
+        assert_eq!(map_output(1.0, 0.0, 1.0, f32::INFINITY, false), 0.0);
+        assert_eq!(map_output(1.0, 0.9, 0.2, 1.0, false), 0.2);
+        assert!((map_output(1.2, 0.0, 1.0, 0.5, false) - 0.6).abs() < 1e-6);
+    }
 
     // --- Helper functions ---
 
@@ -1763,6 +1898,119 @@ mod tests {
         // Trigger should transition to Attack (attack_ms >= 50 -> Attack state)
         env.trigger(1.0, 100.0, 0.0, 100.0);
         assert_eq!(env.state, EnvelopeState::Attack);
+    }
+
+    #[test]
+    fn envelope_accepts_first_trigger_at_zero_and_reset_rearms_gate() {
+        let mut env = EnvelopeProcessor::new();
+        env.trigger(1.0, 0.0, 1.0, 20.0);
+        assert_eq!(env.state, EnvelopeState::Decay);
+        env.last_gate_open = true;
+        env.reset();
+        assert!(!env.last_gate_open);
+        env.trigger(1.0, 0.0, 1.0, 20.0);
+        assert_eq!(env.state, EnvelopeState::Decay);
+    }
+
+    #[test]
+    fn envelope_phase_deadlines_survive_sparse_processing() {
+        let mut dense = EnvelopeProcessor::new();
+        let mut sparse = EnvelopeProcessor::new();
+        dense.trigger(1.0, 100.0, 1.0, 80.0);
+        sparse.trigger(1.0, 100.0, 1.0, 80.0);
+        // Attack ends at 180, decay at 300, release at 400 ms.
+        for now in (100..350).step_by(5) {
+            dense.process(now as f32, 80.0, 120.0, 0.1, 100.0, 1.0, 1.0, 1.0);
+        }
+        let a = dense.process(350.0, 80.0, 120.0, 0.1, 100.0, 1.0, 1.0, 1.0);
+        let b = sparse.process(350.0, 80.0, 120.0, 0.1, 100.0, 1.0, 1.0, 1.0);
+        assert!(
+            (a - 0.05).abs() < 1e-6,
+            "expected half-released tail, got {a}"
+        );
+        assert!((a - b).abs() < 1e-6, "dense {a}, sparse {b}");
+        assert_eq!(sparse.state, EnvelopeState::Release);
+        assert_eq!(
+            sparse.process(400.0, 80.0, 120.0, 0.1, 100.0, 1.0, 1.0, 1.0),
+            0.0
+        );
+        assert!(sparse.silence_event);
+    }
+
+    #[test]
+    fn beat_confidence_depends_on_elapsed_time_not_poll_count() {
+        let mut dense = BeatDetector::new();
+        let mut sparse = BeatDetector::new();
+        for now in [1000.0, 1500.0, 2000.0, 2500.0] {
+            assert!(dense.process(10.0, now).0);
+            assert!(sparse.process(10.0, now).0);
+        }
+        for now in (2510..3500).step_by(10) {
+            dense.process(0.0, now as f32);
+        }
+        dense.process(0.0, 3500.0);
+        sparse.process(0.0, 3500.0);
+        assert!(
+            (dense.tempo_confidence - sparse.tempo_confidence).abs() < 1e-6,
+            "dense {}, sparse {}",
+            dense.tempo_confidence,
+            sparse.tempo_confidence
+        );
+    }
+
+    #[test]
+    fn beat_detector_recovers_immediately_after_nonfinite_flux() {
+        let mut beat = BeatDetector::new();
+        assert_eq!(beat.process(f32::NAN, 100.0), (false, 0.0));
+        assert_eq!(beat.process(f32::INFINITY, 150.0), (false, 0.0));
+        assert!(beat.process(10.0, 200.0).0);
+    }
+
+    #[test]
+    fn played_prefire_suppresses_one_matching_real_attack_only() {
+        let mut beat = BeatDetector::new();
+        for now in [1000.0, 1500.0, 2000.0, 2500.0] {
+            assert!(beat.process(10.0, now).0);
+        }
+        assert!(beat.take_prefire(2950.0).is_some());
+        beat.confirm_prefire(2950.0);
+        assert!(beat.process(10.0, 2960.0).0);
+        assert!(beat.is_prefired_onset(2960.0));
+        // A separate flam just 60ms later is a distinct detected onset,
+        // even though both events fall within the prediction's ±50ms window.
+        assert!(beat.process(10.0, 3020.0).0);
+        assert!(!beat.is_prefired_onset(3020.0));
+    }
+
+    #[test]
+    fn unplayed_prefire_never_suppresses_a_real_attack() {
+        let mut beat = BeatDetector::new();
+        for now in [1000.0, 1500.0, 2000.0, 2500.0] {
+            assert!(beat.process(10.0, now).0);
+        }
+        assert!(beat.take_prefire(2950.0).is_some());
+        // A host can reject the synthetic event due to gate, capture staleness,
+        // Attack state, or cooldown. It therefore does not confirm the prefire.
+        assert!(beat.process(10.0, 3000.0).0);
+        assert!(!beat.is_prefired_onset(3000.0));
+    }
+
+    #[test]
+    fn advancing_time_does_not_learn_duplicate_flux_and_stale_real_onset_relearns() {
+        let mut beat = BeatDetector::new();
+        for now in [1000.0, 1500.0, 2000.0, 2500.0] {
+            assert!(beat.process(10.0, now).0);
+        }
+        let history = beat.flux_history.clone();
+        for now in (2505..4000).step_by(5) {
+            beat.advance_time(now as f32);
+        }
+        assert_eq!(beat.flux_history, history);
+        beat.advance_time(4000.0);
+        assert_eq!(beat.tempo_confidence, 0.0);
+        assert!(beat.process(10.0, 4500.0).0);
+        assert_eq!(beat.predicted_next_onset_ms, 0.0);
+        assert_eq!(beat.onset_ts_count, 1);
     }
 
     #[test]
@@ -1956,6 +2204,48 @@ mod tests {
         assert_eq!(loaded.band_energies, data.band_energies);
         assert_eq!(loaded.spectral_centroid, 1500.0);
         assert_eq!(loaded.spectral_flux, 0.42);
+    }
+
+    #[test]
+    fn producer_sequence_advances_identical_frames_but_not_repeat_reads() {
+        let shared = SharedSpectralData::new();
+        let initial = shared.load_frame();
+        shared.store(SpectralData::default());
+        let first = shared.load_frame();
+        assert_ne!(initial.sequence, first.sequence);
+        for _ in 0..20 {
+            assert_eq!(shared.load_frame().sequence, first.sequence);
+        }
+        shared.store(SpectralData::default());
+        let second = shared.load_frame();
+        assert_ne!(first.sequence, second.sequence);
+        assert_eq!(first.data.band_energies, second.data.band_energies);
+        assert_eq!(first.data.spectral_flux, second.data.spectral_flux);
+    }
+
+    #[test]
+    fn identical_captured_silence_closes_a_smoothed_gate_without_duplicate_ui_ticks() {
+        let shared = SharedSpectralData::new();
+        let mut gate = Gate::new();
+        assert!(gate.process(0.8, 0.1, 0.0, 0.9));
+        let mut seen = shared.load_frame().sequence;
+        let mut processed = 0;
+        let mut open = true;
+        for _ in 0..8 {
+            shared.store(SpectralData::default());
+            for _ in 0..12 {
+                let frame = shared.load_frame();
+                if frame.sequence != seen {
+                    seen = frame.sequence;
+                    processed += 1;
+                    let energy =
+                        SpectralAnalyzer::extract_energy(&frame.data, FrequencyMode::Full, 0.0);
+                    open = gate.process(energy, 0.1, 0.0, 0.9);
+                }
+            }
+        }
+        assert_eq!(processed, 8, "only captured frames advance the gate");
+        assert!(!open, "identical silence frames must complete gate release");
     }
 
     // --- extract_energy modes ---
@@ -2251,7 +2541,10 @@ mod tests {
                 break;
             }
         }
-        assert!(denied, "edge-and-deny must activate under sustained high output");
+        assert!(
+            denied,
+            "edge-and-deny must activate under sustained high output"
+        );
     }
 
     // --- BeatDetector tempo tracking ---
@@ -2298,11 +2591,21 @@ mod tests {
         let first = bd.take_prefire(lead_t);
         assert!(first.is_some(), "prefire should fire inside lead window");
         assert!(first.unwrap() >= 1.15, "synthetic strength floor");
-        // Same window must not fire again (one-shot latch).
+        // Actual GUI ordering processes a fresh quiet spectrum between calls.
+        // That refresh used to rewind the consumed prediction and double-fire.
+        assert!(!bd.process(0.0, lead_t + 8.0).0);
         assert!(
             bd.take_prefire(lead_t + 8.0).is_none(),
             "latched prefire must not double-fire"
         );
+        assert!(bd.process(8.0, pred).0, "the real beat remains detectable");
+        let following = bd.predicted_next_onset_ms - BeatDetector::PREFIRE_LEAD_MS * 0.5;
+        assert!(
+            bd.take_prefire(following).is_some(),
+            "the following beat may prefire"
+        );
+        assert!(!bd.process(0.0, following + 8.0).0);
+        assert!(bd.take_prefire(following + 8.0).is_none());
     }
 
     #[test]

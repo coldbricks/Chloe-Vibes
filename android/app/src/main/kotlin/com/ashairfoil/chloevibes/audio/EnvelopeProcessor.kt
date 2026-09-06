@@ -72,7 +72,7 @@ class EnvelopeProcessor {
     private val minRetriggerMs: Float = 20f
 
     /** Time of last trigger (ms). */
-    private var lastTriggerTimeMs: Float = 0f
+    private var lastTriggerTimeMs: Float = Float.NEGATIVE_INFINITY
 
     /** Velocity of last trigger (gate-edge → real-onset upgrade). */
     private var lastTriggerVelocity: Float = 0f
@@ -118,6 +118,12 @@ class EnvelopeProcessor {
 
     /** Trigger the envelope (gate just opened or strong onset detected). */
     fun trigger(magnitude: Float, currentTimeMs: Float, velocity: Float, attackMs: Float = 30f) {
+        if (!magnitude.isFinite() || !currentTimeMs.isFinite() ||
+            !velocity.isFinite() || !attackMs.isFinite()
+        ) {
+            reset()
+            return
+        }
         // Enforce minimum retrigger interval — allow real onset to upgrade a
         // gate-edge thump (velocity=1) that fired a few ms earlier.
         if (currentTimeMs - lastTriggerTimeMs < minRetriggerMs) {
@@ -164,6 +170,10 @@ class EnvelopeProcessor {
         lastTriggerTimeMs = currentTimeMs
     }
 
+    /** Whether this frame actually started an envelope, including cooldown checks. */
+    fun triggeredAt(currentTimeMs: Float): Boolean =
+        currentTimeMs.isFinite() && lastTriggerTimeMs == currentTimeMs
+
     /** Release the envelope (gate just closed). */
     fun release(currentTimeMs: Float) {
         if (state != EnvelopeState.Idle && state != EnvelopeState.Release) {
@@ -205,43 +215,42 @@ class EnvelopeProcessor {
         decayCurve: Float,
         releaseCurve: Float
     ): Float {
-        val elapsed = currentTimeMs - startTimeMs
         silenceEvent = false
+
+        if (!currentTimeMs.isFinite() || !attackMs.isFinite() || !decayMs.isFinite() ||
+            !sustainLevel.isFinite() || !releaseMs.isFinite() || !attackCurve.isFinite() ||
+            !decayCurve.isFinite() || !releaseCurve.isFinite()
+        ) {
+            reset()
+            silenceEvent = true
+            return 0f
+        }
+
+        // Carry late-frame time into the next phase instead of stretching the pulse.
+        val attackDuration = if (attackMs <= 0.5f) 0f else attackMs
+        if (state == EnvelopeState.Attack && currentTimeMs - startTimeMs >= attackDuration) {
+            startTimeMs += attackDuration
+            value = attackTarget
+            phaseStartValue = attackTarget
+            state = EnvelopeState.Decay
+        }
+        val decayDuration = if (decayMs <= 0.5f) 0f else decayMs
+        if (state == EnvelopeState.Decay && currentTimeMs - startTimeMs >= decayDuration) {
+            enterPostDecay(sustainLevel, startTimeMs + decayDuration)
+        }
+        val elapsed = (currentTimeMs - startTimeMs).coerceAtLeast(0f)
 
         when (state) {
             EnvelopeState.Attack -> {
-                if (attackMs <= 0.5f) {
-                    // Instant attack
-                    value = attackTarget
-                    state = EnvelopeState.Decay
-                    startTimeMs = currentTimeMs
-                    phaseStartValue = attackTarget
-                } else {
-                    val progress = (elapsed / attackMs).coerceIn(0f, 1f)
-                    val curved = applyCurve(progress, attackCurve)
-                    value = phaseStartValue + (attackTarget - phaseStartValue) * curved
-
-                    if (progress >= 1f) {
-                        value = attackTarget
-                        state = EnvelopeState.Decay
-                        startTimeMs = currentTimeMs
-                        phaseStartValue = attackTarget
-                    }
-                }
+                val progress = (elapsed / attackMs).coerceIn(0f, 1f)
+                val curved = applyCurve(progress, attackCurve)
+                value = phaseStartValue + (attackTarget - phaseStartValue) * curved
             }
 
             EnvelopeState.Decay -> {
-                if (decayMs <= 0.5f) {
-                    enterPostDecay(sustainLevel, currentTimeMs)
-                } else {
-                    val progress = (elapsed / decayMs).coerceIn(0f, 1f)
-                    val decayFactor = applyCurve(1f - progress, decayCurve)
-                    value = sustainLevel + (phaseStartValue - sustainLevel) * decayFactor
-
-                    if (progress >= 1f) {
-                        enterPostDecay(sustainLevel, currentTimeMs)
-                    }
-                }
+                val progress = (elapsed / decayMs).coerceIn(0f, 1f)
+                val decayFactor = applyCurve(1f - progress, decayCurve)
+                value = sustainLevel + (phaseStartValue - sustainLevel) * decayFactor
             }
 
             EnvelopeState.Sustain -> {
@@ -438,7 +447,10 @@ class EnvelopeProcessor {
         value = 0f
         magnitude = 0f
         attackTarget = 1f
-        lastTriggerTimeMs = 0f
+        phaseStartValue = 0f
+        startTimeMs = 0f
+        lastGateOpen = false
+        lastTriggerTimeMs = Float.NEGATIVE_INFINITY
         lastTriggerVelocity = 0f
         microPauseUntilMs = 0f
         nextMicroPauseMs = 0f
