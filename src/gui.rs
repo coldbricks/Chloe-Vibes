@@ -22,7 +22,7 @@ use std::{
 
 use audio_capture::win::capture::AudioCapture;
 use buttplug::{
-    client::{ButtplugClient, ButtplugClientDevice, ButtplugClientError, ScalarValueCommand},
+    client::{ButtplugClient, ButtplugClientDevice, ScalarValueCommand},
     core::message::ActuatorType,
 };
 use clap::Parser;
@@ -390,7 +390,7 @@ struct GuiApp {
     runtime: tokio::runtime::Runtime,
     client: Option<Arc<ButtplugClient>>,
     connection_state: ConnectionState,
-    connection_task: Option<tokio::task::JoinHandle<Result<ButtplugClient, ButtplugClientError>>>,
+    connection_task: Option<tokio::task::JoinHandle<util::ClientConnectionResult>>,
     server_addr: Option<String>,
     server_name: String,
     capture_status: Arc<Mutex<String>>,

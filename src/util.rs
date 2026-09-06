@@ -27,6 +27,8 @@ use buttplug::{
 
 const DEFAULT_SERVER_ADDR: &str = "ws://127.0.0.1:12345";
 
+pub type ClientConnectionResult = Result<ButtplugClient, Box<ButtplugClientError>>;
+
 pub const NO_CAPTURE_PACKET: u64 = u64::MAX;
 pub const CAPTURE_STALE_MS: u64 = 250;
 
@@ -83,10 +85,7 @@ impl OutputDelay {
     }
 }
 
-async fn connect_remote(
-    client_name: &str,
-    addr: &str,
-) -> Result<ButtplugClient, ButtplugClientError> {
+async fn connect_remote(client_name: &str, addr: &str) -> ClientConnectionResult {
     let remote_connector =
         RemoteConn::<_, JsonSer>::new(WebsocketTransport::new_insecure_connector(addr));
     let client = ButtplugClient::new(client_name);
@@ -224,9 +223,7 @@ async fn start_embedded_client(client_name: &str) -> Result<ButtplugClient, Stri
     Ok(client)
 }
 
-pub async fn start_bp_server(
-    server_addr: Option<String>,
-) -> Result<ButtplugClient, ButtplugClientError> {
+pub async fn start_bp_server(server_addr: Option<String>) -> ClientConnectionResult {
     let name = "chloe-vibes";
     // Validate server address scheme
     let server_addr = server_addr.filter(|addr| {
