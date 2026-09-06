@@ -2,7 +2,7 @@
 
 **Status:** VERIFY (adversarial)  
 **Date:** 2026-08-08  
-**Repo:** `C:\Users\coldb\Chloe-Vibes`  
+**Repo:** `.`
 **Scope:** Working-tree diff vs `master` (`365b53d` + dirty overlay) against `WAVE-002-PEAK-FEEL.md` claims  
 **Reviewer posture:** Challenge every “feel improved” claim; demand path:line / symbol evidence; no credit for theater  
 

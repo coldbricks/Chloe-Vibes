@@ -65,6 +65,16 @@ class BeatDetector {
     private var pendingPrefire: Pair<Float, Float>? = null
     private var playedPrefireMs: Float? = null
     private var matchedPrefireOnsetMs: Float? = null
+    private var manualIntervalMs: Float? = null
+
+    /** Tempo hint only; a real onset must anchor phase before prediction runs. */
+    fun setManualTempo(bpm: Float?) {
+        val interval = bpm?.takeIf { it.isFinite() && it in 30f..300f }?.let { 60_000f / it }
+        if (interval != manualIntervalMs) {
+            clearTempoLock()
+            manualIntervalMs = interval
+        }
+    }
 
     /**
      * Process spectral flux and detect onsets.
@@ -116,7 +126,13 @@ class BeatDetector {
             if (onsetTsCount < onsetTimestamps.size) onsetTsCount++
 
             // Update tempo prediction after accumulating enough onsets
-            if (onsetTsCount >= 4) {
+            val manual = manualIntervalMs
+            if (manual != null) {
+                tempoIntervalMs = manual
+                tempoConfidence = 1f
+                tempoConfidenceAtOnset = 1f
+                predictedNextOnsetMs = currentTimeMs + manual
+            } else if (onsetTsCount >= 4) {
                 updateTempoPrediction(currentTimeMs)
             }
         } else {

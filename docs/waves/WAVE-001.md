@@ -2,7 +2,7 @@
 
 **Status:** VERIFY  
 **Created:** 2026-07-19  
-**Repo:** C:\Users\coldb\Chloe-Vibes  
+**Repo:** .
 **MAX COMPUTE:** ON  
 
 ## Scope (one sentence)

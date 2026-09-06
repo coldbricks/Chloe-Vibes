@@ -2,7 +2,7 @@
 
 **Status:** PLAN  
 **Created:** 2026-08-08  
-**Repo:** C:\Users\coldb\Chloe-Vibes  
+**Repo:** .
 **Depends on:** WAVE-001 (feel-depth) — VERIFY; several WAVE-001 items shipped but prefire is dead in the motor path  
 **MAX COMPUTE:** ON  
 

@@ -13,7 +13,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/coldbricks/Chloe-Vibes/releases/latest">What's new in v1.6.1</a>
+  <a href="https://github.com/coldbricks/Chloe-Vibes/releases/latest">What's new in v1.6.2</a>
   &nbsp; · &nbsp;
   <a href="docs/TECHNICAL_REFERENCE.md">Guide &amp; technical reference</a>
   &nbsp; · &nbsp;
@@ -29,7 +29,7 @@ ChloeVibes treats haptics like a musical instrument. A kick can have a distinct 
 Start with one of **33 presets**, or press **FIND BOOM** on Windows to fit a response to the track. Grab the envelope and shape the pulse directly: a sharper attack, a longer tail, a different feel. Open the full controls whenever you want more detail.
 
 <p align="center">
-  <img src="assets/windows-envelope.jpg" alt="ChloeVibes for Windows: a large, color-coded envelope editor with draggable attack, decay, sustain and release handles." width="100%">
+  <img src="assets/windows-envelope.png" alt="ChloeVibes for Windows: a large, color-coded envelope editor with draggable attack, decay, sustain and release handles." width="100%">
 </p>
 
 | **Find the feeling** | **Shape the response** | **Stay with the music** |
@@ -42,15 +42,17 @@ Start with one of **33 presets**, or press **FIND BOOM** on Windows to fit a res
 | :--- | :--- | :--- |
 | **Audio** | Follow Windows default or choose speakers/headphones; reconnect automatically | Choose system audio or microphone |
 | **Devices** | Supported vibration and oscillation devices through Buttplug / Intiface | Direct Lovense Bluetooth connection |
+| **Tempo** | Tap four beats or use automatic detection | Tap four beats or use automatic detection |
+| **Timing test** | Tone, sweep, Wet Floor Bass, Tile Room Throb, How Long You Last | Use a playback app as the audio source |
 | **Start simply** | Presets + FIND BOOM | Presets + Simple controls |
 | **Shape a pulse** | Drag the envelope; expand full tuning | Touch and drag the envelope; switch to Full controls |
 
-**New in 1.6.1:** direct envelope editing, steady layouts during reconnection, the platform-heel app icon, and a Windows capture/dispatch update that reduces avoidable waiting. Shared onset fixes also reach Android. [Release details](https://github.com/coldbricks/Chloe-Vibes/releases/tag/v1.6.1).
+**New in 1.6.2:** top-level **Tap Tempo** on Windows and Android; a Windows timing-test panel with selectable tones, a frequency sweep and three looped grooves; faster wakeup after silence, reinforced stop commands, and capture compatibility controls. [Release details](https://github.com/coldbricks/Chloe-Vibes/releases/tag/v1.6.2).
 
 <details>
 <summary>See the Android touch editor</summary>
 <p align="center">
-  <img src="assets/android-envelope.png" alt="Android envelope editor after dragging the decay and sustain corner, with Stop all always within reach." width="360">
+  <img src="assets/android-envelope.png" alt="Android Tap Tempo and touch envelope editor, with Stop all always within reach." width="360">
 </p>
 </details>
 
@@ -79,6 +81,6 @@ Use **Stop all devices** to end output. Both apps include stale-input handling a
 </p>
 
 <p align="center">
-  Built by <a href="https://github.com/coldbricks">Ash Airfoil</a>.<br>
+  Built by <a href="https://github.com/coldbricks">coldbricks</a>.<br>
   <sub>Native Rust + Kotlin · Local audio processing · For adult use</sub>
 </p>

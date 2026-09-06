@@ -108,6 +108,8 @@ class MainScreenState {
     // Preset
     var selectedPresetName by mutableStateOf("Bass Drum")
     var selectedCategory by mutableStateOf(PresetCategory.Init)
+    var manualTempoBpm by mutableFloatStateOf(0f)
+    var detectedBpm by mutableFloatStateOf(0f)
 
     // Input — bass-drum boom defaults
     var mainVolume by mutableFloatStateOf(1.90f)
@@ -225,6 +227,8 @@ fun MainScreen(
     onParameterChanged: () -> Unit
 ) {
     val scrollState = rememberScrollState()
+    val tapTempo = remember { com.ashairfoil.chloevibes.audio.TapTempo() }
+    var tapCount by remember { mutableIntStateOf(0) }
     var showClimaxOffConfirm by remember { mutableStateOf(false) }
     var expertOpen by rememberSaveable { mutableStateOf(false) }
     var climaxFineOpen by remember { mutableStateOf(false) }
@@ -269,6 +273,28 @@ fun MainScreen(
             Spacer(modifier = Modifier.height(12.dp))
 
             // Output meter + device status
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                Button(onClick = {
+                    tapTempo.tap(android.os.SystemClock.elapsedRealtime().toDouble())
+                    tapCount = tapTempo.count
+                    state.manualTempoBpm = tapTempo.bpm ?: 0f
+                    onParameterChanged()
+                }) { Text("TAP TEMPO", fontWeight = FontWeight.Bold) }
+                Text(
+                    when {
+                        state.manualTempoBpm > 0f -> "Manual %.1f BPM".format(state.manualTempoBpm)
+                        tapCount > 0 -> "Tap $tapCount/4"
+                        state.detectedBpm > 0f -> "Detected %.1f BPM".format(state.detectedBpm)
+                        else -> "Auto · listening"
+                    }, modifier = Modifier.weight(1f), color = ChloeColors.OnSurfaceDim, fontSize = 12.sp
+                )
+                TextButton(enabled = tapCount > 0 || state.manualTempoBpm > 0f, onClick = {
+                    tapTempo.reset(); tapCount = 0; state.manualTempoBpm = 0f; onParameterChanged()
+                }) { Text("Auto") }
+            }
+            Text("Tap four beats to guide prediction. Audio still triggers output.", color = ChloeColors.OnSurfaceDim, fontSize = 11.sp)
+            Spacer(modifier = Modifier.height(8.dp))
+
             OutputMeter(
                 output = state.currentOutput,
                 gateOpen = state.gateOpen,

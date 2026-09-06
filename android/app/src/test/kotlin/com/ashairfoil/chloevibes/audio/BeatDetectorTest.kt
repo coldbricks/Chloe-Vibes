@@ -5,6 +5,47 @@ import org.junit.jupiter.api.Test
 
 class BeatDetectorTest {
     @Test
+    fun `manual tempo requires real audio expires in silence and returns to auto`() {
+        val detector = BeatDetector()
+        detector.setManualTempo(125f)
+        assertNull(detector.takePrefire(950f))
+        assertTrue(detector.process(10f, 1000f).first)
+        assertEquals(480f, detector.tempoIntervalMs)
+        assertEquals(1480f, detector.predictedNextOnsetMs)
+        detector.setManualTempo(125f)
+        assertNotNull(detector.takePrefire(1430f))
+        assertNull(detector.takePrefire(1430f))
+        detector.advanceTime(2440f)
+        assertNull(detector.takePrefire(2440f))
+        assertEquals(0f, detector.tempoConfidence)
+        assertTrue(detector.process(10f, 2500f).first)
+        assertEquals(480f, detector.tempoIntervalMs)
+        detector.setManualTempo(null)
+        assertEquals(0f, detector.predictedNextOnsetMs)
+        for (now in listOf(3000f, 3500f, 4000f, 4500f)) assertTrue(detector.process(10f, now).first)
+        assertEquals(500f, detector.tempoIntervalMs)
+    }
+
+    @Test
+    fun `four taps reject bounce and jitter then restart after a pause`() {
+        val tap = TapTempo()
+        for (time in listOf(1000.0, 1480.0, 1500.0, 1965.0)) tap.tap(time)
+        assertEquals(3, tap.count)
+        assertNull(tap.bpm)
+        tap.tap(2440.0)
+        assertEquals(125f, tap.bpm)
+        tap.tap(Double.NaN)
+        assertEquals(125f, tap.bpm)
+        tap.tap(6000.0)
+        assertEquals(1, tap.count)
+        assertNull(tap.bpm)
+        for (time in listOf(6600.0, 7200.0, 7800.0)) tap.tap(time)
+        assertEquals(100f, tap.bpm)
+        tap.reset()
+        assertEquals(0, tap.count)
+        assertNull(tap.bpm)
+    }
+    @Test
     fun `confidence depends on elapsed time not polling frequency`() {
         val dense = lockedDetector()
         val sparse = lockedDetector()

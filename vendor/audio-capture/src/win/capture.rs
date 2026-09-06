@@ -150,6 +150,15 @@ impl AudioCapture {
             .or_else(|_| Self::init_with_mode(buffer_duration, device_id, false))
     }
 
+    /// Explicit compatibility mode: use a polling client and the requested
+    /// capacity. Automatic event mode lets Windows choose its own buffer.
+    pub fn init_for_device_polling(
+        buffer_duration: Duration,
+        device_id: Option<&str>,
+    ) -> Result<Self, WinError> {
+        Self::init_with_mode(buffer_duration, device_id, false)
+    }
+
     fn init_with_mode(
         buffer_duration: Duration,
         device_id: Option<&str>,

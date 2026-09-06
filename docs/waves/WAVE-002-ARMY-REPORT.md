@@ -70,13 +70,13 @@ Working tree vs `master` `365b53d`; full writeup at [`docs/waves/WAVE-002-VERIFY
 
 **files:**
 
-- `C:\Users\coldb\Chloe-Vibes\src\audio.rs`
-- `C:\Users\coldb\Chloe-Vibes\src\gui.rs`
-- `C:\Users\coldb\Chloe-Vibes\tests\parity_golden.csv`
-- `C:\Users\coldb\Chloe-Vibes\android\app\src\main\kotlin\com\ashairfoil\chloevibes\audio\EnvelopeProcessor.kt`
-- `C:\Users\coldb\Chloe-Vibes\android\app\src\main\kotlin\com\ashairfoil\chloevibes\audio\ClimaxEngine.kt`
-- `C:\Users\coldb\Chloe-Vibes\android\app\src\main\kotlin\com\ashairfoil\chloevibes\audio\BeatDetector.kt`
-- `C:\Users\coldb\Chloe-Vibes\android\app\src\main\kotlin\com\ashairfoil\chloevibes\audio\AudioCaptureManager.kt`
+- `src/audio.rs`
+- `src/gui.rs`
+- `tests/parity_golden.csv`
+- `android/app/src/main/kotlin/com/ashairfoil/chloevibes/audio/EnvelopeProcessor.kt`
+- `android/app/src/main/kotlin/com/ashairfoil/chloevibes/audio/ClimaxEngine.kt`
+- `android/app/src/main/kotlin/com/ashairfoil/chloevibes/audio/BeatDetector.kt`
+- `android/app/src/main/kotlin/com/ashairfoil/chloevibes/audio/AudioCaptureManager.kt`
 
 ---
 
@@ -110,10 +110,10 @@ Working tree vs `master` `365b53d`; full writeup at [`docs/waves/WAVE-002-VERIFY
 
 **files:**
 
-- `C:\Users\coldb\Chloe-Vibes\src\gui.rs`
-- `C:\Users\coldb\Chloe-Vibes\android\app\src\main\kotlin\com\ashairfoil\chloevibes\device\BleDeviceManager.kt`
-- `C:\Users\coldb\Chloe-Vibes\android\app\src\main\kotlin\com\ashairfoil\chloevibes\device\LovenseProtocol.kt`
-- `C:\Users\coldb\Chloe-Vibes\android\app\src\test\kotlin\com\ashairfoil\chloevibes\device\LovenseProtocolTest.kt`
+- `src/gui.rs`
+- `android/app/src/main/kotlin/com/ashairfoil/chloevibes/device/BleDeviceManager.kt`
+- `android/app/src/main/kotlin/com/ashairfoil/chloevibes/device/LovenseProtocol.kt`
+- `android/app/src/test/kotlin/com/ashairfoil/chloevibes/device/LovenseProtocolTest.kt`
 
 ---
 
@@ -127,11 +127,11 @@ Working tree vs `master` `365b53d`; full writeup at [`docs/waves/WAVE-002-VERIFY
 
 **files:**
 
-- `C:\Users\coldb\Chloe-Vibes\src\presets.rs`
-- `C:\Users\coldb\Chloe-Vibes\src\settings.rs`
-- `C:\Users\coldb\Chloe-Vibes\src\gui.rs`
-- `C:\Users\coldb\Chloe-Vibes\android\app\src\main\kotlin\com\ashairfoil\chloevibes\audio\Presets.kt`
-- `C:\Users\coldb\Chloe-Vibes\android\app\src\main\kotlin\com\ashairfoil\chloevibes\audio\AudioCaptureManager.kt`
+- `src/presets.rs`
+- `src/settings.rs`
+- `src/gui.rs`
+- `android/app/src/main/kotlin/com/ashairfoil/chloevibes/audio/Presets.kt`
+- `android/app/src/main/kotlin/com/ashairfoil/chloevibes/audio/AudioCaptureManager.kt`
 
 ---
 

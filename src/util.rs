@@ -48,7 +48,7 @@ macro_rules! log_stderr {
 pub type ClientConnectionResult = Result<ButtplugClient, Box<ButtplugClientError>>;
 
 pub const NO_CAPTURE_PACKET: u64 = u64::MAX;
-pub const CAPTURE_STALE_MS: u64 = 250;
+pub const CAPTURE_STALE_MS: u64 = 120;
 
 /// The GUI being alive is not evidence that the audio source is alive.
 pub fn capture_is_fresh(now_ms: u64, last_packet_ms: u64) -> bool {
@@ -431,8 +431,8 @@ mod tests {
     fn capture_health_requires_packets_even_if_the_ui_keeps_ticking() {
         assert!(!capture_is_fresh(0, NO_CAPTURE_PACKET));
         assert!(capture_is_fresh(1_000, 1_000));
-        assert!(capture_is_fresh(1_249, 1_000));
-        for now in [1_250, 1_500, 2_000, 20_000] {
+        assert!(capture_is_fresh(1_119, 1_000));
+        for now in [1_120, 1_500, 2_000, 20_000] {
             assert!(!capture_is_fresh(now, 1_000));
         }
         assert!(capture_is_fresh(20_001, 20_001));

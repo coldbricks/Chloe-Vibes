@@ -879,7 +879,7 @@ dependencies = [
 
 [[package]]
 name = "chloe-vibes"
-version = "1.6.1"
+version = "1.6.2"
 dependencies = [
  "audio-capture",
  "buttplug",
@@ -891,6 +891,7 @@ dependencies = [
  "rustfft",
  "serde",
  "tokio",
+ "winapi",
  "winresource",
 ]
 

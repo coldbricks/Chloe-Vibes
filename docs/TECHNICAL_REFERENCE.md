@@ -1,6 +1,6 @@
 # ChloeVibes — Technical Reference
 
-Software version **1.6.1**. Product overview and install: [root README](../README.md).
+Software version **1.6.2**. Product overview and install: [root README](../README.md).
 
 This document is the long-form engineering reference (signal chain, protocols, parity, limitations, CI).
 
@@ -17,7 +17,7 @@ This document is the long-form engineering reference (signal chain, protocols, p
 | Spectral resolution | 2048-point FFT, 1024 usable bins, 23.4 Hz per bin at 48 kHz |
 | Output interface | Lovense BLE UART services; Buttplug 9.0.9 client on desktop |
 | Output resolution | Normalized DSP output; Lovense BLE commands use integer intensity 0 to 20 |
-| Software version | 1.6.1 |
+| Software version | 1.6.2 |
 | License | MIT |
 
 ---
@@ -265,8 +265,8 @@ Desktop dispatch compares the final requested values for every vibration and osc
 | Output resolution | Lovense 0–20 integer |
 | Command pacing | Desktop loop: at most 50 Hz; Android ordinary BLE writes: at least 28 ms apart (~36 Hz), stop writes: 12 ms |
 | Desktop stack | Rust, eframe/egui 0.33.3, Buttplug 9.0.9 |
-| Desktop package | `chloe-vibes` 1.6.1 |
-| Android stack | `com.ashairfoil.chloevibes` 1.6.1 (versionCode 8) |
+| Desktop package | `chloe-vibes` 1.6.2 |
+| Android stack | `com.ashairfoil.chloevibes` 1.6.2 (versionCode 9) |
 | Android SDK | Minimum API 26 (Android 8.0); target / compile API 35 |
 | Stop behavior | Both clients: 2 s pipeline watchdog; desktop: panic-stop and stop-error feedback; Android: stop latch |
 | License | MIT |
@@ -349,3 +349,10 @@ Published Android APKs use the project's preserved signing identity. For a given
 
 1. Signal-chain order is invariant on both clients.
 2. Engines are one specification in two implementations — change both; parity enforces it.
+
+
+## Tap Tempo (Windows and Android)
+
+Tap **TAP TEMPO** four times to set a session-only manual tempo. The median of recent tap intervals rejects timing jitter and accidental double taps. **Manual** labels the selected BPM; **Auto** clears it and returns to detected tempo. Starting a new tap sequence after a pause clears the old sequence.
+
+Manual tempo guides predictive onset spacing. It does not generate a free-running motor pattern: a real audio onset must establish phase, the input gate remains in force, and prediction expires when real onsets stop. Presets, ADSR, gain and device enable state are unchanged. Windows original RMS mode does not use beat prediction.

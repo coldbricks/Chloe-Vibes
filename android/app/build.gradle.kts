@@ -12,8 +12,8 @@ android {
         applicationId = "com.ashairfoil.chloevibes"
         minSdk = 26
         targetSdk = 35
-        versionCode = 8
-        versionName = "1.6.1"
+        versionCode = 9
+        versionName = "1.6.2"
     }
 
     buildTypes {

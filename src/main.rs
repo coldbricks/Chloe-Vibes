@@ -10,6 +10,8 @@ mod device_dispatch;
 mod gui;
 mod presets;
 mod settings;
+mod tap_tempo;
+mod timing_test;
 mod util;
 
 use clap::Parser;

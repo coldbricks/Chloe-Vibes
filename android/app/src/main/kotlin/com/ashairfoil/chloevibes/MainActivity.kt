@@ -47,12 +47,14 @@ class MainActivity : ComponentActivity() {
             if (audioCaptureManager.isRunning) {
                 val state = audioCaptureManager.state
                 uiState.currentOutput = state.lastFinalOutput
+                uiState.detectedBpm = if (state.beatDetector.tempoConfidence > 0.6f && state.beatDetector.tempoIntervalMs > 0f) 60_000f / state.beatDetector.tempoIntervalMs else 0f
                 uiState.gateOpen = state.lastGateOpen
                 uiState.envelopeState = state.lastEnvelopeState
                 uiState.bandEnergies = state.lastSpectralData.bandEnergies.copyOf()
                 uiState.climaxPhase = state.lastClimaxPhase
             } else {
                 uiState.currentOutput = 0f
+                uiState.detectedBpm = 0f
                 uiState.climaxPhase = 0f
             }
             handler.postDelayed(this, 33) // ~30Hz UI updates
@@ -258,6 +260,7 @@ class MainActivity : ComponentActivity() {
     /** Push all UI parameter values into the AudioCaptureManager. */
     private fun syncParamsToCapture() {
         audioCaptureManager.apply {
+            manualTempoBpm = uiState.manualTempoBpm
             mainVolume = uiState.mainVolume
             frequencyMode = uiState.frequencyMode
             targetFrequency = uiState.targetFrequency

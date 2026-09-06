@@ -59,6 +59,7 @@ pub struct Settings {
     /// None follows the current Windows playback default, including device changes.
     pub audio_source_id: Option<String>,
     pub polling_rate_ms: SharedF32,
+    pub capture_buffer_ms: SharedF32,
     pub use_polling_rate: Arc<AtomicBool>,
     pub device_settings: HashMap<String, DeviceSettings>,
     pub save_device_settings: bool,
@@ -370,6 +371,12 @@ impl Settings {
             20_000.0,
             defaults::LOW_PASS_FREQ,
         ));
+        self.capture_buffer_ms.store(finite_range(
+            self.capture_buffer_ms.load(),
+            10.0,
+            200.0,
+            80.0,
+        ));
         self.polling_rate_ms.store(finite_range(
             self.polling_rate_ms.load(),
             1.0,
@@ -538,6 +545,7 @@ impl Default for Settings {
             start_scanning_on_startup: defaults::START_SCANNING_ON_STARTUP,
             audio_source_id: None,
             polling_rate_ms: SharedF32::new(defaults::POLLING_RATE_MS),
+            capture_buffer_ms: SharedF32::new(80.0),
             use_polling_rate: Arc::new(AtomicBool::new(defaults::USE_POLLING_RATE)),
             device_settings: HashMap::new(),
             save_device_settings: false,
@@ -694,6 +702,9 @@ impl Settings {
             start_scanning_on_startup,
             audio_source_id,
             polling_rate_ms: SharedF32::new(polling_rate_ms),
+            capture_buffer_ms: SharedF32::new(
+                get_value(storage, "capture_buffer_ms").unwrap_or(80.0),
+            ),
             use_polling_rate: Arc::new(AtomicBool::new(use_polling_rate)),
             device_settings,
             save_device_settings,
@@ -754,6 +765,7 @@ impl Settings {
             names::POLLING_RATE_MS,
             &self.polling_rate_ms.load(),
         );
+        set_value(storage, "capture_buffer_ms", &self.capture_buffer_ms.load());
         set_value(
             storage,
             names::USE_POLLING_RATE,

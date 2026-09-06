@@ -1094,6 +1094,7 @@ pub struct BeatDetector {
     pending_prefire: Option<(f32, f32)>,
     played_prefire_ms: Option<f32>,
     matched_prefire_onset_ms: Option<f32>,
+    manual_interval_ms: Option<f32>,
 }
 
 impl BeatDetector {
@@ -1119,6 +1120,18 @@ impl BeatDetector {
             pending_prefire: None,
             played_prefire_ms: None,
             matched_prefire_onset_ms: None,
+            manual_interval_ms: None,
+        }
+    }
+
+    /// Tempo hint only: a real onset must anchor phase before prediction can run.
+    pub fn set_manual_tempo(&mut self, bpm: Option<f32>) {
+        let interval = bpm
+            .filter(|v| v.is_finite() && (30.0..=300.0).contains(v))
+            .map(|v| 60_000.0 / v);
+        if interval != self.manual_interval_ms {
+            self.clear_tempo_lock();
+            self.manual_interval_ms = interval;
         }
     }
 
@@ -1184,7 +1197,12 @@ impl BeatDetector {
             }
 
             // Update tempo prediction after accumulating enough onsets
-            if self.onset_ts_count >= 4 {
+            if let Some(interval) = self.manual_interval_ms {
+                self.tempo_interval_ms = interval;
+                self.tempo_confidence = 1.0;
+                self.tempo_confidence_at_onset = 1.0;
+                self.predicted_next_onset_ms = current_time_ms + interval;
+            } else if self.onset_ts_count >= 4 {
                 self.update_tempo_prediction(current_time_ms);
             }
         } else {
@@ -1822,6 +1840,32 @@ pub fn map_output(shaped: f32, min_vibe: f32, max_vibe: f32, gain: f32, is_silen
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manual_tempo_requires_real_audio_expires_in_silence_and_can_return_to_auto() {
+        let mut detector = BeatDetector::new();
+        detector.set_manual_tempo(Some(125.0));
+        assert!(detector.take_prefire(950.0).is_none());
+        assert!(detector.process(10.0, 1000.0).0);
+        assert_eq!(detector.tempo_interval_ms, 480.0);
+        assert_eq!(detector.predicted_next_onset_ms, 1480.0);
+        detector.set_manual_tempo(Some(125.0)); // unchanged UI snapshot must not reset phase
+        assert!(detector.take_prefire(1430.0).is_some());
+        assert!(detector.take_prefire(1430.0).is_none());
+        detector.advance_time(2440.0);
+        assert!(detector.take_prefire(2440.0).is_none());
+        assert_eq!(detector.tempo_confidence, 0.0);
+        assert!(detector.process(10.0, 2500.0).0);
+        assert_eq!(detector.tempo_interval_ms, 480.0);
+        detector.set_manual_tempo(None);
+        assert_eq!(detector.predicted_next_onset_ms, 0.0);
+        for now in [3000.0, 3500.0, 4000.0, 4500.0] {
+            assert!(detector.process(10.0, now).0);
+        }
+        assert_eq!(detector.tempo_interval_ms, 500.0);
+        detector.set_manual_tempo(Some(f32::NAN));
+        assert!(detector.tempo_interval_ms.is_finite());
+    }
 
     #[test]
     fn output_ceiling_binds_after_gain_and_invalid_input_stops() {

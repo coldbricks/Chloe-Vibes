@@ -32,11 +32,45 @@ Bluetooth headphones add delay to what you hear. That may change perceived align
 
 ## Capture and output behavior
 
+Automatic capture uses event wakeups with 1 ms fallback checks. In Settings,
+enable **Compatibility: fixed polling interval** to select a polling interval
+and buffer capacity. This changes polling, not the endpoint's sample rate.
+Native-rate capture avoids app resampling; status reports the negotiated format,
+buffer capacity and default engine period. These are not measured motor latency.
+
+Near-digital silence lasting 40 ms stops software output independently of ADSR
+release or gate smoothing. Missing packets become stale after 120 ms. During
+quiet input the device path reinforces stop commands three times, 100 ms apart,
+and continues retrying failures. Fresh output wakes the idle loop immediately
+instead of waiting through the former 250 ms sleep. Driver and device transport
+latency can still extend physical response time.
+
 ChloeVibes prefers event-driven WASAPI capture and registers its capture thread with Windows' multimedia audio scheduler. If those facilities are unavailable, it falls back to bounded polling and normal thread scheduling. Analysis uses exact sample-count hops, independent of how Windows divides packets.
 
 Device commands wake when a new output is available. Each device retains a maximum of 50 normal output batches per second and one batch in flight. Obsolete output is replaced by the newest value, and failed commands are retried. Audio-device changes discard previous analysis and prevent old-source output from being reused.
 
 Code signing and the application icon do not change audio or Bluetooth timing.
+
+## Tap Tempo and timing tests
+
+Tap **TAP TEMPO** four times near the top of the app. **Manual** shows the selected
+BPM; **Auto** clears the tap sequence and returns to detected tempo. Taps guide
+prediction in the advanced engine, while real audio anchors each prediction.
+They never start playback, enable a device, change a preset/gate, or generate
+standalone motor pulses. The original RMS algorithm does not use tempo hints.
+
+Open **Timing test** to choose a tone, a 40–400 Hz sweep, or a four-bar groove:
+**Wet Floor Bass**, **Tile Room Throb**, or **How Long You Last**. Play once plays
+one excerpt; Loop repeats for up to 60 seconds. Stop audio, closing the panel,
+changing the audio route, or Stop all devices ends the test. The embedded groove
+clips need no separate music files.
+
+Test audio passes through the selected playback endpoint and ordinary capture,
+frequency focus, gate and device controls. Choose a tone within the selected
+frequency range and adjust its audio level if it does not pass the gate. The
+test preserves presets, gates and device limits. Its meter reports software
+output, not physical motor motion. Added haptic delay should remain zero unless
+the vibration arrives before the sound; it cannot make a late motor arrive sooner.
 
 For source and visualization diagnostics without connecting to a server or
 scanning for toys, launch `chloe-vibes.exe --audio-only`. This mode lasts for

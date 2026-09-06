@@ -116,6 +116,8 @@ data class ProcessingParams(
  * (AudioRecord), and runs the signal processing loop.
  */
 class AudioCaptureManager(private val context: Context) {
+    // Session control, intentionally separate from presets and persisted parameters.
+    @Volatile var manualTempoBpm: Float = 0f
 
     // Processing state (thread-safe via volatile fields)
     val state = ProcessingState()
@@ -715,6 +717,7 @@ class AudioCaptureManager(private val context: Context) {
             state.lastGateOpen = gateOpen
 
             // Step 4: Beat detection
+            state.beatDetector.setManualTempo(manualTempoBpm.takeIf { it > 0f })
             val (detectedOnset, onsetStrength) = if (freshCapture) {
                 state.beatDetector.process(spectralData.spectralFlux, currentTimeMs)
             } else {

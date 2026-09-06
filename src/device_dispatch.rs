@@ -4,6 +4,34 @@ use std::time::Duration;
 
 pub const DEVICE_UPDATE_INTERVAL: Duration = Duration::from_millis(20);
 
+/// A transport acknowledgment does not prove that a motor stopped. Repeat
+/// a quiet-input stop three times, without flooding BLE or delaying resume.
+pub struct QuietStopSchedule {
+    remaining: u8,
+    next_at: Duration,
+}
+
+impl Default for QuietStopSchedule {
+    fn default() -> Self {
+        Self {
+            remaining: 3,
+            next_at: Duration::ZERO,
+        }
+    }
+}
+
+impl QuietStopSchedule {
+    pub fn due(&self, now: Duration, unacknowledged: bool) -> bool {
+        (self.remaining > 0 || unacknowledged) && now >= self.next_at
+    }
+    pub fn attempted(&mut self, now: Duration, success: bool) {
+        if success {
+            self.remaining = self.remaining.saturating_sub(1);
+        }
+        self.next_at = now + Duration::from_millis(100);
+    }
+}
+
 /// Output carries the capture generation that produced it. A fresh heartbeat
 /// from a replacement source must never authorize an older GUI frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -126,6 +154,21 @@ impl DeviceDispatchState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quiet_stops_are_reinforced_and_failures_remain_retryable() {
+        let mut stop = QuietStopSchedule::default();
+        for ms in [0, 100, 200] {
+            assert!(stop.due(Duration::from_millis(ms), false));
+            stop.attempted(Duration::from_millis(ms), true);
+            assert!(!stop.due(Duration::from_millis(ms + 1), false));
+        }
+        assert!(!stop.due(Duration::from_secs(1), false));
+        assert!(stop.due(Duration::from_secs(1), true));
+        stop.attempted(Duration::from_secs(1), false);
+        assert!(stop.due(Duration::from_millis(1100), true));
+        assert!(QuietStopSchedule::default().due(Duration::ZERO, false));
+    }
 
     fn output(primary: f64, secondary: f64) -> DeviceOutput {
         DeviceOutput {

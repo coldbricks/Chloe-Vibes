@@ -43,10 +43,10 @@ use crate::{
     },
     audio_source::{AudioSource, AudioSources},
     auto_lock::{AutoLock, AutoLockState},
-    capture_frames::CaptureFrames,
+    capture_frames::{CaptureActivity, CaptureFrames},
     device_dispatch::{
         actuator_output, DeviceDispatchSchedule, DeviceDispatchState, DeviceOutput, OutputFrame,
-        DEVICE_UPDATE_INTERVAL,
+        QuietStopSchedule, DEVICE_UPDATE_INTERVAL,
     },
     presets::{self, PresetCategory},
     settings::{defaults, DeviceSettings, OscillatorSettings, Settings, VibratorSettings},
@@ -431,6 +431,7 @@ struct GuiApp {
     // it goes stale (dead-man watchdog).
     pipeline_heartbeat: Arc<AtomicU64>,
     capture_heartbeat: Arc<AtomicU64>,
+    capture_active: Arc<AtomicBool>,
     // Definitive result of the last scan start/stop op.
     scan_result: Arc<Mutex<Option<ScanOpResult>>>,
     // True while a scan start/stop op is in flight (button disabled).
@@ -449,6 +450,9 @@ struct GuiApp {
     use_advanced_shared: Arc<AtomicBool>,
     is_scanning: bool,
     show_settings: bool,
+    show_timing_test: bool,
+    timing_test: crate::timing_test::TimingTest,
+    tap_tempo: crate::tap_tempo::TapTempo,
 
     // Processing state
     vibration_level: f32,
@@ -622,6 +626,7 @@ fn panic_stop_devices() {
 // (subsystem windows) looks like a silent "app just vanished" crash.
 impl Drop for GuiApp {
     fn drop(&mut self) {
+        self.timing_test.stop();
         // Stop command producers before the final stop RPC, otherwise a live
         // dispatch task can re-arm a motor while shutdown is awaiting its reply.
         self.processed_output.send_replace(OutputFrame::stopped(
@@ -664,6 +669,7 @@ fn capture_thread(
     spectral_shared: SharedSpectralData,
     low_pass_freq: SharedF32,
     polling_rate_ms: SharedF32,
+    capture_buffer_ms: SharedF32,
     use_polling_rate: Arc<AtomicBool>,
     use_advanced: Arc<AtomicBool>,
     capture_status: Arc<Mutex<String>>,
@@ -671,15 +677,16 @@ fn capture_thread(
     audio_sources: Arc<Mutex<AudioSources>>,
     audio_source_selection: Arc<Mutex<Option<String>>>,
     capture_epoch: Arc<AtomicU64>,
+    capture_active: Arc<AtomicBool>,
+    repaint: egui::Context,
+    output: tokio::sync::watch::Sender<OutputFrame>,
 ) -> ! {
-    // WASAPI loopback buffer. Duration::ZERO made the third-party crate
-    // unwrap-panic on Initialize (WinError 0x88890008 / unsupported format)
-    // on some devices — looked like "app dies while scanning for the toy".
-    const CAPTURE_BUFFER: Duration = Duration::from_millis(80);
-
     loop {
+        capture_active.store(false, Ordering::Release);
         capture_heartbeat.store(util::NO_CAPTURE_PACKET, Ordering::Relaxed);
-        capture_epoch.fetch_add(1, Ordering::Relaxed);
+        let epoch = capture_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        output.send_replace(OutputFrame::stopped(epoch));
+        repaint.request_repaint();
         sound_power.store(0.0);
         spectral_shared.store(SpectralData::default());
         set_capture_status(&capture_status, "audio: initializing");
@@ -697,10 +704,17 @@ fn capture_thread(
         let source_id = source.id.clone();
         let source_name = source.name.clone();
 
-        // This audio-capture crate unwraps WinErrors (panics) on init/read.
+        let requested_polling = use_polling_rate.load(Ordering::Relaxed);
+        let requested_buffer = capture_buffer_ms.load().clamp(10.0, 200.0);
+        let buffer_request = Duration::from_secs_f32(requested_buffer / 1000.0);
+        // Recover from driver initialization failures without taking down the UI.
         // Catch so the UI + BLE stay alive; we just retry audio.
         let mut capture = match std::panic::catch_unwind(|| {
-            AudioCapture::init_for_device(CAPTURE_BUFFER, Some(&source_id))
+            if requested_polling {
+                AudioCapture::init_for_device_polling(buffer_request, Some(&source_id))
+            } else {
+                AudioCapture::init_for_device(buffer_request, Some(&source_id))
+            }
         }) {
             Ok(Ok(capture)) => capture,
             Ok(Err(e)) => {
@@ -740,8 +754,9 @@ fn capture_thread(
         // enough to publish each 1024-frame analysis hop instead of waiting
         // half an 80ms buffer and merging distinct transients.
         let engine_period = capture.device_period().unwrap_or(Duration::from_millis(10));
-        let default_poll =
-            (engine_period / 2).clamp(Duration::from_millis(2), Duration::from_millis(5));
+        // Events wake immediately; a 1 ms timeout also covers drivers that
+        // accept event mode but do not reliably signal loopback events.
+        let default_poll = Duration::from_millis(1);
         let sample_dt = Duration::from_secs_f32(1.0 / sample_rate);
 
         // Buffer large enough for FFT analysis.
@@ -765,6 +780,20 @@ fn capture_thread(
         let mut last_packet_time = Instant::now();
         let mut last_source_check = Instant::now();
         let mut starved = false;
+        let mut activity = CaptureActivity::new(format.sample_rate, channels);
+        let capture_details = format!(
+            "{} · {} Hz / {} ch · {} · buffer {:.1} ms / default period {:.1} ms",
+            source_name,
+            format.sample_rate,
+            format.channels,
+            if capture.is_event_driven() {
+                "event-driven"
+            } else {
+                "polling fallback"
+            },
+            capture.buffer_frame_size as f32 * 1000.0 / sample_rate,
+            engine_period.as_secs_f32() * 1000.0
+        );
 
         if let Err(e) = capture.start() {
             crate::log_stderr!("Audio start failed: {e}");
@@ -775,18 +804,17 @@ fn capture_thread(
             continue;
         }
 
-        set_capture_status(
-            &capture_status,
-            format!(
-                "{} · {} Hz / {} ch",
-                source_name, format.sample_rate, format.channels
-            ),
-        );
+        set_capture_status(&capture_status, &capture_details);
 
         loop {
             let use_custom = use_polling_rate.load(Ordering::Relaxed);
+            if use_custom != requested_polling
+                || capture_buffer_ms.load().clamp(10.0, 200.0) != requested_buffer
+            {
+                break;
+            }
             let sleep_duration = if use_custom {
-                Duration::from_millis(polling_rate_ms.load().max(1.0) as u64)
+                Duration::from_millis(polling_rate_ms.load().clamp(1.0, 100.0) as u64)
             } else {
                 default_poll
             };
@@ -844,6 +872,20 @@ fn capture_thread(
                         spectral_shared.store(SpectralData::default());
                         capture_epoch.fetch_add(1, Ordering::Relaxed);
                     }
+                    let was_active = capture_active.load(Ordering::Acquire);
+                    let active = activity.push(samples);
+                    if active != was_active {
+                        capture_active.store(false, Ordering::Release);
+                        let epoch = capture_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+                        output.send_replace(OutputFrame::stopped(epoch));
+                        buf.clear();
+                        analysis_frames.clear();
+                        analyzer = SpectralAnalyzer::new(sample_rate);
+                        spectral_shared.store(SpectralData::default());
+                        sound_power.store(0.0);
+                        repaint.request_repaint();
+                    }
+                    capture_active.store(active, Ordering::Release);
                     buf.extend(samples.iter().copied());
                     frames_read_this_tick += samples.len() / channels;
                     let len = buf.len();
@@ -852,6 +894,7 @@ fn capture_thread(
                     }
                     analysis_frames.push(samples, |window, _frame_end| {
                         spectral_shared.store(analyzer.analyze(window, channels));
+                        repaint.request_repaint();
                     });
                     Ok(())
                 })
@@ -888,6 +931,11 @@ fn capture_thread(
                     sound_power.store(0.0);
                     if !starved {
                         starved = true;
+                        capture_active.store(false, Ordering::Release);
+                        output.send_replace(OutputFrame::stopped(
+                            capture_epoch.load(Ordering::Acquire),
+                        ));
+                        repaint.request_repaint();
                         // Resuming the same stream must not authorize output
                         // produced before this gap while the UI catches up.
                         capture_epoch.fetch_add(1, Ordering::Relaxed);
@@ -948,15 +996,19 @@ fn capture_thread(
                     sanitize_unit((sum_sq / samples.len() as f32).sqrt())
                 };
                 sound_power.store(low_pass_rms.max(raw_rms));
+            } else {
+                // Do not reuse a legacy RMS level after changing algorithms.
+                sound_power.store(0.0);
             }
 
             if last_status_time.elapsed() >= Duration::from_secs(1) {
                 set_capture_status(
                     &capture_status,
-                    format!(
-                        "{} · {} Hz / {} ch",
-                        source_name, format.sample_rate, format.channels
-                    ),
+                    if capture_active.load(Ordering::Acquire) {
+                        capture_details.clone()
+                    } else {
+                        format!("{} · silence — output stopped", capture_details)
+                    },
                 );
                 last_status_time = Instant::now();
             }
@@ -1142,9 +1194,14 @@ impl GuiApp {
         }
         let low_pass_freq = settings.low_pass_freq.clone();
         let polling_rate_ms = settings.polling_rate_ms.clone();
+        let capture_buffer_ms = settings.capture_buffer_ms.clone();
         let use_polling_rate = settings.use_polling_rate.clone();
         let use_advanced_shared = Arc::new(AtomicBool::new(settings.use_advanced_processing));
         let use_advanced_capture = use_advanced_shared.clone();
+        let capture_active = Arc::new(AtomicBool::new(false));
+        let capture_active2 = capture_active.clone();
+        let capture_repaint = ctx.egui_ctx.clone();
+        let capture_output = processed_output.clone();
 
         // Named so the panic-stop hook can recognize this thread's RECOVERED
         // panics (capture init is wrapped in catch_unwind + retry) and not
@@ -1157,6 +1214,7 @@ impl GuiApp {
                     spectral_data2,
                     low_pass_freq,
                     polling_rate_ms,
+                    capture_buffer_ms,
                     use_polling_rate,
                     use_advanced_capture,
                     capture_status2,
@@ -1164,6 +1222,9 @@ impl GuiApp {
                     audio_sources2,
                     audio_source_selection2,
                     capture_epoch2,
+                    capture_active2,
+                    capture_repaint,
+                    capture_output,
                 )
             })
             .expect("failed to spawn audio capture thread");
@@ -1203,6 +1264,7 @@ impl GuiApp {
             recent_disconnects: HashMap::new(),
             pipeline_heartbeat,
             capture_heartbeat,
+            capture_active,
             scan_result: Arc::new(Mutex::new(None)),
             scan_op_in_flight: Arc::new(AtomicBool::new(false)),
             stop_all_error: Arc::new(Mutex::new(None)),
@@ -1213,6 +1275,9 @@ impl GuiApp {
             use_advanced_shared,
             is_scanning: false,
             show_settings: false,
+            show_timing_test: false,
+            timing_test: crate::timing_test::TimingTest::default(),
+            tap_tempo: crate::tap_tempo::TapTempo::default(),
             settings,
             vibration_level: 0.0,
             motor2_level: 0.0,
@@ -1554,6 +1619,9 @@ impl eframe::App for GuiApp {
                 if ui.button("Settings").clicked() {
                     self.show_settings = true;
                 }
+                if ui.button("Timing test").clicked() {
+                    self.show_timing_test = true;
+                }
 
                 // FIND BOOM: listen → max-dynamic bass-drum sweet spot.
                 // Advanced pipeline only. After lock, tweak any slider —
@@ -1599,6 +1667,7 @@ impl eframe::App for GuiApp {
                 )
                 .fill(Color32::from_rgb(240, 0, 0));
                 if ui.add_sized([stop_w, 30.0], stop_btn).clicked() {
+                    self.timing_test.stop();
                     if let Some(client) = &self.client {
                         // Verified stop: the result is checked and a failure is
                         // shown in red. Disabling every device also makes the
@@ -1620,6 +1689,24 @@ impl eframe::App for GuiApp {
                         }
                     }
                 }
+            });
+
+            ui.horizontal_wrapped(|ui| {
+                if ui.add_enabled(self.settings.use_advanced_processing, Button::new(RichText::new("TAP TEMPO").strong().color(Color32::WHITE)).fill(Color32::from_rgb(100, 45, 140)).min_size(vec2(94.0, 30.0)))
+                    .on_hover_text("Tap four beats to guide prediction. Real audio still triggers output; presets and gates are unchanged.").clicked() {
+                    self.tap_tempo.tap(ctx.input(|i| i.time) * 1000.0);
+                }
+                let tempo_text = if !self.settings.use_advanced_processing {
+                    "Advanced mode only".into()
+                } else if let Some(bpm) = self.tap_tempo.bpm {
+                    format!("Manual {bpm:.1} BPM")
+                } else if self.tap_tempo.count() > 0 {
+                    format!("Tap {}/4", self.tap_tempo.count())
+                } else if self.beat_detector.tempo_confidence > 0.6 && self.beat_detector.tempo_interval_ms > 0.0 {
+                    format!("Detected {:.1} BPM", 60_000.0 / self.beat_detector.tempo_interval_ms)
+                } else { "Auto · listening".into() };
+                ui.label(tempo_text);
+                if ui.add_enabled(self.tap_tempo.count() > 0, Button::new("Auto")).clicked() { self.tap_tempo.reset(); }
             });
 
             let (connection_message, connection_color) = match &self.connection_state {
@@ -1679,7 +1766,7 @@ impl eframe::App for GuiApp {
             let capture_fresh = util::capture_is_fresh(
                 app_now_ms(), self.capture_heartbeat.load(Ordering::Relaxed),
             );
-            if !capture_fresh {
+            if !capture_fresh || !self.capture_active.load(Ordering::Acquire) {
                 self.reset_audio_response();
                 if self.settings.use_advanced_processing {
                     self.auto_lock.tick(current_time_ms, &self.last_spectral,
@@ -1687,6 +1774,7 @@ impl eframe::App for GuiApp {
                 }
             } else if self.settings.use_advanced_processing {
                 // ====== NEW PIPELINE (ChloeVibes-derived) ======
+                self.beat_detector.set_manual_tempo(self.tap_tempo.bpm);
 
                 // 1. Read spectral data from capture thread
                 let spectral_frame = self.spectral_data.load_frame();
@@ -2026,7 +2114,7 @@ impl eframe::App for GuiApp {
             let is_silent = self.raw_energy < 0.005
                 && !self.gate_is_open
                 && self.envelope.state == audio::EnvelopeState::Idle;
-            let m2_silence = !capture_fresh || is_silent
+            let m2_silence = !capture_fresh || !self.capture_active.load(Ordering::Acquire) || is_silent
                 || self.envelope.silence_event
                 || self.climax_engine.silence_event;
             let motor2_target = if m2_silence {
@@ -2573,7 +2661,7 @@ impl eframe::App for GuiApp {
                         );
                         let mut rate = self.settings.polling_rate_ms.load();
                         let slider = ui.add(
-                            Slider::new(&mut rate, 1.0..=500.0)
+                            Slider::new(&mut rate, 1.0..=100.0)
                                 .integer()
                                 .logarithmic(true),
                         );
@@ -3369,11 +3457,13 @@ impl eframe::App for GuiApp {
                             let heartbeat = self.pipeline_heartbeat.clone();
                             let capture_heartbeat = self.capture_heartbeat.clone();
                             let capture_epoch = self.capture_epoch.clone();
+                            let capture_active = self.capture_active.clone();
                             async move {
                                 let mut dispatch = DeviceDispatchState::default();
                                 let mut schedule = DeviceDispatchSchedule::default();
                                 let schedule_clock = tokio::time::Instant::now();
                                 let mut consecutive_errors: u32 = 0;
+                                let mut quiet_stops = QuietStopSchedule::default();
 
                                 loop {
                                     // Dead-man watchdog: if the pipeline stops
@@ -3384,29 +3474,35 @@ impl eframe::App for GuiApp {
                                     let heartbeat_age = app_now_ms()
                                         .saturating_sub(heartbeat.load(Ordering::Relaxed));
                                     if heartbeat_age > WATCHDOG_TIMEOUT_MS
+                                        || !capture_active.load(Ordering::Acquire)
                                         || !util::capture_is_fresh(app_now_ms(), capture_heartbeat.load(Ordering::Relaxed))
                                     {
-                                        if dispatch.needs_stop() {
+                                        if quiet_stops.due(schedule_clock.elapsed(), dispatch.needs_stop()) {
                                             crate::log_stderr!(
-                                                "Pipeline heartbeat stale ({heartbeat_age}ms); stopping device"
+                                                "Audio quiet or pipeline stale ({heartbeat_age}ms); stopping device"
                                             );
                                             // Only mark stopped on SUCCESS —
                                             // a failed stop must be retried
-                                            // on the next 250ms pass, not
+                                            // on a subsequent paced attempt, not
                                             // forgotten while the motor runs.
                                             match tokio::time::timeout(Duration::from_millis(500), bp_device.stop()).await {
                                                 Ok(Ok(_)) => {
                                                     dispatch.confirm_stop();
+                                                    quiet_stops.attempted(schedule_clock.elapsed(), true);
                                                 }
-                                                result => crate::log_stderr!(
-                                                    "Watchdog stop failed (will retry): {result:?}"
-                                                ),
+                                                result => {
+                                                    quiet_stops.attempted(schedule_clock.elapsed(), false);
+                                                    crate::log_stderr!("Watchdog stop failed (will retry): {result:?}");
+                                                },
                                             }
                                         }
-                                        tokio::time::sleep(Duration::from_millis(250)).await;
+                                        // Resume on fresh output, without the old 250 ms
+                                        // sleep that could swallow the first beat after idle.
+                                        if matches!(tokio::time::timeout(DEVICE_UPDATE_INTERVAL, processed.changed()).await, Ok(Err(_))) { break; }
                                         continue;
                                     }
 
+                                    quiet_stops = QuietStopSchedule::default();
                                     let output_frame = *processed.borrow_and_update();
                                     let [vibration_level, vibration_level_2] = output_frame
                                         .levels_for_epoch(capture_epoch.load(Ordering::Relaxed));
@@ -3529,6 +3625,21 @@ impl eframe::App for GuiApp {
         });
 
         settings_window_widget(ctx, &mut self.show_settings, &mut self.settings);
+        let sources = self
+            .audio_sources
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let source = sources.resolve(self.settings.audio_source_id.as_deref());
+        self.timing_test.check_route(source);
+        self.timing_test.show(
+            ctx,
+            &mut self.show_timing_test,
+            source,
+            &mut self.settings,
+            self.vibration_level,
+            self.capture_active.load(Ordering::Acquire),
+        );
         ctx.request_repaint_after(Duration::from_millis(16));
     }
 }
@@ -3967,9 +4078,10 @@ fn settings_window_widget(ctx: &egui::Context, show_settings: &mut bool, setting
                 "Remember device settings",
             );
 
+            ui.label("Automatic fast capture is the default: event wakeups + 1 ms fallback checks.");
             let mut current_value = settings.use_polling_rate.load(Ordering::Relaxed);
             if ui
-                .checkbox(&mut current_value, "Use fixed polling rate")
+                .checkbox(&mut current_value, "Compatibility: fixed polling interval")
                 .changed()
             {
                 settings
@@ -3978,6 +4090,15 @@ fn settings_window_widget(ctx: &egui::Context, show_settings: &mut bool, setting
             }
 
             ui.separator();
+
+            ui.add_enabled_ui(current_value, |ui| {
+                let mut poll = settings.polling_rate_ms.load();
+                if ui.add(Slider::new(&mut poll, 1.0..=100.0).text("Polling interval (ms)")).changed() { settings.polling_rate_ms.store(poll); }
+                let mut buffer = settings.capture_buffer_ms.load();
+                if ui.add(Slider::new(&mut buffer, 10.0..=200.0).text("Compatibility buffer (ms)")).changed() { settings.capture_buffer_ms.store(buffer); }
+            });
+            ui.label("Fixed polling is not sample rate. Native-rate capture avoids app resampling.");
+            ui.label("Automatic mode lets Windows choose the buffer; actual values appear in audio status.");
 
             // Pipeline toggle
             ui.checkbox(

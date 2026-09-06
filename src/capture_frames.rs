@@ -2,6 +2,41 @@
 
 use std::collections::VecDeque;
 
+/// Independent of presets, gain, gate smoothing and ADSR release. A quiet
+/// packet is still a fresh packet; freshness alone cannot authorize a motor.
+pub struct CaptureActivity {
+    quiet_frames: usize,
+    quiet_limit: usize,
+    channels: usize,
+    active: bool,
+}
+
+impl CaptureActivity {
+    pub fn new(sample_rate: u32, channels: usize) -> Self {
+        Self {
+            quiet_frames: 0,
+            quiet_limit: (sample_rate as usize * 40).div_ceil(1000).max(1),
+            channels: channels.max(1),
+            active: false,
+        }
+    }
+
+    pub fn push(&mut self, samples: &[f32]) -> bool {
+        for frame in samples.chunks_exact(self.channels) {
+            if frame.iter().any(|x| x.is_finite() && x.abs() > 0.00001) {
+                self.quiet_frames = 0;
+                self.active = true;
+            } else {
+                self.quiet_frames = self.quiet_frames.saturating_add(1);
+                if self.quiet_frames >= self.quiet_limit {
+                    self.active = false;
+                }
+            }
+        }
+        self.active
+    }
+}
+
 pub struct CaptureFrames {
     samples: VecDeque<f32>,
     channels: usize,
@@ -55,6 +90,30 @@ impl CaptureFrames {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn silence_stops_after_forty_ms_even_with_continuous_packets() {
+        for rate in [44100, 48000, 96000] {
+            let mut guard = CaptureActivity::new(rate, 2);
+            assert!(!guard.push(&[0.0; 100]));
+            assert!(guard.push(&[0.0, 0.3])); // Either channel is enough.
+            let frames = (rate as usize * 40).div_ceil(1000);
+            assert!(guard.push(&vec![0.0; (frames - 1) * 2]));
+            assert!(!guard.push(&[0.0, 0.0]));
+            assert!(!guard.push(&[f32::NAN, f32::INFINITY]));
+            assert!(guard.push(&[0.00002, 0.0])); // Preserve very quiet music.
+        }
+    }
+
+    #[test]
+    fn silence_guard_observes_the_tail_of_a_batched_packet() {
+        let mut guard = CaptureActivity::new(48000, 1);
+        let mut packet = vec![0.5; 480];
+        packet.extend(vec![0.0; 1920]);
+        assert!(!guard.push(&packet));
+        packet.push(0.1);
+        assert!(guard.push(&packet));
+    }
 
     fn windows(packet_frames: &[usize]) -> Vec<(u64, Vec<f32>)> {
         let mut buffer = CaptureFrames::new(2, 2048, 1024);
