@@ -359,7 +359,8 @@ class EnvelopeProcessor {
         attackCurve: Float,
         decayCurve: Float,
         releaseCurve: Float,
-        spectralCentroid: Float = 1000f
+        spectralCentroid: Float = 1000f,
+        onsetAlreadyPlayed: Boolean = false
     ): Float {
         // Frequency-dependent envelope shaping: bass = deep sustained
         // pressure, treble = sharp surface tingling. Spectral centroid
@@ -406,14 +407,18 @@ class EnvelopeProcessor {
                     (triggerMode == TriggerMode.Hybrid && hybridBlend < 0.45f))
 
         // Trigger logic
-        if (gateJustOpened || isOnsetTrigger) {
+        // A confirmed prefire also consumes a matching gate-opening attack.
+        // Gate state, release and silence still advance normally.
+        if (!onsetAlreadyPlayed && (gateJustOpened || isOnsetTrigger)) {
             val velocity = if (isOnsetTrigger) {
                 onsetStrength.coerceAtMost(1.35f)
             } else {
                 1f
             }
             trigger(mag.coerceAtLeast(0.03f), currentTimeMs, velocity, attackMs)
-        } else if (gateOpen && state == EnvelopeState.Idle && continuousHold && mag > 0.05f) {
+        } else if (!onsetAlreadyPlayed && gateOpen && state == EnvelopeState.Idle &&
+            continuousHold && mag > 0.05f
+        ) {
             // Pad/organ: re-enter while gate held. Require real magnitude.
             trigger(mag, currentTimeMs, 1f, attackMs)
         } else if (gateJustClosed) {

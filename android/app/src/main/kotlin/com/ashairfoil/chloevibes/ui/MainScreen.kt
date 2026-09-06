@@ -27,6 +27,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
@@ -72,7 +73,6 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
-import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke as DrawStroke
 import androidx.compose.ui.semantics.contentDescription
@@ -92,7 +92,6 @@ import com.ashairfoil.chloevibes.audio.NUM_BANDS
 import com.ashairfoil.chloevibes.audio.Preset
 import com.ashairfoil.chloevibes.audio.PresetCategory
 import com.ashairfoil.chloevibes.audio.TriggerMode
-import com.ashairfoil.chloevibes.audio.applyCurve
 import com.ashairfoil.chloevibes.audio.presetsInCategory
 import com.ashairfoil.chloevibes.device.BleDeviceInfo
 import com.ashairfoil.chloevibes.device.ConnectionState
@@ -244,6 +243,7 @@ fun MainScreen(
         modifier = Modifier
             .fillMaxSize()
             .background(ChloeColors.Background)
+            .systemBarsPadding()
     ) {
         Column(
             modifier = Modifier
@@ -313,6 +313,9 @@ fun MainScreen(
                     state.audioSource == AudioSourceMode.Microphone -> "Microphone hears audio around your phone"
                     else -> "System audio follows supported playback on your phone"
                 },
+                minLines = 2,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
                 fontSize = 12.sp,
                 color = ChloeColors.OnSurfaceDim
             )
@@ -333,6 +336,22 @@ fun MainScreen(
             // Spectrum visualizer
             SpectrumVisualizer(bandEnergies = state.bandEnergies)
 
+            Spacer(modifier = Modifier.height(16.dp))
+
+            EnvelopeEditor(
+                shape = EnvelopeShape(state.attackMs, state.decayMs, state.sustainLevel, state.releaseMs),
+                attackCurve = state.attackCurve,
+                decayCurve = state.decayCurve,
+                releaseCurve = state.releaseCurve,
+                onChange = { shape ->
+                    state.attackMs = shape.attack
+                    state.decayMs = shape.decay
+                    state.sustainLevel = shape.sustain
+                    state.releaseMs = shape.release
+                    state.selectedPresetName = "Custom"
+                    onParameterChanged()
+                }
+            )
             Spacer(modifier = Modifier.height(16.dp))
 
             // Preset path (Android stand-in for desktop FIND BOOM + presets)
@@ -545,15 +564,6 @@ fun MainScreen(
 
                 Spacer(modifier = Modifier.height(10.dp))
 
-                EnvelopeScopeView(
-                    attackMs = state.attackMs,
-                    decayMs = state.decayMs,
-                    sustainLevel = state.sustainLevel,
-                    releaseMs = state.releaseMs,
-                    attackCurve = state.attackCurve,
-                    decayCurve = state.decayCurve,
-                    releaseCurve = state.releaseCurve
-                )
 
                 Spacer(modifier = Modifier.height(8.dp))
                 Text("Curves", color = ChloeColors.OnSurfaceDim, fontSize = 11.sp, letterSpacing = 1.sp)
@@ -700,7 +710,8 @@ private fun OutputMeter(
 
             // Status row
             Row(
-                horizontalArrangement = Arrangement.SpaceBetween,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier.fillMaxWidth()
             ) {
                 // Envelope state
@@ -754,26 +765,27 @@ private fun OutputMeter(
                     ConnectionState.Connecting -> ChloeColors.Amber
                     ConnectionState.Disconnected -> ChloeColors.Disconnected
                 }
-                StatusChip(deviceLabel, deviceColor)
+                StatusChip(deviceLabel, deviceColor, modifier = Modifier.weight(1f))
             }
 
-            // Battery
-            if (batteryLevel >= 0) {
-                Spacer(modifier = Modifier.height(4.dp))
-                Text(
-                    "Battery: $batteryLevel%",
-                    color = if (batteryLevel < 20) ChloeColors.Error else ChloeColors.OnSurfaceDim,
-                    fontSize = 11.sp
-                )
-            }
+            // Reserve the readout even before the first battery response.
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                if (batteryLevel >= 0) "Battery: $batteryLevel%" else "",
+                color = if (batteryLevel in 0..19) ChloeColors.Error else ChloeColors.OnSurfaceDim,
+                fontSize = 11.sp,
+                minLines = 1,
+                maxLines = 1
+            )
         }
     }
 }
 
 @Composable
-private fun StatusChip(label: String, color: Color, large: Boolean = false) {
+private fun StatusChip(label: String, color: Color, large: Boolean = false, modifier: Modifier = Modifier) {
     Text(
         text = label,
+        modifier = modifier,
         color = color,
         fontSize = if (large) 13.sp else 10.sp,
         fontWeight = FontWeight.Bold,
@@ -1642,168 +1654,4 @@ private fun ManualEntryDialog(
         },
         containerColor = ChloeColors.Surface
     )
-}
-
-// ---------------------------------------------------------------------------
-// ADSR Envelope Scope
-// ---------------------------------------------------------------------------
-
-@Composable
-private fun EnvelopeScopeView(
-    attackMs: Float,
-    decayMs: Float,
-    sustainLevel: Float,
-    releaseMs: Float,
-    attackCurve: Float,
-    decayCurve: Float,
-    releaseCurve: Float
-) {
-    // Sustain gets a proportional display width so the scope looks balanced
-    val sustainDisplayMs = (attackMs + decayMs + releaseMs).coerceAtLeast(1f) * 0.3f
-    val totalMs = attackMs + decayMs + sustainDisplayMs + releaseMs
-    if (totalMs <= 0f) return
-
-    val attackFrac = attackMs / totalMs
-    val decayFrac = decayMs / totalMs
-    val sustainFrac = sustainDisplayMs / totalMs
-    val samples = 48
-
-    // Phase labels with times
-    Row(
-        modifier = Modifier.fillMaxWidth().padding(bottom = 2.dp),
-        horizontalArrangement = Arrangement.SpaceBetween
-    ) {
-        @Composable
-        fun PhaseLabel(letter: String, timeMs: Float, color: Color, weight: Float) {
-            Row(
-                modifier = Modifier.weight(weight.coerceAtLeast(0.05f)),
-                horizontalArrangement = Arrangement.Center
-            ) {
-                Text(letter, color = color, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                Spacer(modifier = Modifier.width(3.dp))
-                Text(
-                    if (letter == "S") "%.2f".format(sustainLevel)
-                    else "%.0fms".format(timeMs),
-                    color = color.copy(alpha = 0.6f),
-                    fontSize = 9.sp
-                )
-            }
-        }
-        PhaseLabel("A", attackMs, ChloeColors.Attack, attackFrac)
-        PhaseLabel("D", decayMs, ChloeColors.Decay, decayFrac)
-        PhaseLabel("S", sustainDisplayMs, ChloeColors.Sustain, sustainFrac)
-        PhaseLabel("R", releaseMs, ChloeColors.Release, 1f - attackFrac - decayFrac - sustainFrac)
-    }
-
-    Canvas(
-        modifier = Modifier
-            .fillMaxWidth()
-            .height(72.dp)
-            .clip(RoundedCornerShape(8.dp))
-            .background(ChloeColors.Surface)
-    ) {
-        val w = size.width
-        val h = size.height
-        val pad = 4f
-
-        val drawH = h - pad * 2
-        val drawW = w - pad * 2
-        fun xOf(frac: Float) = pad + frac * drawW
-        fun yOf(level: Float) = pad + (1f - level) * drawH
-
-        // Phase x boundaries
-        val xA = xOf(attackFrac)
-        val xD = xOf(attackFrac + decayFrac)
-        val xS = xOf(attackFrac + decayFrac + sustainFrac)
-        val xR = xOf(1f)
-
-        // --- Build per-phase paths (fill + stroke) ---
-
-        // Attack: 0 → 1.0
-        val attackPath = Path().apply {
-            moveTo(pad, yOf(0f))
-            for (i in 1..samples) {
-                val t = i.toFloat() / samples
-                val level = applyCurve(t, attackCurve)
-                lineTo(pad + t * (xA - pad), yOf(level))
-            }
-        }
-        val attackFill = Path().apply {
-            addPath(attackPath)
-            lineTo(xA, yOf(0f))
-            lineTo(pad, yOf(0f))
-            close()
-        }
-
-        // Decay: 1.0 → sustainLevel
-        val decayPath = Path().apply {
-            moveTo(xA, yOf(1f))
-            for (i in 1..samples) {
-                val t = i.toFloat() / samples
-                val decayFactor = applyCurve(1f - t, decayCurve)
-                val level = sustainLevel + (1f - sustainLevel) * decayFactor
-                lineTo(xA + t * (xD - xA), yOf(level))
-            }
-        }
-        val decayFill = Path().apply {
-            addPath(decayPath)
-            lineTo(xD, yOf(0f))
-            lineTo(xA, yOf(0f))
-            close()
-        }
-
-        // Sustain: flat at sustainLevel
-        val sustainPath = Path().apply {
-            moveTo(xD, yOf(sustainLevel))
-            lineTo(xS, yOf(sustainLevel))
-        }
-        val sustainFill = Path().apply {
-            moveTo(xD, yOf(sustainLevel))
-            lineTo(xS, yOf(sustainLevel))
-            lineTo(xS, yOf(0f))
-            lineTo(xD, yOf(0f))
-            close()
-        }
-
-        // Release: sustainLevel → 0
-        val releasePath = Path().apply {
-            moveTo(xS, yOf(sustainLevel))
-            for (i in 1..samples) {
-                val t = i.toFloat() / samples
-                val relFactor = applyCurve(1f - t, releaseCurve)
-                val level = sustainLevel * relFactor
-                lineTo(xS + t * (xR - xS), yOf(level))
-            }
-        }
-        val releaseFill = Path().apply {
-            addPath(releasePath)
-            lineTo(xR, yOf(0f))
-            lineTo(xS, yOf(0f))
-            close()
-        }
-
-        // Draw fills
-        drawPath(attackFill, ChloeColors.Attack.copy(alpha = 0.12f))
-        drawPath(decayFill, ChloeColors.Decay.copy(alpha = 0.12f))
-        drawPath(sustainFill, ChloeColors.Sustain.copy(alpha = 0.10f))
-        drawPath(releaseFill, ChloeColors.Release.copy(alpha = 0.12f))
-
-        // Draw strokes
-        val strokeWidth = 2.dp.toPx()
-        drawPath(attackPath, ChloeColors.Attack, style = DrawStroke(strokeWidth, cap = StrokeCap.Round))
-        drawPath(decayPath, ChloeColors.Decay, style = DrawStroke(strokeWidth, cap = StrokeCap.Round))
-        drawPath(sustainPath, ChloeColors.Sustain, style = DrawStroke(strokeWidth, cap = StrokeCap.Round))
-        drawPath(releasePath, ChloeColors.Release, style = DrawStroke(strokeWidth, cap = StrokeCap.Round))
-
-        // Phase boundary lines (dashed)
-        val dashEffect = PathEffect.dashPathEffect(floatArrayOf(4f, 4f))
-        val boundaryColor = ChloeColors.OnSurfaceDim.copy(alpha = 0.25f)
-        for (bx in listOf(xA, xD, xS)) {
-            drawLine(boundaryColor, Offset(bx, pad), Offset(bx, h - pad),
-                strokeWidth = 1f, pathEffect = dashEffect)
-        }
-
-        // Baseline
-        drawLine(ChloeColors.SurfaceVariant, Offset(pad, yOf(0f)), Offset(xR, yOf(0f)), strokeWidth = 1f)
-    }
 }

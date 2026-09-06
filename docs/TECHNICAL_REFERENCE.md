@@ -1,6 +1,6 @@
 # ChloeVibes — Technical Reference
 
-Software version **1.6.0**. Product overview and install: [root README](../README.md).
+Software version **1.6.1**. Product overview and install: [root README](../README.md).
 
 This document is the long-form engineering reference (signal chain, protocols, parity, limitations, CI).
 
@@ -17,7 +17,7 @@ This document is the long-form engineering reference (signal chain, protocols, p
 | Spectral resolution | 2048-point FFT, 1024 usable bins, 23.4 Hz per bin at 48 kHz |
 | Output interface | Lovense BLE UART services; Buttplug 9.0.9 client on desktop |
 | Output resolution | Normalized DSP output; Lovense BLE commands use integer intensity 0 to 20 |
-| Software version | 1.6.0 |
+| Software version | 1.6.1 |
 | License | MIT |
 
 ---
@@ -86,7 +86,7 @@ A hysteresis gate with threshold-proportional hysteresis and asymmetric smoothin
 
 Onset detection runs on spectral flux against an adaptive threshold computed as the mean plus a multiple of the standard deviation over a 43-frame window. Onsets are subject to a 55 ms refractory cooldown, bounding detection at approximately 270 BPM at sixteenth-note resolution. Tempo is tracked across the most recent 16 onset timestamps. The engine publishes a predicted next-onset time when tempo confidence exceeds 0.5. Downstream, each client pre-fires the drive command approximately 50 ms ahead of the predicted onset when tempo confidence exceeds 0.6 and a real onset was seen within about two beats (recency guard). Without new onsets, tempo confidence decays so stale locks cannot ghost-fire into silence or the next track.
 
-Confidence decays from the last real-onset baseline according to elapsed time, independently of how often the host polls, and clears after three missed beat periods. A confirmed pre-fire suppresses one matching real envelope attack; the real onset still contributes to tempo tracking and desktop tuner evidence.
+Confidence decays from the last real-onset baseline according to elapsed time, independently of how often the host polls, and clears after three missed beat periods. A confirmed pre-fire suppresses one matching real envelope attack, including a coincident gate-open edge; the real onset still contributes to tempo tracking and desktop tuner evidence.
 
 ### 2.4 ADSR Envelope Processor
 
@@ -115,7 +115,7 @@ Changing algorithms resets the gate, beat detector, envelope, modulation state, 
 
 ### 2.8 FIND BOOM / AUTO-LOCK (Desktop)
 
-One-press automatic parameter fitting (UI label **FIND BOOM**). On activation the client listens to 4 to 15 seconds of the playing material and derives: the punchiest frequency band (largest per-hit energy jump over the quietest between-hit floor, times hit consistency), the beat interval (median and IQR of merged inter-onset intervals with perceptual octave folding into 70 to 180 BPM), the material's crest factor, and the median spectral centroid. It then writes a fitted parameter set — drive band, gate, trigger mode and curve, and an envelope whose decay fits inside the beat interval — through a 1.5 s glide, and reports a lock-quality score on the button. Unlockable material (ambient, speech) is reported honestly as NO LOCK and nothing is written.
+One-press automatic parameter fitting (UI label **FIND BOOM**). On activation the client listens to 4 to 15 seconds of the playing material and derives: the punchiest frequency band (largest per-hit energy jump over the quietest between-hit floor, times hit consistency), the beat interval (median and IQR of merged inter-onset intervals with perceptual octave folding into 70 to 180 BPM), the material's crest factor, and the median spectral centroid. The gate threshold is calibrated in the newly selected frequency domain, so switching the drive band does not reuse a threshold from a different energy scale. It then writes a fitted parameter set — drive band, gate, trigger mode and curve, and an envelope whose decay fits inside the beat interval — through a 1.5 s glide, and reports a lock-quality score on the button. Unlockable material (ambient, speech) is reported honestly as NO LOCK and nothing is written.
 
 The default product path and the fitted response target a bass-drum waveform: instant peak, curved decay spanning most of the beat (~78% of the folded interval at curve 1.8), then a low-sustain release. Onsets arriving mid-Decay are absorbed. The fit leaves timing margin for the next hit; it does not guarantee a physical peak on every beat. Every press starts a fresh listen using audio arriving after that press.
 
@@ -265,8 +265,8 @@ Desktop dispatch compares the final requested values for every vibration and osc
 | Output resolution | Lovense 0–20 integer |
 | Command pacing | Desktop loop: at most 50 Hz; Android ordinary BLE writes: at least 28 ms apart (~36 Hz), stop writes: 12 ms |
 | Desktop stack | Rust, eframe/egui 0.33.3, Buttplug 9.0.9 |
-| Desktop package | `chloe-vibes` 1.6.0 |
-| Android stack | `com.ashairfoil.chloevibes` 1.6.0 (versionCode 7) |
+| Desktop package | `chloe-vibes` 1.6.1 |
+| Android stack | `com.ashairfoil.chloevibes` 1.6.1 (versionCode 8) |
 | Android SDK | Minimum API 26 (Android 8.0); target / compile API 35 |
 | Stop behavior | Both clients: 2 s pipeline watchdog; desktop: panic-stop and stop-error feedback; Android: stop latch |
 | License | MIT |
@@ -286,6 +286,12 @@ Play audio, select **Bass Drum** or another preset, and adjust volume and output
 Android source selection is explicit: choose **System audio** or **Microphone** before starting capture, and stop capture to change sources. System audio availability depends on the playback route and Android audio implementation.
 
 Use **Stop all devices** to end output. Its software stop request and delivery limits are described in Sections 1 and 5.
+
+### Direct envelope editing
+
+Both clients show a large ADSR curve before the expert controls. Drag **A** horizontally for attack, **D** horizontally for decay and vertically for sustain, **S** vertically for sustain, and **R** horizontally for release. A gesture keeps its starting time scale so the curve stays under the pointer. A preset or slider change refits the view; Android also has **Fit view**, and Windows supports a double-click on empty graph space. The sustain segment illustrates a held level, not a timed hold.
+
+Edits select Custom and update the same parameters as the detailed sliders. On Windows they also cancel an active FIND BOOM fit without reverting the edit. Output limits and gain remain separate. Windows connection and audio-status rows reserve their height, and the main content scrolls when needed; Android audio hints reserve two lines and long device labels truncate.
 
 ### 8.2 Audio status and timing
 
@@ -327,14 +333,15 @@ cargo fmt --all --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo build --locked --release
 cargo test --locked --all-targets
-cd android && ./gradlew assembleDebug testDebugUnitTest
+cargo test -p audio-capture --locked
+cd android && ./gradlew testDebugUnitTest testReleaseUnitTest assembleDebug assembleRelease
 ```
 
-The [main CI workflow](../.github/workflows/ci.yml) runs for pushes to `main` / `master`, pull requests targeting those branches, and manual dispatch. It checks Rust formatting, Clippy across all targets, the release build, and all-target tests including parity. Cargo builds and tests use the committed dependency lockfile. Android unit tests and the debug APK build run separately. The workflow has read-only repository-content permission and uploads build/test artifacts; it does not publish GitHub releases.
+The [main CI workflow](../.github/workflows/ci.yml) runs for pushes to `main` / `master`, pull requests targeting those branches, and manual dispatch. It checks Rust formatting, Clippy across all targets, the release build, and all-target tests including parity. Cargo builds and tests use the committed dependency lockfile. Android debug and release unit tests, debug APK assembly, and optimized release APK assembly run in a separate job. Windows also tests the vendored capture backend. The workflow has read-only repository-content permission and uploads build/test artifacts; it does not publish GitHub releases.
 
 The [Android debug workflow](../.github/workflows/android-debug-apk.yml) is manually dispatched and produces test artifacts only. CI debug APKs may use a different signing certificate and are not automatically promoted to downloadable releases.
 
-Published Android APKs use the project's preserved signing identity. For a given release, the versioned download and its aliases receive identical APK bytes, keeping both contents and signing certificate consistent. Use GitHub release assets for distribution; workflow artifacts are for testing.
+Published Android APKs use the project's preserved signing identity. For a given release, the standard debug download and its debug aliases receive identical APK bytes, keeping both contents and signing certificate consistent. The separately named `ChloeVibes-android-release.apk` is an optimized, non-debuggable build signed with that same identity. It can update the standard APK, but its bytes differ. The signing identity is a preserved Android debug certificate, not a Play Store signing identity. Use GitHub release assets for distribution; workflow artifacts are for testing.
 
 ---
 

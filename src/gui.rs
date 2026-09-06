@@ -20,7 +20,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use audio_capture::win::capture::AudioCapture;
+use audio_capture::win::capture::{enumerate_render_endpoints, AudioCapture};
 use buttplug::{
     client::{ButtplugClient, ButtplugClientDevice, ScalarValueCommand},
     core::message::ActuatorType,
@@ -38,12 +38,16 @@ use tokio::runtime::Runtime;
 
 use crate::{
     audio::{
-        self, BeatDetector, ClimaxEngine, ClimaxPattern, EnvelopeProcessor, EnvelopeState,
-        FrequencyMode, Gate, SharedSpectralData, SpectralAnalyzer, SpectralData, TriggerMode,
-        BAND_NAMES,
+        self, BeatDetector, ClimaxEngine, ClimaxPattern, EnvelopeProcessor, FrequencyMode, Gate,
+        SharedSpectralData, SpectralAnalyzer, SpectralData, TriggerMode, BAND_NAMES,
     },
+    audio_source::{AudioSource, AudioSources},
     auto_lock::{AutoLock, AutoLockState},
-    device_dispatch::{actuator_output, DeviceDispatchState, DeviceOutput},
+    capture_frames::CaptureFrames,
+    device_dispatch::{
+        actuator_output, DeviceDispatchSchedule, DeviceDispatchState, DeviceOutput, OutputFrame,
+        DEVICE_UPDATE_INTERVAL,
+    },
     presets::{self, PresetCategory},
     settings::{defaults, DeviceSettings, OscillatorSettings, Settings, VibratorSettings},
     util::{self, MinCutoff, SharedF32},
@@ -57,11 +61,22 @@ use crate::{
 pub struct Gui {
     #[clap(short, long)]
     server_addr: Option<String>,
+    /// Analyze audio without connecting to a device server or scanning for toys.
+    #[clap(long, conflicts_with = "server_addr")]
+    audio_only: bool,
+    /// Use a separate settings file, useful for isolated diagnostics.
+    #[clap(long)]
+    settings_path: Option<std::path::PathBuf>,
 }
 
 pub fn gui(args: Gui) {
     let native_options = eframe::NativeOptions {
+        persistence_path: args.settings_path,
         viewport: egui::ViewportBuilder::default()
+            .with_icon(
+                eframe::icon_data::from_png_bytes(include_bytes!("../assets/chloevibes.png"))
+                    .expect("The embedded ChloeVibes icon must be a valid PNG"),
+            )
             .with_inner_size([1100.0, 900.0])
             .with_min_inner_size([640.0, 480.0]),
         ..Default::default()
@@ -69,9 +84,15 @@ pub fn gui(args: Gui) {
     if let Err(e) = eframe::run_native(
         "Chloe Vibes",
         native_options,
-        Box::new(|ctx| Ok(Box::new(GuiApp::new(args.server_addr, ctx)))),
+        Box::new(|ctx| {
+            Ok(Box::new(GuiApp::new(
+                args.server_addr,
+                args.audio_only,
+                ctx,
+            )))
+        }),
     ) {
-        eprintln!("eframe exited with error: {e}");
+        crate::log_stderr!("eframe exited with error: {e}");
         let log_dir = std::env::var("APPDATA")
             .map(|d| std::path::PathBuf::from(d).join("chloe-vibes"))
             .unwrap_or_else(|_| std::env::temp_dir().join("chloe-vibes"));
@@ -90,6 +111,7 @@ pub fn gui(args: Gui) {
 // ---------------------------------------------------------------------------
 
 enum ConnectionState {
+    AudioOnly,
     Connecting,
     Connected,
     Error(String),
@@ -394,6 +416,10 @@ struct GuiApp {
     server_addr: Option<String>,
     server_name: String,
     capture_status: Arc<Mutex<String>>,
+    audio_sources: Arc<Mutex<AudioSources>>,
+    audio_source_selection: Arc<Mutex<Option<String>>>,
+    capture_epoch: Arc<AtomicU64>,
+    last_capture_epoch: u64,
     // Keyed by Buttplug device INDEX (unique per connection); names collide
     // when two identical toys are connected.
     devices: HashMap<u32, Device>,
@@ -416,9 +442,8 @@ struct GuiApp {
     sound_power: SharedF32,            // Legacy: simple RMS power
     spectral_data: SharedSpectralData, // NEW: full spectral analysis
 
-    // Processed output that devices read
-    processed_output: SharedF32, // Final output after envelope/gate (primary motor)
-    processed_output_2: SharedF32, // Secondary motor output from ClimaxEngine
+    // One coherent, latest-only publication wakes every device on output changes.
+    processed_output: tokio::sync::watch::Sender<OutputFrame>,
 
     _capture_thread: JoinHandle<()>,
     use_advanced_shared: Arc<AtomicBool>,
@@ -433,6 +458,7 @@ struct GuiApp {
     // NEW: Signal processors (from ChloeVibes)
     gate: Gate,
     envelope: EnvelopeProcessor,
+    adsr_editor: crate::adsr_editor::AdsrEditor,
     beat_detector: BeatDetector,
     climax_engine: ClimaxEngine,
 
@@ -518,7 +544,6 @@ mod palette {
 // ---------------------------------------------------------------------------
 
 const HISTORY_LEN: usize = 256;
-const ADSR_PREVIEW_HEIGHT: f32 = 100.0;
 const OUTPUT_HISTORY_HEIGHT: f32 = 80.0;
 
 // ---------------------------------------------------------------------------
@@ -599,8 +624,9 @@ impl Drop for GuiApp {
     fn drop(&mut self) {
         // Stop command producers before the final stop RPC, otherwise a live
         // dispatch task can re-arm a motor while shutdown is awaiting its reply.
-        self.processed_output.store(0.0);
-        self.processed_output_2.store(0.0);
+        self.processed_output.send_replace(OutputFrame::stopped(
+            self.capture_epoch.load(Ordering::Relaxed),
+        ));
         for device in self.devices.values() {
             device
                 .props
@@ -642,6 +668,9 @@ fn capture_thread(
     use_advanced: Arc<AtomicBool>,
     capture_status: Arc<Mutex<String>>,
     capture_heartbeat: Arc<AtomicU64>,
+    audio_sources: Arc<Mutex<AudioSources>>,
+    audio_source_selection: Arc<Mutex<Option<String>>>,
+    capture_epoch: Arc<AtomicU64>,
 ) -> ! {
     // WASAPI loopback buffer. Duration::ZERO made the third-party crate
     // unwrap-panic on Initialize (WinError 0x88890008 / unsupported format)
@@ -650,16 +679,32 @@ fn capture_thread(
 
     loop {
         capture_heartbeat.store(util::NO_CAPTURE_PACKET, Ordering::Relaxed);
+        capture_epoch.fetch_add(1, Ordering::Relaxed);
         sound_power.store(0.0);
         spectral_shared.store(SpectralData::default());
         set_capture_status(&capture_status, "audio: initializing");
 
+        let mut requested_source = audio_source_selection
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let sources = refresh_audio_sources(&audio_sources);
+        let Some(source) = sources.resolve(requested_source.as_deref()) else {
+            set_capture_status(&capture_status, sources.label(requested_source.as_deref()));
+            std::thread::sleep(Duration::from_millis(500));
+            continue;
+        };
+        let source_id = source.id.clone();
+        let source_name = source.name.clone();
+
         // This audio-capture crate unwraps WinErrors (panics) on init/read.
         // Catch so the UI + BLE stay alive; we just retry audio.
-        let mut capture = match std::panic::catch_unwind(|| AudioCapture::init(CAPTURE_BUFFER)) {
+        let mut capture = match std::panic::catch_unwind(|| {
+            AudioCapture::init_for_device(CAPTURE_BUFFER, Some(&source_id))
+        }) {
             Ok(Ok(capture)) => capture,
             Ok(Err(e)) => {
-                eprintln!("Audio init failed: {e}");
+                crate::log_stderr!("Audio init failed: {e}");
                 set_capture_status(&capture_status, format!("audio: init failed ({e})"));
                 sound_power.store(0.0);
                 spectral_shared.store(SpectralData::default());
@@ -667,7 +712,7 @@ fn capture_thread(
                 continue;
             }
             Err(_) => {
-                eprintln!("Audio init panicked; retrying (device busy/format blip)");
+                crate::log_stderr!("Audio init panicked; retrying (device busy/format blip)");
                 set_capture_status(&capture_status, "audio: waiting for playback device…");
                 sound_power.store(0.0);
                 spectral_shared.store(SpectralData::default());
@@ -679,7 +724,7 @@ fn capture_thread(
         let format = match capture.format() {
             Ok(format) => format,
             Err(e) => {
-                eprintln!("Audio format error: {e}");
+                crate::log_stderr!("Audio format error: {e}");
                 set_capture_status(&capture_status, format!("audio: format error ({e})"));
                 sound_power.store(0.0);
                 spectral_shared.store(SpectralData::default());
@@ -694,12 +739,9 @@ fn capture_thread(
         // The WASAPI buffer is capacity, not a latency target. Poll often
         // enough to publish each 1024-frame analysis hop instead of waiting
         // half an 80ms buffer and merging distinct transients.
-        let estimated_period =
-            Duration::from_secs_f32(capture.buffer_frame_size as f32 / sample_rate);
-        let mut default_poll = (estimated_period / 2).max(Duration::from_millis(5));
-        if default_poll > Duration::from_millis(10) {
-            default_poll = Duration::from_millis(10);
-        }
+        let engine_period = capture.device_period().unwrap_or(Duration::from_millis(10));
+        let default_poll =
+            (engine_period / 2).clamp(Duration::from_millis(2), Duration::from_millis(5));
         let sample_dt = Duration::from_secs_f32(1.0 / sample_rate);
 
         // Buffer large enough for FFT analysis.
@@ -711,20 +753,21 @@ fn capture_thread(
         let mut buf = VecDeque::with_capacity(buffer_size);
 
         let mut analyzer = SpectralAnalyzer::new(sample_rate);
-        let mut total_frames_read: u64 = 0;
-        let mut frames_since_analysis: usize = 0;
         // Analyze on a fixed ~1024-frame hop (~47Hz at 48k), not per poll.
         // The beat detector's frame-based statistics (43-frame flux window)
         // assume this cadence; analyzing every ~11ms poll produced 77%-overlap
         // windows whose shrunken flux inflated inter-onset jitter ~6x on real
         // material (measured: IOI IQR 21ms at this hop vs 130ms per-poll).
         let analysis_hop_frames = (audio::FFT_SIZE / 2).max(1);
+        let mut analysis_frames =
+            CaptureFrames::new(channels, audio::FFT_SIZE, analysis_hop_frames);
         let mut last_status_time = Instant::now();
         let mut last_packet_time = Instant::now();
+        let mut last_source_check = Instant::now();
         let mut starved = false;
 
         if let Err(e) = capture.start() {
-            eprintln!("Audio start failed: {e}");
+            crate::log_stderr!("Audio start failed: {e}");
             set_capture_status(&capture_status, format!("audio: start failed ({e})"));
             sound_power.store(0.0);
             spectral_shared.store(SpectralData::default());
@@ -735,8 +778,8 @@ fn capture_thread(
         set_capture_status(
             &capture_status,
             format!(
-                "audio: running {} Hz / {} ch / {:?}",
-                format.sample_rate, format.channels, format.sample_format
+                "{} · {} Hz / {} ch",
+                source_name, format.sample_rate, format.channels
             ),
         );
 
@@ -747,37 +790,96 @@ fn capture_thread(
             } else {
                 default_poll
             };
-            std::thread::sleep(sleep_duration);
+            if use_custom {
+                std::thread::sleep(sleep_duration);
+            } else if let Err(error) = capture.wait_for_packet(default_poll) {
+                set_capture_status(
+                    &capture_status,
+                    format!("audio: reconnecting after wait error ({error})"),
+                );
+                break;
+            }
+
+            let selection_changed = *audio_source_selection
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                != requested_source;
+            if selection_changed || last_source_check.elapsed() >= Duration::from_millis(500) {
+                let sources = refresh_audio_sources(&audio_sources);
+                let selection = audio_source_selection
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                if sources
+                    .resolve(selection.as_deref())
+                    .map(|source| source.id.as_str())
+                    != Some(source_id.as_str())
+                {
+                    capture_heartbeat.store(util::NO_CAPTURE_PACKET, Ordering::Relaxed);
+                    sound_power.store(0.0);
+                    spectral_shared.store(SpectralData::default());
+                    set_capture_status(&capture_status, "switching audio source…");
+                    break;
+                }
+                requested_source = selection;
+                last_source_check = Instant::now();
+            }
 
             let mut frames_read_this_tick: usize = 0;
             // read_samples can also panic on device invalidate — catch it.
             let read_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                capture.read_samples::<(), _>(|samples, _| {
+                capture.read_samples::<(), _>(|samples, info| {
+                    // Source changes and publication share this lock. Once the
+                    // selector changes, an in-flight old packet cannot re-arm output.
+                    let selection = audio_source_selection
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if *selection != requested_source {
+                        return Ok(());
+                    }
+                    if info.data_discontinuity {
+                        buf.clear();
+                        analysis_frames.clear();
+                        analyzer = SpectralAnalyzer::new(sample_rate);
+                        spectral_shared.store(SpectralData::default());
+                        capture_epoch.fetch_add(1, Ordering::Relaxed);
+                    }
                     buf.extend(samples.iter().copied());
                     frames_read_this_tick += samples.len() / channels;
                     let len = buf.len();
                     if len > buffer_size {
                         buf.drain(0..(len - buffer_size));
                     }
+                    analysis_frames.push(samples, |window, _frame_end| {
+                        spectral_shared.store(analyzer.analyze(window, channels));
+                    });
                     Ok(())
                 })
             }));
             match read_result {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
-                    eprintln!("Audio read failed, reinitializing capture: {e:?}");
+                    crate::log_stderr!("Audio read failed, reinitializing capture: {e:?}");
                     set_capture_status(&capture_status, format!("audio: read error ({e:?})"));
                     sound_power.store(0.0);
                     spectral_shared.store(SpectralData::default());
                     break;
                 }
                 Err(_) => {
-                    eprintln!("Audio read panicked; reinitializing capture");
+                    crate::log_stderr!("Audio read panicked; reinitializing capture");
                     set_capture_status(&capture_status, "audio: device blip — reinitializing…");
                     sound_power.store(0.0);
                     spectral_shared.store(SpectralData::default());
                     break;
                 }
+            }
+            // Keep the same source selected through heartbeat/legacy publication.
+            // The selector can then invalidate both without a late old-source write.
+            let selection = audio_source_selection
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if *selection != requested_source {
+                break;
             }
             if frames_read_this_tick == 0 {
                 if last_packet_time.elapsed() >= Duration::from_millis(util::CAPTURE_STALE_MS) {
@@ -786,8 +888,11 @@ fn capture_thread(
                     sound_power.store(0.0);
                     if !starved {
                         starved = true;
+                        // Resuming the same stream must not authorize output
+                        // produced before this gap while the UI catches up.
+                        capture_epoch.fetch_add(1, Ordering::Relaxed);
                         buf.clear();
-                        frames_since_analysis = 0;
+                        analysis_frames.clear();
                         analyzer = SpectralAnalyzer::new(sample_rate);
                         spectral_shared.store(SpectralData::default());
                         set_capture_status(
@@ -805,7 +910,6 @@ fn capture_thread(
             last_packet_time = Instant::now();
             capture_heartbeat.store(app_now_ms(), Ordering::Relaxed);
             starved = false;
-            total_frames_read += frames_read_this_tick as u64;
 
             let samples = buf.make_contiguous();
             if samples.is_empty() {
@@ -846,29 +950,56 @@ fn capture_thread(
                 sound_power.store(low_pass_rms.max(raw_rms));
             }
 
-            // NEW: Full spectral analysis via FFT, on the fixed hop cadence
-            frames_since_analysis += frames_read_this_tick;
-            if frames_since_analysis >= analysis_hop_frames {
-                frames_since_analysis %= analysis_hop_frames;
-                let spectral = analyzer.analyze(samples, channels);
-                spectral_shared.store(spectral);
-            }
-
             if last_status_time.elapsed() >= Duration::from_secs(1) {
                 set_capture_status(
                     &capture_status,
                     format!(
-                        "audio: active {} Hz / {} ch / poll {} ms / frames {}",
-                        format.sample_rate,
-                        format.channels,
-                        sleep_duration.as_millis(),
-                        total_frames_read
+                        "{} · {} Hz / {} ch",
+                        source_name, format.sample_rate, format.channels
                     ),
                 );
                 last_status_time = Instant::now();
             }
         }
     }
+}
+
+fn refresh_audio_sources(shared: &Arc<Mutex<AudioSources>>) -> AudioSources {
+    static DISCOVERY_FAILED: AtomicBool = AtomicBool::new(false);
+
+    let discovered = enumerate_render_endpoints().map(|endpoints| {
+        endpoints
+            .into_iter()
+            .map(|source| AudioSource {
+                id: source.id,
+                name: source.name,
+                is_default: source.is_default,
+            })
+            .collect()
+    });
+    let (sources, result) = {
+        let mut current = shared.lock().unwrap_or_else(|e| e.into_inner());
+        let result = current.apply_discovery(discovered);
+        (current.clone(), result)
+    };
+    // Log transitions outside the catalog lock, once per failure period.
+    // The HRESULT identifies the failure without exposing endpoint IDs.
+    match result {
+        Ok(()) => {
+            if DISCOVERY_FAILED.swap(false, Ordering::Relaxed) {
+                crate::log_stderr!("Audio endpoint discovery recovered");
+            }
+        }
+        Err(error) => {
+            if !DISCOVERY_FAILED.swap(true, Ordering::Relaxed) {
+                crate::log_stderr!(
+                    "Audio endpoint discovery failed (Windows error 0x{:08X}); retaining the previous device list until discovery recovers",
+                    error.0 as u32,
+                );
+            }
+        }
+    }
+    sources
 }
 
 // ---------------------------------------------------------------------------
@@ -927,27 +1058,32 @@ impl GuiApp {
         self.hold_start_time = None;
         self.output_delay.clear();
         self.output_delay_2.clear();
-        self.processed_output.store(0.0);
-        self.processed_output_2.store(0.0);
+        self.processed_output.send_replace(OutputFrame::stopped(
+            self.capture_epoch.load(Ordering::Relaxed),
+        ));
     }
 
-    fn new(server_addr: Option<String>, ctx: &CreationContext) -> Self {
+    fn new(server_addr: Option<String>, audio_only: bool, ctx: &CreationContext) -> Self {
         install_fonts(&ctx.egui_ctx);
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let client = None;
         let devices = Default::default();
 
-        let connection_state = ConnectionState::Connecting;
-        let server_addr_clone = server_addr.clone();
-        let connection_task =
-            Some(runtime.spawn(async move { util::start_bp_server(server_addr_clone).await }));
+        let (connection_state, connection_task) = if audio_only {
+            (ConnectionState::AudioOnly, None)
+        } else {
+            let server_addr_clone = server_addr.clone();
+            (
+                ConnectionState::Connecting,
+                Some(runtime.spawn(async move { util::start_bp_server(server_addr_clone).await })),
+            )
+        };
 
         let sound_power = SharedF32::new(0.0);
         let sound_power2 = sound_power.clone();
         let spectral_data = SharedSpectralData::new();
         let spectral_data2 = spectral_data.clone();
-        let processed_output = SharedF32::new(0.0);
-        let processed_output_2 = SharedF32::new(0.0);
+        let (processed_output, _) = tokio::sync::watch::channel(OutputFrame::default());
         let capture_status = Arc::new(Mutex::new(String::from("audio: starting")));
         let capture_status2 = capture_status.clone();
         let capture_heartbeat = Arc::new(AtomicU64::new(util::NO_CAPTURE_PACKET));
@@ -964,13 +1100,19 @@ impl GuiApp {
                 loop {
                     interval.tick().await;
                     let age = app_now_ms().saturating_sub(hb.load(Ordering::Relaxed));
-                    eprintln!("[hb-probe] pipeline heartbeat age: {age}ms");
+                    crate::log_stderr!("[hb-probe] pipeline heartbeat age: {age}ms");
                 }
             });
         }
 
         let mut settings = ctx.storage.map(Settings::load).unwrap_or_default();
         settings.sanitize();
+        let audio_sources = Arc::new(Mutex::new(AudioSources::default()));
+        let audio_sources2 = audio_sources.clone();
+        let audio_source_selection = Arc::new(Mutex::new(settings.audio_source_id.clone()));
+        let audio_source_selection2 = audio_source_selection.clone();
+        let capture_epoch = Arc::new(AtomicU64::new(0));
+        let capture_epoch2 = capture_epoch.clone();
         // Migrate the old ineffective negative nudge to a real delay-only
         // control, preserving a user's chosen positive delay across restarts.
         settings.trim_ms = settings.trim_ms.clamp(0.0, 500.0);
@@ -1019,6 +1161,9 @@ impl GuiApp {
                     use_advanced_capture,
                     capture_status2,
                     capture_heartbeat2,
+                    audio_sources2,
+                    audio_source_selection2,
+                    capture_epoch2,
                 )
             })
             .expect("failed to spawn audio capture thread");
@@ -1037,7 +1182,7 @@ impl GuiApp {
                 ))
             }
             Err(e) => {
-                eprintln!("Failed to load logo: {e}");
+                crate::log_stderr!("Failed to load logo: {e}");
                 None
             }
         };
@@ -1050,6 +1195,10 @@ impl GuiApp {
             server_addr,
             server_name: String::from("<not connected>"),
             capture_status,
+            audio_sources,
+            audio_source_selection,
+            capture_epoch,
+            last_capture_epoch: 0,
             devices,
             recent_disconnects: HashMap::new(),
             pipeline_heartbeat,
@@ -1060,7 +1209,6 @@ impl GuiApp {
             sound_power,
             spectral_data,
             processed_output,
-            processed_output_2,
             _capture_thread,
             use_advanced_shared,
             is_scanning: false,
@@ -1073,6 +1221,7 @@ impl GuiApp {
             // New processors
             gate: Gate::new(),
             envelope: EnvelopeProcessor::new(),
+            adsr_editor: crate::adsr_editor::AdsrEditor::default(),
             beat_detector: BeatDetector::new(),
             climax_engine: ClimaxEngine::new(),
             auto_lock: AutoLock::new(),
@@ -1157,6 +1306,12 @@ impl eframe::App for GuiApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let capture_epoch = self.capture_epoch.load(Ordering::Relaxed);
+        if capture_epoch != self.last_capture_epoch {
+            self.last_capture_epoch = capture_epoch;
+            self.auto_lock.cancel();
+            self.reset_audio_response();
+        }
         // Sync advanced processing flag with capture thread
         let mode_changed = self
             .use_advanced_shared
@@ -1316,6 +1471,7 @@ impl eframe::App for GuiApp {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             // === ChloeVibes Logo ===
             if let Some(logo) = &self.logo_texture {
                 let max_logo_w = ui.available_width() * 0.45;
@@ -1334,8 +1490,8 @@ impl eframe::App for GuiApp {
 
             // === Top Bar: Connection + Scanning + Settings + Stop ===
             ui.horizontal(|ui| {
-                if !matches!(self.connection_state, ConnectionState::Connecting)
-                {
+                ui.allocate_ui_with_layout(vec2(145.0, 30.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.set_min_size(vec2(145.0, 30.0));
                     match self.connection_state {
                         ConnectionState::Error(_) => {
                             if ui.button("Connect to Server").clicked() {
@@ -1390,44 +1546,10 @@ impl eframe::App for GuiApp {
                                 }
                             }
                         }
-                        ConnectionState::Connecting => {}
+                        ConnectionState::AudioOnly => { ui.add_enabled(false, Button::new("Audio only")); }
+                        ConnectionState::Connecting => { ui.add_enabled(false, Button::new("Connecting…")); }
                     }
-                }
-
-                match &self.connection_state {
-                    ConnectionState::Connecting => {
-                        ui.label("Connecting...");
-                    }
-                    ConnectionState::Error(msg) => {
-                        ui.colored_label(Color32::RED, "Error");
-                        ui.label(
-                            RichText::new(msg)
-                                .size(9.0)
-                                .color(palette::TEXT_DIM),
-                        );
-                    }
-                    ConnectionState::Connected => {}
-                }
-
-                if matches!(self.connection_state, ConnectionState::Connected) {
-                    ui.label(
-                        RichText::new(format!("Server: {}", self.server_name))
-                            .size(9.0)
-                            .color(palette::TEXT_DIM)
-                            .monospace(),
-                    );
-                }
-                if !util::capture_is_fresh(app_now_ms(), self.capture_heartbeat.load(Ordering::Relaxed)) {
-                    ui.colored_label(palette::AMBER, "Waiting for audio · output stopped");
-                }
-                if let Ok(status) = self.capture_status.lock() {
-                    ui.label(
-                        RichText::new(format!("Audio: {}", *status))
-                            .size(9.0)
-                            .color(palette::TEXT_DIM)
-                            .monospace(),
-                    );
-                }
+                });
 
                 if ui.button("Settings").clicked() {
                     self.show_settings = true;
@@ -1449,7 +1571,7 @@ impl eframe::App for GuiApp {
                             .strong(),
                     )
                     .fill(al_fill);
-                    let al_resp = ui.add(al_btn);
+                    let al_resp = ui.add_sized([130.0, 30.0], al_btn.truncate());
                     if al_resp.clicked() {
                         self.auto_lock.on_button(current_time_ms);
                     }
@@ -1466,14 +1588,7 @@ impl eframe::App for GuiApp {
                             self.auto_lock.keep(&mut self.settings);
                         }
                     }
-                    if let Some(line) = self.auto_lock.report_line() {
-                        ui.label(
-                            RichText::new(line)
-                                .size(9.0)
-                                .color(palette::ACCENT_TEAL)
-                                .monospace(),
-                        );
-                    }
+
                 }
 
                 let stop_w = 120.0;
@@ -1507,13 +1622,49 @@ impl eframe::App for GuiApp {
                 }
             });
 
+            let (connection_message, connection_color) = match &self.connection_state {
+                ConnectionState::AudioOnly => ("Audio only — devices disconnected".to_owned(), palette::TEXT_DIM),
+                ConnectionState::Connecting => ("Connecting to device server…".to_owned(), palette::AMBER),
+                ConnectionState::Error(message) => (format!("Connection error: {message}"), palette::RED),
+                ConnectionState::Connected => (format!("Server: {}", self.server_name), palette::TEXT_DIM),
+            };
+            status_line(ui, &connection_message, connection_color);
+            let audio_status = self.capture_status.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let audio_fresh = util::capture_is_fresh(app_now_ms(), self.capture_heartbeat.load(Ordering::Relaxed));
+            status_line(ui, &audio_status, if audio_fresh { palette::TEXT_DIM } else { palette::AMBER });
+            if self.settings.use_advanced_processing {
+                status_line(ui, self.auto_lock.report_line().as_deref().unwrap_or(""), palette::ACCENT_TEAL);
+            }
+
+            let sources = self.audio_sources.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let previous_source = self.settings.audio_source_id.clone();
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Audio source");
+                ComboBox::from_id_salt("audio_source")
+                    .width(ui.available_width().min(440.0))
+                    .truncate()
+                    .selected_text(sources.label(self.settings.audio_source_id.as_deref()))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.settings.audio_source_id, None, "Follow Windows default");
+                        for source in &sources.available {
+                            ui.selectable_value(&mut self.settings.audio_source_id, Some(source.id.clone()), &source.name);
+                        }
+                    }).response.on_hover_text("Capture music playing through these speakers or headphones. Windows default follows device changes automatically.");
+            });
+            if self.settings.audio_source_id != previous_source {
+                *self.audio_source_selection.lock().unwrap_or_else(|e| e.into_inner()) = self.settings.audio_source_id.clone();
+                self.capture_heartbeat.store(util::NO_CAPTURE_PACKET, Ordering::Relaxed);
+                self.auto_lock.cancel();
+                self.reset_audio_response();
+            }
+
             let stop_error = self
                 .stop_all_error
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
             if let Some(msg) = stop_error {
-                ui.colored_label(palette::RED, msg);
+                status_line(ui, &msg, palette::RED);
             }
 
             ui.separator();
@@ -1614,8 +1765,9 @@ impl eframe::App for GuiApp {
                 // Predictive onset: tempo-locked pre-trigger so attack lands
                 // on-beat. take_prefire injects strength floor + one-shot latch.
                 // Uses THIS frame's gate (not stale prior-frame).
-                let real_envelope_onset = detected_onset
-                    && !self.beat_detector.is_prefired_onset(current_time_ms);
+                let onset_already_played = detected_onset
+                    && self.beat_detector.is_prefired_onset(current_time_ms);
+                let real_envelope_onset = detected_onset && !onset_already_played;
                 let (is_onset, onset_strength) = if !detected_onset && self.gate_is_open
                     && energy > self.settings.gate_threshold * 0.40
                 {
@@ -1640,7 +1792,7 @@ impl eframe::App for GuiApp {
                 }
 
                 // 6. Envelope ADSR (the big upgrade)
-                let envelope_output = self.envelope.drive(
+                let envelope_output = self.envelope.drive_with_onset_status(
                     self.gate_is_open,
                     energy,
                     onset_ok,
@@ -1663,6 +1815,7 @@ impl eframe::App for GuiApp {
                     self.settings.decay_curve,
                     self.settings.release_curve,
                     self.last_spectral.spectral_centroid,
+                    onset_already_played,
                 );
 
                 if !detected_onset && onset_ok && self.envelope.triggered_at(current_time_ms) {
@@ -1754,7 +1907,7 @@ impl eframe::App for GuiApp {
                     static DIAG_FRAME: AtomicU32 = AtomicU32::new(0);
                     if DIAG_FRAME.fetch_add(1, Ordering::Relaxed).is_multiple_of(60) {
                         let onsets = DIAG_ONSETS.swap(0, Ordering::Relaxed);
-                        eprintln!(
+                        crate::log_stderr!(
                             "[pipe] e={:.5} stable={:.5} gate={} th_eff={:.4} auto={:.2} env={:?} out={:.4} trig={:?} minv={:.2} rmsfb={} conf={:.2} pred_in={:.0}ms str={:.2} onsets={}",
                             energy,
                             stable_energy,
@@ -1864,7 +2017,6 @@ impl eframe::App for GuiApp {
                 1.0
             };
             self.vibration_level = util::limit_output(self.vibration_level, final_ceiling);
-            self.processed_output.store(self.vibration_level);
 
             // Secondary motor (motor 2):
             // - Climax ON → ClimaxEngine.motor2_output (spatial anti-phase arc)
@@ -1923,7 +2075,15 @@ impl eframe::App for GuiApp {
                 }
             }
             self.motor2_level = util::limit_output(self.motor2_level, final_ceiling);
-            self.processed_output_2.store(self.motor2_level);
+            let output = OutputFrame::new([self.vibration_level, self.motor2_level], capture_epoch);
+            self.processed_output.send_if_modified(|previous| {
+                if *previous == output {
+                    false
+                } else {
+                    *previous = output;
+                    true
+                }
+            });
 
             // Push to visualization history
             self.output_history.push_back(self.vibration_level);
@@ -2153,38 +2313,14 @@ impl eframe::App for GuiApp {
 
                 ui.add_space(4.0);
 
-                // --- ADSR Envelope Shape Preview ---
-                let desired = vec2(ui.available_width(), ADSR_PREVIEW_HEIGHT);
-                let (rect, _) = ui.allocate_exact_size(
-                    desired,
-                    egui::Sense::hover(),
-                );
-                draw_adsr_envelope(
-                    ui.painter(),
-                    rect,
-                    self.settings.attack_ms,
-                    self.settings.decay_ms,
-                    self.settings.sustain_level,
-                    self.settings.release_ms,
-                    self.settings.attack_curve,
-                    self.settings.decay_curve,
-                    self.settings.release_curve,
-                    &self.envelope,
-                );
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("ENVELOPE SHAPE")
-                            .size(9.0)
-                            .color(palette::ACCENT_TEAL)
-                            .monospace(),
-                    );
-                    ui.label(
-                        RichText::new("  A → D → S → R")
-                            .size(8.0)
-                            .color(palette::TEXT_DIM)
-                            .monospace(),
-                    );
+                    ui.label(RichText::new("ENVELOPE").strong().color(palette::ACCENT_TEAL));
+                    ui.label(RichText::new("Drag the handles to shape each pulse").small().color(palette::TEXT_DIM));
                 });
+                if crate::adsr_editor::show(ui, &mut self.adsr_editor, &mut self.settings, &self.envelope) {
+                    self.auto_lock.cancel();
+                    mark_custom(&mut self.settings);
+                }
 
                 ui.add_space(8.0);
 
@@ -2487,7 +2623,8 @@ impl eframe::App for GuiApp {
                     );
                     let slider = slider.on_hover_text(
                         "How loud the music must be to vibrate.\n\
-                         Higher = only big hits. Lower = reacts to quieter audio.",
+                         Higher can wait until a bass note swells, delaying the pulse.\n\
+                         Lower starts earlier but may include extra notes.",
                     );
                     if slider.changed() {
                         mark_custom(&mut self.settings);
@@ -2513,7 +2650,8 @@ impl eframe::App for GuiApp {
                             .text("Attack"),
                     );
                     let slider = slider.on_hover_text(
-                        "How fast vibration ramps up. Near 0 = instant punch.",
+                        "Short attacks (under 50 ms) send an immediate punch.\n\
+                         Longer attacks ramp gradually.",
                     );
                     if slider.changed() {
                         mark_custom(&mut self.settings);
@@ -3227,12 +3365,14 @@ impl eframe::App for GuiApp {
                         let task = self.runtime.spawn({
                             let bp_device = bp_device.clone();
                             let props = props.clone();
-                            let processed = self.processed_output.clone();
-                            let processed2 = self.processed_output_2.clone();
+                            let mut processed = self.processed_output.subscribe();
                             let heartbeat = self.pipeline_heartbeat.clone();
                             let capture_heartbeat = self.capture_heartbeat.clone();
+                            let capture_epoch = self.capture_epoch.clone();
                             async move {
                                 let mut dispatch = DeviceDispatchState::default();
+                                let mut schedule = DeviceDispatchSchedule::default();
+                                let schedule_clock = tokio::time::Instant::now();
                                 let mut consecutive_errors: u32 = 0;
 
                                 loop {
@@ -3247,7 +3387,7 @@ impl eframe::App for GuiApp {
                                         || !util::capture_is_fresh(app_now_ms(), capture_heartbeat.load(Ordering::Relaxed))
                                     {
                                         if dispatch.needs_stop() {
-                                            eprintln!(
+                                            crate::log_stderr!(
                                                 "Pipeline heartbeat stale ({heartbeat_age}ms); stopping device"
                                             );
                                             // Only mark stopped on SUCCESS —
@@ -3258,7 +3398,7 @@ impl eframe::App for GuiApp {
                                                 Ok(Ok(_)) => {
                                                     dispatch.confirm_stop();
                                                 }
-                                                result => eprintln!(
+                                                result => crate::log_stderr!(
                                                     "Watchdog stop failed (will retry): {result:?}"
                                                 ),
                                             }
@@ -3267,9 +3407,9 @@ impl eframe::App for GuiApp {
                                         continue;
                                     }
 
-                                    let now = tokio::time::Instant::now();
-                                    let vibration_level = processed.load();
-                                    let vibration_level_2 = processed2.load();
+                                    let output_frame = *processed.borrow_and_update();
+                                    let [vibration_level, vibration_level_2] = output_frame
+                                        .levels_for_epoch(capture_epoch.load(Ordering::Relaxed));
                                     // Compare the final per-actuator values, so changing
                                     // a motor's multiplier or limit takes effect even
                                     // during a steady note. Zero is never dead-banded.
@@ -3294,19 +3434,21 @@ impl eframe::App for GuiApp {
                                         }
                                     };
                                     let should_send = dispatch.should_send(&requested_output);
+                                    let send_delay = schedule.delay(schedule_clock.elapsed());
                                     let vibrate_cmd = (!requested_output.vibrators.is_empty()).then(||
                                         ScalarValueCommand::ScalarValueVec(requested_output.vibrators.clone()));
                                     let oscillate_cmd = (!requested_output.oscillators.is_empty()).then(||
                                         ScalarValueCommand::ScalarValueVec(requested_output.oscillators.clone()));
 
                                     // Only hit the BT stack when we have something new
-                                    if should_send {
+                                    if should_send && send_delay.is_zero() {
+                                        schedule.started(schedule_clock.elapsed());
                                         let mut had_error = false;
                                         if let Some(cmd) = vibrate_cmd {
                                             if !matches!(tokio::time::timeout(
                                                 Duration::from_millis(500), bp_device.vibrate(&cmd),
                                             ).await, Ok(Ok(_))) {
-                                                eprintln!(
+                                                crate::log_stderr!(
                                                     "Vibrate command failed or timed out; retrying latest output"
                                                 );
                                                 had_error = true;
@@ -3316,7 +3458,7 @@ impl eframe::App for GuiApp {
                                             if !matches!(tokio::time::timeout(
                                                 Duration::from_millis(500), bp_device.oscillate(&cmd),
                                             ).await, Ok(Ok(_))) {
-                                                eprintln!(
+                                                crate::log_stderr!(
                                                     "Oscillate command failed or timed out; retrying latest output"
                                                 );
                                                 had_error = true;
@@ -3332,7 +3474,7 @@ impl eframe::App for GuiApp {
                                                 // really gone the client drops
                                                 // it and the UI thread aborts
                                                 // this task.
-                                                eprintln!("10+ consecutive BLE errors; backing off");
+                                                crate::log_stderr!("10+ consecutive BLE errors; backing off");
                                                 tokio::time::sleep(Duration::from_secs(1)).await;
                                             }
                                         } else {
@@ -3342,15 +3484,25 @@ impl eframe::App for GuiApp {
                                         // the current desired output on the next rate-limited
                                         // pass, including unchanged zero/disable commands.
                                         dispatch.complete(&requested_output, !had_error);
+                                        // A newer output may have arrived during the await.
+                                        // Read it immediately, retaining the send deadline.
+                                        continue;
                                     }
 
-                                    // 20ms = 50Hz max update rate.
-                                    // Most BT toys can't actually process faster
-                                    // than ~30-50Hz anyway, so 5ms was pure waste.
-                                    tokio::time::sleep_until(
-                                        now + Duration::from_millis(20),
-                                    )
-                                    .await;
+                                    // Output changes wake an idle device immediately.
+                                    // The deadline still caps active dispatch at 50Hz;
+                                    // periodic checks cover settings-only edits and safety.
+                                    let wait = if should_send {
+                                        send_delay
+                                    } else {
+                                        DEVICE_UPDATE_INTERVAL
+                                    };
+                                    if matches!(
+                                        tokio::time::timeout(wait, processed.changed()).await,
+                                        Ok(Err(_))
+                                    ) {
+                                        break;
+                                    }
                                 }
                             }
                         });
@@ -3373,6 +3525,7 @@ impl eframe::App for GuiApp {
                     }
                 }
             }
+            });
         });
 
         settings_window_widget(ctx, &mut self.show_settings, &mut self.settings);
@@ -3383,242 +3536,6 @@ impl eframe::App for GuiApp {
 // ---------------------------------------------------------------------------
 // Visualization Drawing Functions
 // ---------------------------------------------------------------------------
-
-/// Draw the ADSR envelope shape preview — shows the static curve shape
-/// plus a phase indicator dot showing where the envelope currently is.
-fn draw_adsr_envelope(
-    painter: &egui::Painter,
-    rect: Rect,
-    attack_ms: f32,
-    decay_ms: f32,
-    sustain_level: f32,
-    release_ms: f32,
-    attack_curve: f32,
-    decay_curve: f32,
-    release_curve: f32,
-    envelope: &EnvelopeProcessor,
-) {
-    // Recessed scope well + hairline frame
-    painter.rect_filled(rect, 4.0, palette::WELL);
-    painter.rect_stroke(
-        rect,
-        4.0,
-        Stroke::new(1.0_f32, palette::HAIRLINE),
-        StrokeKind::Inside,
-    );
-
-    let w = rect.width();
-    let h = rect.height();
-    let padding = 8.0;
-    let draw_w = w - padding * 2.0;
-    let draw_h = h - padding * 2.0;
-    let origin = pos2(rect.min.x + padding, rect.max.y - padding);
-
-    // Grid lines
-    for i in 1..=4 {
-        let y = origin.y - draw_h * (i as f32 / 4.0);
-        painter.line_segment(
-            [pos2(origin.x, y), pos2(origin.x + draw_w, y)],
-            Stroke::new(0.5_f32, palette::GRID_LINE),
-        );
-    }
-
-    // Calculate phase widths
-    let sustain_display = 200.0_f32;
-    let total = attack_ms + decay_ms + sustain_display + release_ms;
-    if total <= 0.0 {
-        return;
-    }
-    let time_scale = draw_w / total;
-
-    // Build the curve path
-    let mut points: Vec<Pos2> = Vec::with_capacity(256);
-    points.push(origin);
-
-    let resolution = 2.0_f32;
-    let mut current_x = 0.0_f32;
-
-    // Attack
-    let mut t = 0.0_f32;
-    while t <= attack_ms {
-        let progress = if attack_ms > 0.0 { t / attack_ms } else { 1.0 };
-        let curved = progress.powf(attack_curve);
-        let x = origin.x + t * time_scale;
-        let y = origin.y - curved * draw_h;
-        points.push(pos2(x, y));
-        current_x = t * time_scale;
-        t += resolution;
-    }
-
-    // Decay
-    let attack_x = current_x;
-    let sustain_y = origin.y - sustain_level * draw_h;
-
-    t = 0.0;
-    while t <= decay_ms {
-        let progress = if decay_ms > 0.0 { t / decay_ms } else { 1.0 };
-        let decay_factor = (1.0 - progress).powf(decay_curve);
-        let value = sustain_level + (1.0 - sustain_level) * decay_factor;
-        let x = origin.x + attack_x + t * time_scale;
-        let y = origin.y - value * draw_h;
-        points.push(pos2(x, y));
-        current_x = attack_x + t * time_scale;
-        t += resolution;
-    }
-
-    // Sustain
-    let sustain_end_x = current_x + sustain_display * time_scale;
-    points.push(pos2(origin.x + sustain_end_x, sustain_y));
-
-    // Release
-    t = 0.0;
-    while t <= release_ms {
-        let progress = if release_ms > 0.0 {
-            t / release_ms
-        } else {
-            1.0
-        };
-        let release_factor = (1.0 - progress).powf(release_curve);
-        let value = sustain_level * release_factor;
-        let x = origin.x + sustain_end_x + t * time_scale;
-        let y = origin.y - value * draw_h;
-        points.push(pos2(x, y));
-        t += resolution;
-    }
-
-    // Faint fill under the curve -- properly translucent (not additive), so a
-    // high sustain no longer floods the panel with a bright block.
-    for i in 0..points.len().saturating_sub(1) {
-        let p0 = points[i];
-        let p1 = points[i + 1];
-        let quad = vec![pos2(p0.x, origin.y), p0, p1, pos2(p1.x, origin.y)];
-        painter.add(Shape::convex_polygon(
-            quad,
-            Color32::from_rgba_unmultiplied(56, 190, 235, 16),
-            Stroke::NONE,
-        ));
-    }
-
-    // Single restrained azure curve, no glow.
-    if points.len() >= 2 {
-        painter.add(Shape::line(points, Stroke::new(1.5_f32, palette::CYAN)));
-    }
-
-    // Phase separator lines
-    let phase_xs = [
-        origin.x + attack_ms * time_scale,
-        origin.x + (attack_ms + decay_ms) * time_scale,
-        origin.x + sustain_end_x,
-    ];
-    for &px in &phase_xs {
-        painter.line_segment(
-            [pos2(px, origin.y), pos2(px, origin.y - draw_h)],
-            Stroke::new(0.5_f32, Color32::from_rgba_premultiplied(255, 255, 255, 20)),
-        );
-    }
-
-    // Phase labels — color-coded to match the slider labels
-    let label_y = origin.y - 6.0;
-    let font = FontId::monospace(9.0);
-
-    let a_center = origin.x + attack_ms * time_scale * 0.5;
-    painter.text(
-        pos2(a_center, label_y),
-        egui::Align2::CENTER_BOTTOM,
-        "A",
-        font.clone(),
-        palette::ACCENT_TEAL,
-    );
-
-    let d_center = origin.x + attack_ms * time_scale + decay_ms * time_scale * 0.5;
-    painter.text(
-        pos2(d_center, label_y),
-        egui::Align2::CENTER_BOTTOM,
-        "D",
-        font.clone(),
-        palette::ACCENT_PURPLE,
-    );
-
-    let s_center =
-        origin.x + (attack_ms + decay_ms) * time_scale + sustain_display * time_scale * 0.5;
-    painter.text(
-        pos2(s_center, label_y),
-        egui::Align2::CENTER_BOTTOM,
-        "S",
-        font.clone(),
-        palette::ACCENT_AMBER,
-    );
-
-    let r_center = origin.x + sustain_end_x + release_ms * time_scale * 0.5;
-    painter.text(
-        pos2(r_center, label_y),
-        egui::Align2::CENTER_BOTTOM,
-        "R",
-        font.clone(),
-        Color32::from_rgb(200, 100, 100),
-    );
-
-    // Current phase indicator dot
-    let dot_color = match envelope.state {
-        EnvelopeState::Attack => palette::ACCENT_TEAL,
-        EnvelopeState::Decay => palette::ACCENT_PURPLE,
-        EnvelopeState::Sustain => palette::ACCENT_AMBER,
-        EnvelopeState::Release => Color32::from_rgb(200, 100, 100),
-        EnvelopeState::Idle => palette::TEXT_DIM,
-    };
-    let dot_y = origin.y - envelope.value * draw_h;
-
-    // Approximate x position based on current phase
-    let dot_x = match envelope.state {
-        EnvelopeState::Attack => origin.x + envelope.value * attack_ms * time_scale,
-        EnvelopeState::Decay => {
-            origin.x
-                + attack_ms * time_scale
-                + (1.0 - (envelope.value - sustain_level) / (1.0 - sustain_level).max(0.01))
-                    * decay_ms
-                    * time_scale
-        }
-        EnvelopeState::Sustain => {
-            origin.x + (attack_ms + decay_ms) * time_scale + sustain_display * time_scale * 0.5
-        }
-        EnvelopeState::Release => {
-            let progress = 1.0 - (envelope.value / sustain_level.max(0.01)).clamp(0.0, 1.0);
-            origin.x + sustain_end_x + progress * release_ms * time_scale
-        }
-        EnvelopeState::Idle => origin.x,
-    };
-
-    if envelope.state != EnvelopeState::Idle {
-        // Glow
-        painter.circle_filled(
-            pos2(dot_x.clamp(rect.min.x, rect.max.x), dot_y),
-            8.0,
-            Color32::from_rgba_premultiplied(dot_color.r(), dot_color.g(), dot_color.b(), 40),
-        );
-        // Dot
-        painter.circle_filled(
-            pos2(dot_x.clamp(rect.min.x, rect.max.x), dot_y),
-            4.0,
-            dot_color,
-        );
-
-        // Phase state label in top right
-        let state_text = match envelope.state {
-            EnvelopeState::Attack => "ATTACK",
-            EnvelopeState::Decay => "DECAY",
-            EnvelopeState::Sustain => "SUSTAIN",
-            EnvelopeState::Release => "RELEASE",
-            EnvelopeState::Idle => "",
-        };
-        painter.text(
-            pos2(rect.max.x - padding, rect.min.y + padding + 10.0),
-            egui::Align2::RIGHT_TOP,
-            state_text,
-            FontId::monospace(10.0),
-            dot_color,
-        );
-    }
-}
 
 /// Draw the rolling output history as a waveform with energy overlay.
 fn draw_output_history(
@@ -3971,6 +3888,56 @@ fn smoothing_alpha(delta_time_s: f32, time_ms: f32) -> f32 {
     } else {
         let tau = (time_ms / 1000.0).max(0.001);
         (1.0 - (-delta_time_s / tau).exp()).clamp(0.0, 1.0)
+    }
+}
+
+fn status_line(ui: &mut Ui, text: &str, color: Color32) {
+    let single_line = text.replace(['\r', '\n'], " ");
+    let size = vec2(ui.available_width(), 18.0);
+    ui.allocate_ui_with_layout(
+        size,
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.set_min_size(size);
+            ui.add(egui::Label::new(RichText::new(single_line).size(10.0).color(color)).truncate())
+                .on_hover_text(text);
+        },
+    );
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    #[test]
+    fn cycling_long_connection_messages_cannot_change_status_row_size() {
+        for width in [640.0, 1100.0] {
+            let ctx = egui::Context::default();
+            let long_error =
+                "Disconnected: reconnecting to a playback device with a long name.\n".repeat(40);
+            let mut baseline = None;
+            for text in ["", "Connected", &long_error, "Reconnecting…", "Ready"] {
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(width, 480.0))),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            let top = ui.cursor().top();
+                            status_line(ui, text, Color32::WHITE);
+                            let height = ui.cursor().top() - top;
+                            assert!(ui.min_rect().width() <= width - 16.0 + 0.01);
+                            if let Some(expected) = baseline {
+                                assert_eq!(height, expected);
+                            } else {
+                                baseline = Some(height);
+                            }
+                        });
+                    },
+                );
+            }
+        }
     }
 }
 

@@ -13,7 +13,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/coldbricks/Chloe-Vibes/releases/latest">What's new in v1.6.0</a>
+  <a href="https://github.com/coldbricks/Chloe-Vibes/releases/latest">What's new in v1.6.1</a>
   &nbsp; · &nbsp;
   <a href="docs/TECHNICAL_REFERENCE.md">Guide &amp; technical reference</a>
   &nbsp; · &nbsp;
@@ -26,28 +26,45 @@
 
 ChloeVibes treats haptics like a musical instrument. A kick can have a distinct attack and a fading tail. A sustained passage can carry texture. Silence can leave space for the next phrase.
 
-Start with one of **33 presets**, or press **FIND BOOM** on Windows to fit a response to the track. When you want to go further, open the full controls and shape the instrument yourself.
+Start with one of **33 presets**, or press **FIND BOOM** on Windows to fit a response to the track. Grab the envelope and shape the pulse directly: a sharper attack, a longer tail, a different feel. Open the full controls whenever you want more detail.
+
+<p align="center">
+  <img src="assets/windows-envelope.jpg" alt="ChloeVibes for Windows: a large, color-coded envelope editor with draggable attack, decay, sustain and release handles." width="100%">
+</p>
 
 | **Find the feeling** | **Shape the response** | **Stay with the music** |
 | :--- | :--- | :--- |
-| Bass Drum, Deep 90, Club 125, and a wider preset collection. Windows FIND BOOM tunes frequency focus and pulse shape. | Full **attack, decay, sustain, release**, envelope curves, frequency selection, gate, and output controls. | Predictive beat timing, dynamic response, optional long-cycle modulation, and explicit rests. Added output delay defaults to **zero**. |
+| Bass Drum, Deep 90, Club 125, and a wider preset collection. Windows FIND BOOM tunes frequency focus and pulse shape. | A large **draggable ADSR editor** on both platforms, plus envelope curves, frequency selection, gate, and output controls. | Predictive beat timing, dynamic response, optional long-cycle modulation, and explicit rests. Added output delay defaults to **zero**. |
 
 ### Two native apps. One musical idea.
 
 | | Windows | Android |
 | :--- | :--- | :--- |
-| **Audio** | System playback through WASAPI | Choose system audio or microphone |
+| **Audio** | Follow Windows default or choose speakers/headphones; reconnect automatically | Choose system audio or microphone |
 | **Devices** | Supported vibration and oscillation devices through Buttplug / Intiface | Direct Lovense Bluetooth connection |
 | **Start simply** | Presets + FIND BOOM | Presets + Simple controls |
-| **Go deeper** | Expand full ADSR and tuning | Switch to Full controls |
+| **Shape a pulse** | Drag the envelope; expand full tuning | Touch and drag the envelope; switch to Full controls |
+
+**New in 1.6.1:** direct envelope editing, steady layouts during reconnection, the platform-heel app icon, and a Windows capture/dispatch update that reduces avoidable waiting. Shared onset fixes also reach Android. [Release details](https://github.com/coldbricks/Chloe-Vibes/releases/tag/v1.6.1).
+
+<details>
+<summary>See the Android touch editor</summary>
+<p align="center">
+  <img src="assets/android-envelope.png" alt="Android envelope editor after dragging the decay and sustain corner, with Stop all always within reach." width="360">
+</p>
+</details>
 
 ### Your first track
 
 1. Download the app and connect your device.
-2. Play music. Choose **Bass Drum**, or use **FIND BOOM** on Windows.
+2. Play music. On Windows, check **Audio source**. Choose **Bass Drum**, or use **FIND BOOM**.
 3. Adjust the output to a comfortable level. Explore the full controls whenever you like.
 
 **Windows:** run the executable; [Intiface Central](https://intiface.com/central/) is supported. **Android:** sideload the debug APK and grant the requested audio/Bluetooth permissions. System-audio capture depends on your phone and playback app.
+
+An [optimized Android APK](https://github.com/coldbricks/Chloe-Vibes/releases/latest/download/ChloeVibes-android-release.apk) is also available, with the same features and signing identity. [Build and signing details](docs/TECHNICAL_REFERENCE.md#10-build-test-and-ci).
+
+[Windows audio routing and response timing](docs/WINDOWS_AUDIO.md)
 
 Use **Stop all devices** to end output. Both apps include stale-input handling and stop watchdogs; a disconnected device may not receive a stop command.
 

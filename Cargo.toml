@@ -1,6 +1,6 @@
 [package]
 name = "chloe-vibes"
-version = "1.6.0"
+version = "1.6.1"
 edition = "2021"
 license = "MIT"
 
@@ -10,7 +10,7 @@ license = "MIT"
 buttplug = { version = "9.0.9", features = ["server"] }
 flume = "0.12.0"
 clap = { version = "4.5.54", features = ["derive"] }
-audio-capture = { git = "https://github.com/Shadlock0133/audio-capture", rev = "26e326cffcf00cdc564a2b840c6421e021e0c27f" }
+audio-capture = { path = "vendor/audio-capture" }
 parking_lot = "0.12.5"
 eframe = { version = "0.33.3", features = ["persistence"] }
 tokio = { version = "1.49.0", features = ["rt-multi-thread"] }
@@ -21,3 +21,6 @@ rustfft = "6.2"
 
 # Image loading for embedded logo
 image = { version = "0.24", default-features = false, features = ["png"] }
+
+[build-dependencies]
+winresource = { version = "0.1.31", default-features = false }

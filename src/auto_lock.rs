@@ -19,7 +19,7 @@
 use std::collections::VecDeque;
 
 use crate::{
-    audio::{FrequencyMode, SpectralData, TriggerMode},
+    audio::{FrequencyMode, SpectralAnalyzer, SpectralData, TriggerMode},
     settings::Settings,
 };
 
@@ -734,9 +734,14 @@ impl AutoLock {
         centroids.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let centroid_median = percentile_sorted(&centroids, 0.5);
 
-        // Gate fit: pre-volume energy on hits vs between hits. Threshold sits
-        // just above the trough so kicks open the gate and silence closes it
-        // — the single biggest lever for dynamic contrast.
+        // Gate fit must use the frequency focus that the lock will apply.
+        // The recorded pre-volume level belongs to the user's old selection;
+        // carrying it into a newly chosen band can hold the gate shut or open.
+        // Preserve the existing crest/selection decisions, then replay only
+        // the energy extraction + host normalization for the target gate.
+        let (gate_mode, gate_frequency) =
+            Self::frequency_focus(best_band, salience_margin, crest, 0.0);
+        let mut gate_energies = Vec::new();
         let mut hit_e: Vec<f32> = Vec::new();
         let mut floor_e: Vec<f32> = Vec::new();
         for f in &frames {
@@ -746,21 +751,32 @@ impl AutoLock {
             let on_hit = onsets
                 .iter()
                 .any(|&o| f.t_ms >= o && f.t_ms - o <= ONSET_ALIGN_MS);
+            let spectral = SpectralData {
+                band_energies: f.band_energies,
+                ..SpectralData::default()
+            };
+            let target_energy =
+                SpectralAnalyzer::extract_energy(&spectral, gate_mode, gate_frequency);
+            // Keep in step with desktop normalize_capture_energy: volume and
+            // output gain do not participate in the gate's input domain.
+            let gate_energy = (target_energy * 6.0).clamp(0.0, 1.0).powf(0.65);
+            gate_energies.push(gate_energy);
             if on_hit {
-                hit_e.push(f.pre_volume_energy);
+                hit_e.push(gate_energy);
             } else {
-                floor_e.push(f.pre_volume_energy);
+                floor_e.push(gate_energy);
             }
         }
+        gate_energies.sort_by(|a, b| a.partial_cmp(b).unwrap());
         hit_e.sort_by(|a, b| a.partial_cmp(b).unwrap());
         floor_e.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let energy_hit = if hit_e.is_empty() {
-            percentile_sorted(&energies, 0.90)
+            percentile_sorted(&gate_energies, 0.90)
         } else {
             percentile_sorted(&hit_e, 0.50)
         };
         let energy_floor = if floor_e.is_empty() {
-            percentile_sorted(&energies, 0.20)
+            percentile_sorted(&gate_energies, 0.20)
         } else {
             percentile_sorted(&floor_e, 0.50)
         };
@@ -797,29 +813,42 @@ impl AutoLock {
         t
     }
 
+    fn frequency_focus(
+        best_band: usize,
+        salience_margin: f32,
+        crest: f32,
+        previous_target: f32,
+    ) -> (FrequencyMode, f32) {
+        // Frequency focus. Clear winner → tight band. Ambiguous but punchy /
+        // low-band → still kick-lock (Full smears hats into the boom).
+        if salience_margin >= SALIENCE_MARGIN {
+            match best_band {
+                0 => (FrequencyMode::LowPass, BAND_EDGES[1]), // sub only
+                1 => (FrequencyMode::LowPass, BAND_EDGES[2]), // sub+bass
+                2 | 3 => (
+                    FrequencyMode::BandPass,
+                    (BAND_EDGES[best_band] * BAND_EDGES[best_band + 1]).sqrt(),
+                ),
+                b => (FrequencyMode::HighPass, BAND_EDGES[b]),
+            }
+        } else if crest >= 2.0 || best_band <= 1 {
+            (FrequencyMode::LowPass, BAND_EDGES[2])
+        } else {
+            (FrequencyMode::Full, previous_target)
+        }
+    }
+
     /// Feature -> parameter mapping. Always produces the bass-drum boom
     /// shape; crest / band / gate decide *how hard* and *where*, never
     /// whether we boom. Intensity fields stay under the user's ceiling.
     fn map_features(f: &Features, settings: &Settings) -> LockParams {
         let t = Self::fold_to_perceptual_beat(f.ioi_median);
-
-        // Frequency focus. Clear winner → tight band. Ambiguous but punchy /
-        // low-band → still kick-lock (Full smears hats into the boom).
-        let (frequency_mode, target_frequency) = if f.salience_margin >= SALIENCE_MARGIN {
-            match f.best_band {
-                0 => (FrequencyMode::LowPass, BAND_EDGES[1]), // sub only
-                1 => (FrequencyMode::LowPass, BAND_EDGES[2]), // sub+bass
-                2 | 3 => (
-                    FrequencyMode::BandPass,
-                    (BAND_EDGES[f.best_band] * BAND_EDGES[f.best_band + 1]).sqrt(),
-                ),
-                b => (FrequencyMode::HighPass, BAND_EDGES[b]),
-            }
-        } else if f.crest >= 2.0 || f.best_band <= 1 {
-            (FrequencyMode::LowPass, BAND_EDGES[2])
-        } else {
-            (FrequencyMode::Full, settings.target_frequency)
-        };
+        let (frequency_mode, target_frequency) = Self::frequency_focus(
+            f.best_band,
+            f.salience_margin,
+            f.crest,
+            settings.target_frequency,
+        );
 
         // Trigger: max dynamic delivery. Kick-band or punchy crest → Hybrid
         // with a strong binary thump. Flat material stays Dynamic on the same
@@ -1692,5 +1721,67 @@ mod tests {
         // Boom body always
         assert!(settings.sustain_level < 0.2);
         assert!(settings.decay_ms > 200.0);
+    }
+
+    #[test]
+    fn gate_fit_uses_selected_spectrum_instead_of_previous_source_level() {
+        // Same audio, but a previous source selection can report either a
+        // loud unrelated band or a quiet one. Neither level describes the new
+        // target gate. Cover every frequency mode the tuner can select.
+        for (pulsing_bands, expected_mode) in [
+            (vec![1], FrequencyMode::LowPass),
+            (vec![3], FrequencyMode::BandPass),
+            (vec![5], FrequencyMode::HighPass),
+            (vec![4, 5], FrequencyMode::Full),
+        ] {
+            let estimate_with_previous_level = |previous_level| {
+                let mut tuner = AutoLock::new();
+                for index in 0..300 {
+                    let now = index as f32 * 20.0;
+                    let hit = now >= 100.0 && (now - 100.0) % 500.0 <= ONSET_ALIGN_MS;
+                    let mut bands = [0.0004; N_BANDS];
+                    for &band in &pulsing_bands {
+                        bands[band] = if hit { 0.012 } else { 0.0004 };
+                    }
+                    tuner.frames.push_back(FrameSample {
+                        t_ms: now,
+                        band_energies: bands,
+                        pre_volume_energy: previous_level,
+                        centroid: 800.0,
+                        valid: true,
+                    });
+                }
+                tuner.onsets = (0..12).map(|index| 100.0 + index as f32 * 500.0).collect();
+                tuner.estimate(0.0).unwrap()
+            };
+            let quiet = estimate_with_previous_level(0.02);
+            let loud = estimate_with_previous_level(0.8);
+            let settings = Settings::default();
+            let quiet_target = AutoLock::map_features(&quiet, &settings);
+            let loud_target = AutoLock::map_features(&loud, &settings);
+            assert_eq!(quiet_target.frequency_mode, expected_mode);
+            assert_eq!(loud_target.frequency_mode, expected_mode);
+            assert_eq!(quiet.energy_hit, loud.energy_hit);
+            assert_eq!(quiet.energy_floor, loud.energy_floor);
+            assert_eq!(quiet_target.gate_threshold, loud_target.gate_threshold);
+            assert!(quiet_target.gate_threshold > quiet.energy_floor);
+            assert!(quiet_target.gate_threshold < quiet.energy_hit);
+
+            // The fitted gate must actually open on a hit and close again in
+            // the target band's trough, rather than stay shut after retuning.
+            let mut gate = crate::audio::Gate::new();
+            assert!(gate.process(
+                quiet.energy_hit,
+                quiet_target.gate_threshold,
+                0.0,
+                quiet_target.gate_smoothing
+            ));
+            assert!(!gate.process(
+                quiet.energy_floor,
+                quiet_target.gate_threshold,
+                0.0,
+                quiet_target.gate_smoothing
+            ));
+        }
     }
 }

@@ -56,6 +56,8 @@ pub struct Settings {
     pub low_pass_freq: SharedF32,
     pub use_dark_mode: bool,
     pub start_scanning_on_startup: bool,
+    /// None follows the current Windows playback default, including device changes.
+    pub audio_source_id: Option<String>,
     pub polling_rate_ms: SharedF32,
     pub use_polling_rate: Arc<AtomicBool>,
     pub device_settings: HashMap<String, DeviceSettings>,
@@ -477,6 +479,7 @@ mod names {
     pub const LOW_PASS_FREQ: &str = "low_pass_freq";
     pub const DARK_MODE: &str = "dark_mode";
     pub const START_SCANNING_ON_STARTUP: &str = "start_scanning_on_startup";
+    pub const AUDIO_SOURCE_ID: &str = "audio_source_id";
     pub const POLLING_RATE_MS: &str = "polling_rate_ms";
     pub const USE_POLLING_RATE: &str = "use_polling_rate";
     pub const DEVICE_SETTINGS: &str = "device_settings";
@@ -533,6 +536,7 @@ impl Default for Settings {
             low_pass_freq: SharedF32::new(defaults::LOW_PASS_FREQ),
             use_dark_mode: defaults::DARK_MODE,
             start_scanning_on_startup: defaults::START_SCANNING_ON_STARTUP,
+            audio_source_id: None,
             polling_rate_ms: SharedF32::new(defaults::POLLING_RATE_MS),
             use_polling_rate: Arc::new(AtomicBool::new(defaults::USE_POLLING_RATE)),
             device_settings: HashMap::new(),
@@ -597,6 +601,7 @@ impl Settings {
         let low_pass_freq =
             get_value(storage, names::LOW_PASS_FREQ).unwrap_or(defaults::LOW_PASS_FREQ);
         let use_dark_mode = get_value(storage, names::DARK_MODE).unwrap_or(defaults::DARK_MODE);
+        let audio_source_id = get_value(storage, names::AUDIO_SOURCE_ID).unwrap_or(None);
         let start_scanning_on_startup = get_value(storage, names::START_SCANNING_ON_STARTUP)
             .unwrap_or(defaults::START_SCANNING_ON_STARTUP);
         let polling_rate_ms =
@@ -687,6 +692,7 @@ impl Settings {
             low_pass_freq: SharedF32::new(low_pass_freq),
             use_dark_mode,
             start_scanning_on_startup,
+            audio_source_id,
             polling_rate_ms: SharedF32::new(polling_rate_ms),
             use_polling_rate: Arc::new(AtomicBool::new(use_polling_rate)),
             device_settings,
@@ -737,6 +743,7 @@ impl Settings {
         set_value(storage, names::MAIN_VOLUME, &self.main_volume);
         set_value(storage, names::LOW_PASS_FREQ, &self.low_pass_freq.load());
         set_value(storage, names::DARK_MODE, &self.use_dark_mode);
+        set_value(storage, names::AUDIO_SOURCE_ID, &self.audio_source_id);
         set_value(
             storage,
             names::START_SCANNING_ON_STARTUP,

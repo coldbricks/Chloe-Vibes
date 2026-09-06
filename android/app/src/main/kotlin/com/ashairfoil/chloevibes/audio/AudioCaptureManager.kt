@@ -725,7 +725,8 @@ class AudioCaptureManager(private val context: Context) {
             // Predictive onset: takePrefire injects strength floor + one-shot
             // latch (mirrors Rust BeatDetector::take_prefire). Confidence
             // decays without onsets so stale locks cannot ghost-fire.
-            var isOnset = detectedOnset && !state.beatDetector.isPrefiredOnset(currentTimeMs)
+            val onsetAlreadyPlayed = detectedOnset && state.beatDetector.isPrefiredOnset(currentTimeMs)
+            var isOnset = detectedOnset && !onsetAlreadyPlayed
             var onsetStr = onsetStrength
             var syntheticPrefire = false
             if (!detectedOnset && gateOpen && !missingCapture) {
@@ -763,7 +764,8 @@ class AudioCaptureManager(private val context: Context) {
                 attackCurve = params.attackCurve,
                 decayCurve = params.decayCurve,
                 releaseCurve = params.releaseCurve,
-                spectralCentroid = spectralData.spectralCentroid
+                spectralCentroid = spectralData.spectralCentroid,
+                onsetAlreadyPlayed = onsetAlreadyPlayed
             )
             if (syntheticPrefire && isOnset && envelopeOutput > 0f && state.envelope.triggeredAt(currentTimeMs)) {
                 state.beatDetector.confirmPrefire(currentTimeMs)

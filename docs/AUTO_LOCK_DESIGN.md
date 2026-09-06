@@ -1,6 +1,6 @@
 # FIND BOOM — Automatic response fitting
 
-Design reference for ChloeVibes **1.6.0**. The desktop implementation is
+Design reference for ChloeVibes **1.6.1**. The desktop implementation is
 [`src/auto_lock.rs`](../src/auto_lock.rs); its internal name is AUTO-LOCK.
 See the [technical reference](TECHNICAL_REFERENCE.md) for the shared signal
 engine and output controls.

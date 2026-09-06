@@ -864,9 +864,10 @@ impl EnvelopeProcessor {
     }
 
     /// Drive the envelope from gate state and onset detection.
-    /// This is the main entry point called each frame from the GUI update.
+    /// Compatibility entry point when no confirmed prediction needs suppression.
     ///
-    /// Returns the envelope output (0.0 - 1.0).
+    /// Returns the envelope output (0.0 - 1.20, including transient headroom).
+    #[allow(dead_code)] // Public compatibility API; predictive hosts use the status-aware variant.
     #[allow(clippy::too_many_arguments)]
     pub fn drive(
         &mut self,
@@ -889,6 +890,57 @@ impl EnvelopeProcessor {
         decay_curve: f32,
         release_curve: f32,
         spectral_centroid: f32,
+    ) -> f32 {
+        self.drive_with_onset_status(
+            gate_open,
+            energy,
+            is_onset,
+            onset_strength,
+            current_time_ms,
+            trigger_mode,
+            threshold,
+            threshold_knee,
+            dynamic_curve,
+            binary_level,
+            hybrid_blend,
+            attack_ms,
+            decay_ms,
+            sustain_level,
+            release_ms,
+            attack_curve,
+            decay_curve,
+            release_curve,
+            spectral_centroid,
+            false,
+        )
+    }
+
+    /// Drive a frame whose real onset may already have played predictively.
+    /// A matching played onset cannot create another attack through a gate
+    /// reopening. Gate state, release and silence still advance normally.
+    #[allow(clippy::too_many_arguments)]
+    pub fn drive_with_onset_status(
+        &mut self,
+        gate_open: bool,
+        energy: f32,
+        is_onset: bool,
+        onset_strength: f32,
+        current_time_ms: f32,
+        trigger_mode: TriggerMode,
+        threshold: f32,
+        threshold_knee: f32,
+        dynamic_curve: f32,
+        binary_level: f32,
+        hybrid_blend: f32,
+        attack_ms: f32,
+        decay_ms: f32,
+        sustain_level: f32,
+        release_ms: f32,
+        attack_curve: f32,
+        decay_curve: f32,
+        release_curve: f32,
+        spectral_centroid: f32,
+        onset_already_played: bool,
     ) -> f32 {
         // Frequency-dependent envelope shaping: bass = deep sustained pressure,
         // treble = sharp surface tingling. Spectral centroid tells us whether the
@@ -948,14 +1000,15 @@ impl EnvelopeProcessor {
                 || (matches!(trigger_mode, TriggerMode::Hybrid) && hybrid_blend < 0.45));
 
         // Trigger logic
-        if gate_just_opened || is_onset_trigger {
+        if !onset_already_played && (gate_just_opened || is_onset_trigger) {
             let velocity = if is_onset_trigger {
                 onset_strength.min(1.35)
             } else {
                 1.0
             };
             self.trigger(magnitude.max(0.03), current_time_ms, velocity, attack_ms);
-        } else if gate_open
+        } else if !onset_already_played
+            && gate_open
             && self.state == EnvelopeState::Idle
             && continuous_hold
             && magnitude > 0.05
@@ -1993,6 +2046,116 @@ mod tests {
         // Attack state, or cooldown. It therefore does not confirm the prefire.
         assert!(beat.process(10.0, 3000.0).0);
         assert!(!beat.is_prefired_onset(3000.0));
+    }
+
+    fn drive_prefire_frame(
+        envelope: &mut EnvelopeProcessor,
+        now: f32,
+        gate: bool,
+        onset: bool,
+        strength: f32,
+        already_played: bool,
+    ) -> f32 {
+        envelope.drive_with_onset_status(
+            gate,
+            if gate { 0.8 } else { 0.0 },
+            onset,
+            strength,
+            now,
+            TriggerMode::Hybrid,
+            0.14,
+            0.15,
+            1.2,
+            0.82,
+            0.58,
+            20.0,
+            375.0,
+            0.08,
+            240.0,
+            0.7,
+            1.8,
+            1.3,
+            100.0,
+            already_played,
+        )
+    }
+
+    #[test]
+    fn played_prefire_cannot_retrigger_when_matching_real_onset_reopens_gate() {
+        let mut beat = BeatDetector::new();
+        for now in [1000.0, 1500.0, 2000.0, 2500.0] {
+            assert!(beat.process(10.0, now).0);
+        }
+        let mut envelope = EnvelopeProcessor::new();
+        let strength = beat.take_prefire(2950.0).unwrap();
+        let predicted_peak =
+            drive_prefire_frame(&mut envelope, 2950.0, true, true, strength, false);
+        assert!(envelope.triggered_at(2950.0));
+        beat.confirm_prefire(2950.0);
+        drive_prefire_frame(&mut envelope, 2970.0, false, false, 0.0, false);
+        assert_eq!(envelope.state, EnvelopeState::Release);
+
+        let (real, strength) = beat.process(10.0, 3000.0);
+        let played = real && beat.is_prefired_onset(3000.0);
+        assert!(played);
+        let actual = drive_prefire_frame(
+            &mut envelope,
+            3000.0,
+            true,
+            real && !played,
+            strength,
+            played,
+        );
+        assert!(
+            !envelope.triggered_at(3000.0),
+            "gate reopening must not duplicate a played beat"
+        );
+        assert!(actual < predicted_peak);
+        assert_eq!(envelope.state, EnvelopeState::Release);
+        drive_prefire_frame(&mut envelope, 3010.0, true, false, 0.0, false);
+        assert!(
+            !envelope.triggered_at(3010.0),
+            "the suppressed gate edge must still be consumed"
+        );
+
+        // A separate real hit remains playable; suppression is specific to
+        // the one confirmed matching onset, not the entire prediction window.
+        let (real, strength) = beat.process(10.0, 3060.0);
+        let played = real && beat.is_prefired_onset(3060.0);
+        assert!(real && !played);
+        drive_prefire_frame(&mut envelope, 3060.0, true, real, strength, played);
+        assert!(envelope.triggered_at(3060.0));
+        drive_prefire_frame(&mut envelope, 3070.0, false, false, 0.0, true);
+        assert_eq!(envelope.state, EnvelopeState::Release);
+        assert_eq!(
+            drive_prefire_frame(&mut envelope, 3500.0, false, false, 0.0, false),
+            0.0
+        );
+        assert!(envelope.silence_event);
+    }
+
+    #[test]
+    fn rejected_prefire_does_not_swallow_real_gate_opening_or_held_gate_onset() {
+        for gate_was_open in [false, true] {
+            let mut beat = BeatDetector::new();
+            for now in [1000.0, 1500.0, 2000.0, 2500.0] {
+                assert!(beat.process(10.0, now).0);
+            }
+            let mut envelope = EnvelopeProcessor::new();
+            if gate_was_open {
+                drive_prefire_frame(&mut envelope, 2945.0, true, true, 1.35, false);
+            }
+            let strength = beat.take_prefire(2950.0).unwrap();
+            drive_prefire_frame(&mut envelope, 2950.0, gate_was_open, true, strength, false);
+            assert!(!envelope.triggered_at(2950.0));
+            // Closed gate or cooldown rejected the synthetic attack, so the
+            // host must leave it unconfirmed and permit the real event.
+            let (real, strength) = beat.process(10.0, 3000.0);
+            let played = real && beat.is_prefired_onset(3000.0);
+            assert!(real && !played);
+            drive_prefire_frame(&mut envelope, 3000.0, true, real, strength, played);
+            assert!(envelope.triggered_at(3000.0));
+        }
     }
 
     #[test]

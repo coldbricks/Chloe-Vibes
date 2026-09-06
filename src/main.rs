@@ -1,8 +1,11 @@
 // Stops console from showing, but also stops stdout and stderr
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod adsr_editor;
 mod audio;
+mod audio_source;
 mod auto_lock;
+mod capture_frames;
 mod device_dispatch;
 mod gui;
 mod presets;
@@ -85,7 +88,7 @@ fn main() {
         // panics (WASAPI device blips). Those are recovered — do NOT spam
         // crash.log / backtraces or it looks like the app is dying every second.
         if std::thread::current().name() == Some("capture") {
-            eprintln!("[capture] recovered panic (audio device blip): {info}");
+            crate::log_stderr!("[capture] recovered panic (audio device blip): {info}");
             return;
         }
 
@@ -126,7 +129,7 @@ fn main() {
             "[{timestamp}] PANIC at {loc} — details in crash.log\n"
         ));
         // Also try stderr in case we have a console
-        eprintln!("{msg}");
+        crate::log_stderr!("{msg}");
     }));
 
     start_session_log();

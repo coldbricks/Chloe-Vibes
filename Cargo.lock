@@ -503,7 +503,6 @@ dependencies = [
 [[package]]
 name = "audio-capture"
 version = "0.1.0"
-source = "git+https://github.com/Shadlock0133/audio-capture?rev=26e326cffcf00cdc564a2b840c6421e021e0c27f#26e326cffcf00cdc564a2b840c6421e021e0c27f"
 dependencies = [
  "winapi",
 ]
@@ -880,7 +879,7 @@ dependencies = [
 
 [[package]]
 name = "chloe-vibes"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "audio-capture",
  "buttplug",
@@ -892,6 +891,7 @@ dependencies = [
  "rustfft",
  "serde",
  "tokio",
+ "winresource",
 ]
 
 [[package]]
@@ -6134,6 +6134,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a5364e9d77fcdeeaa6062ced926ee3381faa2ee02d3eb83a5c27a8825540829"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "winresource"
+version = "0.1.31"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0986a8b1d586b7d3e4fe3d9ea39fb451ae22869dcea4aa109d287a374d866087"
+dependencies = [
+ "version_check",
 ]
 
 [[package]]

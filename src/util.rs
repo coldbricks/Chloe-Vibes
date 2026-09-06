@@ -27,6 +27,24 @@ use buttplug::{
 
 const DEFAULT_SERVER_ADDR: &str = "ws://127.0.0.1:12345";
 
+/// Best-effort diagnostics for GUI launches whose inherited stderr may be
+/// absent or disconnected. A logging I/O error must not become a second panic,
+/// especially while recovering capture or reporting an existing panic.
+pub(crate) fn log_stderr(message: std::fmt::Arguments<'_>) {
+    write_diagnostic_line(&mut std::io::stderr().lock(), message);
+}
+
+fn write_diagnostic_line(writer: &mut impl std::io::Write, message: std::fmt::Arguments<'_>) {
+    let _ = writeln!(writer, "{message}");
+}
+
+#[macro_export]
+macro_rules! log_stderr {
+    ($($argument:tt)*) => {
+        $crate::util::log_stderr(format_args!($($argument)*))
+    };
+}
+
 pub type ClientConnectionResult = Result<ButtplugClient, Box<ButtplugClientError>>;
 
 pub const NO_CAPTURE_PACKET: u64 = u64::MAX;
@@ -98,11 +116,11 @@ async fn connect_embedded(client_name: &str) -> Option<ButtplugClient> {
     match tokio::task::spawn(async move { start_embedded_client(&name).await }).await {
         Ok(Ok(client)) => Some(client),
         Ok(Err(e)) => {
-            eprintln!("Embedded in-process server startup failed: {e}");
+            crate::log_stderr!("Embedded in-process server startup failed: {e}");
             None
         }
         Err(e) => {
-            eprintln!("Embedded in-process server failed: {e}");
+            crate::log_stderr!("Embedded in-process server failed: {e}");
             None
         }
     }
@@ -130,11 +148,11 @@ fn build_device_config_manager_builder(
         if main_cfg.is_some() || user_cfg.is_some() {
             match load_protocol_configs(&main_cfg, &user_cfg, true) {
                 Ok(builder) => {
-                    eprintln!("Loaded embedded config from Intiface files");
+                    crate::log_stderr!("Loaded embedded config from Intiface files");
                     builder
                 }
                 Err(e) => {
-                    eprintln!("Couldn't load Intiface config for embedded mode: {e}");
+                    crate::log_stderr!("Couldn't load Intiface config for embedded mode: {e}");
                     DeviceConfigurationManagerBuilder::default()
                 }
             }
@@ -229,11 +247,11 @@ pub async fn start_bp_server(server_addr: Option<String>) -> ClientConnectionRes
     let server_addr = server_addr.filter(|addr| {
         if addr.starts_with("ws://") || addr.starts_with("wss://") {
             if !addr.contains("127.0.0.1") && !addr.contains("localhost") && addr.starts_with("ws://") {
-                eprintln!("Warning: connecting to non-localhost server without TLS. Consider using wss://");
+                crate::log_stderr!("Warning: connecting to non-localhost server without TLS. Consider using wss://");
             }
             true
         } else {
-            eprintln!("Invalid server address: must start with ws:// or wss://. Falling back to embedded server.");
+            crate::log_stderr!("Invalid server address: must start with ws:// or wss://. Falling back to embedded server.");
             false
         }
     });
@@ -241,8 +259,8 @@ pub async fn start_bp_server(server_addr: Option<String>) -> ClientConnectionRes
         match connect_remote(name, addr).await {
             Ok(client) => client,
             Err(e) => {
-                eprintln!("Couldn't connect to external server ({addr}): {e}");
-                eprintln!("Trying embedded in-process server");
+                crate::log_stderr!("Couldn't connect to external server ({addr}): {e}");
+                crate::log_stderr!("Trying embedded in-process server");
                 if let Some(client) = connect_embedded(name).await {
                     client
                 } else {
@@ -251,14 +269,14 @@ pub async fn start_bp_server(server_addr: Option<String>) -> ClientConnectionRes
             }
         }
     } else {
-        eprintln!("No server configured; trying external server at {DEFAULT_SERVER_ADDR}");
+        crate::log_stderr!("No server configured; trying external server at {DEFAULT_SERVER_ADDR}");
         match connect_remote(name, DEFAULT_SERVER_ADDR).await {
             Ok(client) => client,
             Err(e) => {
-                eprintln!(
+                crate::log_stderr!(
                     "Couldn't connect to default external server ({DEFAULT_SERVER_ADDR}): {e}"
                 );
-                eprintln!("Falling back to embedded in-process server");
+                crate::log_stderr!("Falling back to embedded in-process server");
                 if let Some(client) = connect_embedded(name).await {
                     client
                 } else {
@@ -270,7 +288,7 @@ pub async fn start_bp_server(server_addr: Option<String>) -> ClientConnectionRes
 
     let server_name = client.server_name();
     let server_name = server_name.as_deref().unwrap_or("<unknown>");
-    eprintln!("Server name: {server_name}");
+    crate::log_stderr!("Server name: {server_name}");
 
     Ok(client)
 }
@@ -348,6 +366,66 @@ impl MinCutoff for f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_logging_ignores_a_closed_pipe() {
+        struct ClosedPipe {
+            attempts: usize,
+        }
+        impl std::io::Write for ClosedPipe {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                self.attempts += 1;
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut pipe = ClosedPipe { attempts: 0 };
+        // This is the same writer path used by startup errors and the panic
+        // hook. Both calls must return normally despite a lost stderr reader.
+        write_diagnostic_line(
+            &mut pipe,
+            format_args!("remote connection failed: {}", "offline"),
+        );
+        write_diagnostic_line(&mut pipe, format_args!("panic while starting at {}", 42));
+        assert_eq!(pipe.attempts, 2);
+    }
+
+    #[test]
+    fn diagnostic_logging_handles_partial_write_then_write_zero() {
+        struct DisconnectedWriter {
+            prefix: Vec<u8>,
+        }
+        impl std::io::Write for DisconnectedWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.prefix.is_empty() {
+                    let count = bytes.len().min(3);
+                    self.prefix.extend_from_slice(&bytes[..count]);
+                    Ok(count)
+                } else {
+                    // Write::write_all interprets this as WriteZero rather
+                    // than making progress. Logging must ignore that too.
+                    Ok(0)
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut writer = DisconnectedWriter { prefix: Vec::new() };
+        write_diagnostic_line(&mut writer, format_args!("capture read failed"));
+        assert_eq!(writer.prefix, b"cap");
+    }
+
+    #[test]
+    fn diagnostic_logging_preserves_formatted_text_and_newline() {
+        let mut bytes = Vec::new();
+        write_diagnostic_line(&mut bytes, format_args!("device {}: {:.2}", "Domi", 0.25));
+        assert_eq!(bytes, b"device Domi: 0.25\n");
+    }
 
     #[test]
     fn capture_health_requires_packets_even_if_the_ui_keeps_ticking() {
