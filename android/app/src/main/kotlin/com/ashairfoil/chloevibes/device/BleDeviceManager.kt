@@ -84,6 +84,15 @@ class BleDeviceManager(private val context: Context) {
     private var writeTicket = 0L
     private var writeFailures = 0
     private val writeLock = Object()
+    private val diagnosticsEnabled = context.applicationInfo.flags and
+        android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0
+    private var diagnosticSubmitted = 0L
+    private var diagnosticAccepted = 0L
+    private var diagnosticCompleted = 0L
+    private var diagnosticFailed = 0L
+    private var diagnosticRx = 0L
+    private var diagnosticLastLevel = -1
+    private var diagnosticLastLogMs = 0L
     private var lastWriteMs: Long = 0
     private val minWriteIntervalMs = 28L  // ~36Hz steady-state; stops may go faster
     private val stopWriteIntervalMs = 12L // allow rest to win over peak backlog
@@ -619,6 +628,11 @@ class BleDeviceManager(private val context: Context) {
             synchronized(writeLock) {
                 if (!isCurrentGatt(gatt) || characteristic !== writeCharacteristic) return
                 val completed = inFlightCommand
+                if (diagnosticsEnabled && completed != null) {
+                    if (status == BluetoothGatt.GATT_SUCCESS) diagnosticCompleted++
+                    else diagnosticFailed++
+                    logOutputDiagnosticLocked()
+                }
                 if (userRequestedDisconnect && status == BluetoothGatt.GATT_SUCCESS &&
                     completed != null && LovenseProtocol.isStopCommand(completed)) {
                     finishDisconnect(gatt)
@@ -688,6 +702,14 @@ class BleDeviceManager(private val context: Context) {
             return@synchronized false
         }
         val command = commandQueue.take() ?: return@synchronized false
+        if (diagnosticsEnabled) {
+            diagnosticSubmitted++
+            if (command.startsWith("Vibrate")) {
+                diagnosticLastLevel = command.split(';').mapNotNull {
+                    it.substringAfter(':', "").toIntOrNull()
+                }.maxOrNull() ?: -1
+            }
+        }
         writeInFlight = true
         inFlightCommand = command
         lastWriteMs = now
@@ -704,6 +726,10 @@ class BleDeviceManager(private val context: Context) {
         } catch (e: Exception) {
             Log.w("ChloeVibes", "BLE command submission failed", e)
             false
+        }
+        if (diagnosticsEnabled) {
+            if (started) diagnosticAccepted++ else diagnosticFailed++
+            logOutputDiagnosticLocked()
         }
         if (!started) {
             writeInFlight = false
@@ -969,6 +995,10 @@ class BleDeviceManager(private val context: Context) {
     }
 
     private fun parseLovenseResponse(response: String) {
+        if (diagnosticsEnabled) {
+            diagnosticRx++
+            logOutputDiagnosticLocked()
+        }
         val trimmed = response.trim().removeSuffix(";")
 
         // DeviceType reply: "<identifier>:<version>:<serial>", e.g. "P:02:0082..".
@@ -1024,5 +1054,16 @@ class BleDeviceManager(private val context: Context) {
             "ChloeVibes",
             "Lovense DeviceType id=$identifier dualMotor=$dual feel=$feel rest=$motorRestFloor gamma=$motorFeelGamma"
         )
+    }
+
+    /** Host-side evidence only; an accepted write does not prove motor movement. */
+    private fun logOutputDiagnosticLocked() {
+        if (!diagnosticsEnabled) return
+        val now = SystemClock.elapsedRealtime()
+        if (now - diagnosticLastLogMs < 2_000L) return
+        diagnosticLastLogMs = now
+        Log.d("ChloeVibes-Output", "BLE output: submitted=$diagnosticSubmitted " +
+            "accepted=$diagnosticAccepted completed=$diagnosticCompleted failed=$diagnosticFailed " +
+            "rx=$diagnosticRx lastVibrationLevel=$diagnosticLastLevel state=$connectionState")
     }
 }

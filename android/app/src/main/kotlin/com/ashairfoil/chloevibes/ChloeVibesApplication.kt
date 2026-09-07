@@ -25,6 +25,8 @@ class ChloeVibesApplication : Application() {
         private set
 
     private val outputLock = Any()
+    private var diagnosticsEnabled = false
+    private var diagnosticLastRouteMs = 0L
     private val mainHandler = Handler(Looper.getMainLooper())
     private val audioWatchdog = AudioPipelineWatchdog()
 
@@ -66,6 +68,8 @@ class ChloeVibesApplication : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        diagnosticsEnabled = applicationInfo.flags and
+            android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0
         audioCaptureManager = AudioCaptureManager(applicationContext)
         bleDeviceManager = BleDeviceManager(applicationContext)
 
@@ -75,12 +79,14 @@ class ChloeVibesApplication : Application() {
         // re-arm motors (WAVE-002 M5 lease fence via OutputOwner).
         audioCaptureManager.onOutputUpdate = { output ->
             synchronized(outputLock) {
+                logOutputRouteLocked(output, output)
                 if (outputOwner != OutputOwner.Audio) return@synchronized
                 bleDeviceManager.setIntensity(output)
             }
         }
         audioCaptureManager.onDualOutputUpdate = { motor1, motor2 ->
             synchronized(outputLock) {
+                logOutputRouteLocked(motor1, motor2)
                 if (outputOwner != OutputOwner.Audio) return@synchronized
                 if (bleDeviceManager.isDualMotor) {
                     bleDeviceManager.setDualIntensity(motor1, motor2)
@@ -100,6 +106,16 @@ class ChloeVibesApplication : Application() {
     }
 
     fun currentSafetyUiState(): SafetyUiState = safetyUiState
+
+    private fun logOutputRouteLocked(motor1: Float, motor2: Float) {
+        if (!diagnosticsEnabled) return
+        val now = SystemClock.elapsedRealtime()
+        if (now - diagnosticLastRouteMs < 2_000L) return
+        diagnosticLastRouteMs = now
+        Log.d("ChloeVibes-Output", "Output route: owner=$outputOwner " +
+            "connection=${bleDeviceManager.connectionState} dual=${bleDeviceManager.isDualMotor} " +
+            "generated=$motor1,$motor2 allowed=${outputOwner == OutputOwner.Audio}")
+    }
 
     /** User intent from the Connect action; arming never initiates a connection. */
     fun armConnectedDeviceForCompanion() {

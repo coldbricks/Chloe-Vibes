@@ -168,6 +168,7 @@ class MainScreenState {
     var isCapturing by mutableStateOf(false)
     var audioSource by mutableStateOf(AudioSourceMode.SystemAudio)
     var hasRecentAudio by mutableStateOf(false)
+    var captureStatus by mutableStateOf("Stopped")
 
     // Safety (audio-path dead-man + emergency stop)
     var watchdogTripped by mutableStateOf(false)
@@ -335,9 +336,9 @@ fun MainScreen(
             }
             Text(
                 when {
-                    state.isCapturing && !state.hasRecentAudio -> "Waiting for audio; output is resting"
-                    state.audioSource == AudioSourceMode.Microphone -> "Microphone hears audio around your phone"
-                    else -> "System audio follows supported playback on your phone"
+                    state.isCapturing -> state.captureStatus
+                    state.audioSource == AudioSourceMode.Microphone -> "Microphone hears room audio when started"
+                    else -> "System audio follows supported playback on this device"
                 },
                 minLines = 2,
                 maxLines = 2,

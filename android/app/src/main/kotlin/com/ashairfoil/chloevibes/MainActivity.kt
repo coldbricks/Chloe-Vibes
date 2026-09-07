@@ -8,6 +8,7 @@
 package com.ashairfoil.chloevibes
 
 import android.Manifest
+import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -43,6 +44,7 @@ class MainActivity : ComponentActivity() {
         override fun run() {
             uiState.isCapturing = audioCaptureManager.isRunning
             uiState.hasRecentAudio = audioCaptureManager.hasRecentInput
+            uiState.captureStatus = audioCaptureManager.captureStatus
             applyKeepScreenOn(uiState.isCapturing)
             if (audioCaptureManager.isRunning) {
                 val state = audioCaptureManager.state
@@ -73,6 +75,10 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        if (WindowPresentationPolicy.prefersLandscape(packageManager::hasSystemFeature)) {
+            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+        }
 
         chloeVibesApplication = application as ChloeVibesApplication
         audioCaptureManager = chloeVibesApplication.audioCaptureManager

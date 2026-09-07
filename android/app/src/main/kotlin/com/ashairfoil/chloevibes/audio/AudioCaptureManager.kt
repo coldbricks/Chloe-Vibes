@@ -116,6 +116,15 @@ data class ProcessingParams(
  * (AudioRecord), and runs the signal processing loop.
  */
 class AudioCaptureManager(private val context: Context) {
+    private val diagnosticsEnabled = context.applicationInfo.flags and
+        android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0
+    @Volatile private var diagnosticCaptureFrames = 0L
+    @Volatile private var diagnosticCaptureValues = 0L
+    private var diagnosticDispatches = 0L
+    private var diagnosticLastLogMs = 0L
+    private val silentSystemAudioRecovery = SilentSystemAudioRecovery()
+    @Volatile var captureStatus: String = "Stopped"
+        private set
     // Session control, intentionally separate from presets and persisted parameters.
     @Volatile var manualTempoBpm: Float = 0f
 
@@ -324,6 +333,9 @@ class AudioCaptureManager(private val context: Context) {
         // Never let it share engine state with a new processing thread.
         if (processingThread?.isAlive == true) return false
         sourceMode = mode
+        silentSystemAudioRecovery.reset()
+        captureStatus = if (mode == AudioSourceMode.SystemAudio) "Waiting for system audio"
+            else "Waiting for microphone"
         synchronized(sampleLock) {
             capturedSamples = FloatArray(0)
             capturedMagnitudes = FloatArray(0)
@@ -360,6 +372,8 @@ class AudioCaptureManager(private val context: Context) {
             Log.i("ChloeVibes", "Audio capture started successfully")
         } else {
             running = false
+            captureStatus = if (mode == AudioSourceMode.SystemAudio) "System audio unavailable"
+                else "Microphone unavailable"
             Log.w("ChloeVibes", "Audio capture failed to start in mode: $mode")
         }
         return started
@@ -369,6 +383,7 @@ class AudioCaptureManager(private val context: Context) {
     @Synchronized
     fun stop() {
         Log.i("ChloeVibes", "Stopping audio capture")
+        captureStatus = "Stopped"
         running = false
         processingThread?.interrupt()
         val (oldVisualizer, oldRecord) = synchronized(sampleLock) {
@@ -454,6 +469,10 @@ class AudioCaptureManager(private val context: Context) {
                         synchronized(sampleLock) {
                             if (!running || visualizer !== this@AudioCaptureManager.visualizer) return
                             capturedMagnitudes = mags
+                            if (diagnosticsEnabled) {
+                                diagnosticCaptureFrames++
+                                diagnosticCaptureValues += fft.size
+                            }
                             captureCadence.received(SystemClock.elapsedRealtime())
                             visualizerSampleRate = samplingRate / 1000
                             lastSampleTimeMs = SystemClock.elapsedRealtime()
@@ -550,6 +569,10 @@ class AudioCaptureManager(private val context: Context) {
                             synchronized(sampleLock) {
                                 if (running && audioRecord === record) {
                                     capturedSamples = samples
+                                    if (diagnosticsEnabled) {
+                                        diagnosticCaptureFrames++
+                                        diagnosticCaptureValues += read
+                                    }
                                     captureCadence.received(SystemClock.elapsedRealtime())
                                     lastSampleTimeMs = SystemClock.elapsedRealtime()
                                 }
@@ -616,6 +639,7 @@ class AudioCaptureManager(private val context: Context) {
                     lastSampleTimeMs = nowCaptureMs
                 } else {
                     Log.w("ChloeVibes", "Selected audio source stopped delivering frames")
+                    captureStatus = "Selected audio source stopped delivering frames"
                     running = false
                     onPipelineFailClosed?.invoke()
                     break
@@ -635,6 +659,36 @@ class AudioCaptureManager(private val context: Context) {
             val freshCapture = frameStatus == AudioFrameCadence.Frame.Fresh
             val missingCapture = frameStatus == AudioFrameCadence.Frame.Missing
             hasRecentInput = !missingCapture
+            if (sourceMode == AudioSourceMode.SystemAudio && useVisualizerFft) {
+                val hasSignal = mags.any { it >= 0.001f }
+                captureStatus = when {
+                    missingCapture -> "Waiting for system audio"
+                    hasSignal -> "System audio signal"
+                    silentSystemAudioRecovery.exhausted ->
+                        "System audio is silent; MIC uses room audio"
+                    else -> "System audio is silent"
+                }
+                if (silentSystemAudioRecovery.observe(
+                    nowCaptureMs, freshCapture && mags.isNotEmpty(), hasSignal,
+                )) {
+                    // Restore the old source recovery without secretly activating
+                    // a microphone. Only fresh sustained silence counts; bounded
+                    // retries cannot churn forever during an intentional pause.
+                    captureStatus = "Retrying system audio (${silentSystemAudioRecovery.attempts}/3)"
+                    Log.i("ChloeVibes", captureStatus)
+                    val oldVisualizer = visualizer
+                    visualizer = null
+                    runCatching { oldVisualizer?.enabled = false }
+                    runCatching { oldVisualizer?.release() }
+                    synchronized(sampleLock) {
+                        captureCadence.clear()
+                        capturedMagnitudes = FloatArray(0)
+                    }
+                    startVisualizer()
+                    lastSampleTimeMs = nowCaptureMs
+                    continue
+                }
+            }
             if (freshCapture) visualizerRestartFailures = 0
             if (missingCapture && !captureWasMissing) {
                 state.gate = Gate()
@@ -701,6 +755,13 @@ class AudioCaptureManager(private val context: Context) {
             val energy = sanitizeUnit(rawEnergy * params.mainVolume)
 
             state.lastSpectralData = spectralData
+            if (sourceMode == AudioSourceMode.Microphone) {
+                captureStatus = when {
+                    missingCapture -> "Waiting for microphone"
+                    spectralData.rmsPower > 0.001f -> "Microphone signal"
+                    else -> "Microphone is silent"
+                }
+            }
             state.lastEnergy = energy
 
             // Step 3: Gate (uses raw energy so threshold isn't defeated by volume)
@@ -839,9 +900,23 @@ class AudioCaptureManager(private val context: Context) {
                 smoothOutput(outputLevel2, motor2Target, deltaTimeS, params.outputSlewMs)
             val motor2Final = outputLevel2.coerceIn(0f, sanitizeUnit(params.maxVibe))
             if (running && outputDispatch.shouldSend(finalOutput, motor2Final)) {
+                if (diagnosticsEnabled) diagnosticDispatches++
                 val dualCb = onDualOutputUpdate
                 if (dualCb != null) dualCb.invoke(finalOutput, motor2Final)
                 else onOutputUpdate?.invoke(finalOutput)
+            }
+            if (diagnosticsEnabled) {
+                val diagnosticNow = SystemClock.elapsedRealtime()
+                if (diagnosticNow - diagnosticLastLogMs >= 2_000L) {
+                    diagnosticLastLogMs = diagnosticNow
+                    Log.d("ChloeVibes-DSP", "Audio output: source=$sourceMode frame=$frameStatus " +
+                        "captureFrames=$diagnosticCaptureFrames captureValues=$diagnosticCaptureValues " +
+                        "ageMs=${diagnosticNow - lastSampleTimeMs} rms=${spectralData.rmsPower} " +
+                        "rmsSource=${if (useVisualizerFft) "FFT" else "PCM"} " +
+                        "energy=${state.lastEnergy} gate=$gateOpen silence=$silenceClass " +
+                        "generated=$finalOutput,$motor2Final dispatches=$diagnosticDispatches " +
+                        "ceiling=${params.maxVibe} gain=${params.outputGain}")
+                }
             }
 
             // Frame completed successfully -- stamp dead-man heartbeat and
@@ -872,6 +947,7 @@ class AudioCaptureManager(private val context: Context) {
                       "Persistent processing errors ($consecutiveErrors consecutive), fail-closed"
                   )
                   running = false
+                  captureStatus = "Audio processing stopped"
                   outputLevel = 0f
                   outputLevel2 = 0f
                   outputDispatch.reset()

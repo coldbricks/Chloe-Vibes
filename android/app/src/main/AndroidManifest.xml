@@ -44,8 +44,12 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:resizeableActivity="true"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode|density"
             android:windowSoftInputMode="adjustResize">
+
+            <!-- Resizable panel preference; fullscreen phones retain their normal bounds. -->
+            <layout android:defaultWidth="1280dp" android:defaultHeight="720dp" />
 
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
