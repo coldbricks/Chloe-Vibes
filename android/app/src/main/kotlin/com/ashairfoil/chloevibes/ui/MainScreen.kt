@@ -87,7 +87,9 @@ import com.ashairfoil.chloevibes.audio.BAND_NAMES
 import com.ashairfoil.chloevibes.audio.AudioSourceMode
 import com.ashairfoil.chloevibes.audio.ClimaxPattern
 import com.ashairfoil.chloevibes.audio.EnvelopeState
+import com.ashairfoil.chloevibes.audio.AutoLockState
 import com.ashairfoil.chloevibes.audio.FrequencyMode
+import com.ashairfoil.chloevibes.audio.ProcessingParams
 import com.ashairfoil.chloevibes.audio.NUM_BANDS
 import com.ashairfoil.chloevibes.audio.Preset
 import com.ashairfoil.chloevibes.audio.PresetCategory
@@ -174,6 +176,34 @@ class MainScreenState {
     var watchdogTripped by mutableStateOf(false)
     var safetyMessage by mutableStateOf<String?>(null)
 
+    // FIND BOOM (Auto-Lock)
+    var autoLockState by mutableStateOf<AutoLockState>(AutoLockState.Idle)
+    var autoLockReport by mutableStateOf<String?>(null)
+    var autoLockCanRevert by mutableStateOf(false)
+    var autoLockButtonLabel by mutableStateOf("FIND BOOM")
+
+    fun syncFromParams(p: ProcessingParams) {
+        frequencyMode = p.frequencyMode
+        targetFrequency = p.targetFrequency
+        gateThreshold = p.gateThreshold
+        autoGateAmount = p.autoGateAmount
+        gateSmoothing = p.gateSmoothing
+        thresholdKnee = p.thresholdKnee
+        triggerMode = p.triggerMode
+        binaryLevel = p.binaryLevel
+        hybridBlend = p.hybridBlend
+        dynamicCurve = p.dynamicCurve
+        attackMs = p.attackMs
+        decayMs = p.decayMs
+        sustainLevel = p.sustainLevel
+        releaseMs = p.releaseMs
+        attackCurve = p.attackCurve
+        decayCurve = p.decayCurve
+        releaseCurve = p.releaseCurve
+        outputSlewMs = p.outputSlewMs
+        climaxEnabled = p.climaxEnabled
+    }
+
     fun applyPreset(preset: Preset) {
         selectedPresetName = preset.name
         mainVolume = preset.mainVolume
@@ -225,6 +255,9 @@ fun MainScreen(
     onDisconnectDevice: () -> Unit,
     onClimaxReset: () -> Unit,
     discoveredDevices: List<BleDeviceInfo>,
+    onAutoLockClick: () -> Unit = {},
+    onAutoLockRevert: () -> Unit = {},
+    onAutoLockKeep: () -> Unit = {},
     onParameterChanged: () -> Unit
 ) {
     val scrollState = rememberScrollState()
@@ -381,10 +414,22 @@ fun MainScreen(
             )
             Spacer(modifier = Modifier.height(16.dp))
 
-            // Preset path (Android stand-in for desktop FIND BOOM + presets)
+            // FIND BOOM (Auto-Lock) + Presets
+            SectionHeader("FIND BOOM / AUTO-TUNE")
+            FindBoomCard(
+                state = state.autoLockState,
+                buttonLabel = state.autoLockButtonLabel,
+                reportLine = state.autoLockReport,
+                canRevert = state.autoLockCanRevert,
+                onButtonClick = onAutoLockClick,
+                onRevertClick = onAutoLockRevert,
+                onKeepClick = onAutoLockKeep
+            )
+            Spacer(modifier = Modifier.height(12.dp))
+
             SectionHeader("PRESETS")
             Text(
-                "Pick a starting point — big cards, one tap. FIND BOOM is desktop-only.",
+                "Or pick a starting point manually — big cards, one tap.",
                 color = ChloeColors.OnSurfaceDim,
                 fontSize = 11.sp,
                 modifier = Modifier.padding(bottom = 6.dp)
@@ -1273,6 +1318,102 @@ private fun SpectrumVisualizer(bandEnergies: FloatArray) {
                     color = ChloeColors.OnSurfaceDim,
                     textAlign = TextAlign.Center,
                     maxLines = 1
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun FindBoomCard(
+    state: AutoLockState,
+    buttonLabel: String,
+    reportLine: String?,
+    canRevert: Boolean,
+    onButtonClick: () -> Unit,
+    onRevertClick: () -> Unit,
+    onKeepClick: () -> Unit
+) {
+    val buttonColor = when (state) {
+        is AutoLockState.Locked -> Color(0xFF10B981)
+        is AutoLockState.Listening -> ChloeColors.Teal
+        is AutoLockState.NoLock -> ChloeColors.Amber
+        is AutoLockState.Idle -> ChloeColors.Purple
+    }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(12.dp),
+        colors = CardDefaults.cardColors(containerColor = ChloeColors.SurfaceVariant)
+    ) {
+        Column(modifier = Modifier.padding(12.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Button(
+                    onClick = onButtonClick,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = buttonColor,
+                        contentColor = Color.White
+                    ),
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier.height(40.dp)
+                ) {
+                    Text(
+                        buttonLabel,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 14.sp
+                    )
+                }
+
+                if (canRevert) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            onClick = onRevertClick,
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = ChloeColors.Surface,
+                                contentColor = ChloeColors.OnSurfaceDim
+                            ),
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier.height(36.dp)
+                        ) {
+                            Text("Revert", fontSize = 12.sp)
+                        }
+                        Button(
+                            onClick = onKeepClick,
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = ChloeColors.Surface,
+                                contentColor = ChloeColors.Teal
+                            ),
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier.height(36.dp)
+                        ) {
+                            Text("Keep", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(6.dp))
+
+            if (reportLine != null) {
+                Text(
+                    text = reportLine,
+                    color = ChloeColors.Teal,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Medium
+                )
+            } else {
+                Text(
+                    text = when (state) {
+                        is AutoLockState.Listening -> "Analyzing rhythm & energy punch over 8s window…"
+                        is AutoLockState.NoLock -> "Could not detect steady kick drum. Try with punchier material."
+                        else -> "Play a track with a kick drum, tap FIND BOOM to auto-tune band, gate & decay."
+                    },
+                    color = ChloeColors.OnSurfaceDim,
+                    fontSize = 11.sp
                 )
             }
         }

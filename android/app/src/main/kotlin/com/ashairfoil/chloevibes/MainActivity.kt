@@ -14,6 +14,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -21,6 +22,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.mutableStateListOf
 import androidx.core.content.ContextCompat
 import com.ashairfoil.chloevibes.audio.AudioCaptureManager
+import com.ashairfoil.chloevibes.audio.AutoLockState
 import com.ashairfoil.chloevibes.audio.EnvelopeState
 import com.ashairfoil.chloevibes.audio.NUM_BANDS
 import com.ashairfoil.chloevibes.audio.findPreset
@@ -46,6 +48,13 @@ class MainActivity : ComponentActivity() {
             uiState.hasRecentAudio = audioCaptureManager.hasRecentInput
             uiState.captureStatus = audioCaptureManager.captureStatus
             applyKeepScreenOn(uiState.isCapturing)
+            val supervisor = audioCaptureManager.autoLock
+            val nowMs = SystemClock.elapsedRealtime().toFloat()
+            uiState.autoLockState = supervisor.state
+            uiState.autoLockReport = supervisor.reportLine()
+            uiState.autoLockCanRevert = supervisor.canRevert()
+            uiState.autoLockButtonLabel = supervisor.buttonLabel(nowMs)
+
             if (audioCaptureManager.isRunning) {
                 val state = audioCaptureManager.state
                 uiState.currentOutput = state.lastFinalOutput
@@ -54,6 +63,13 @@ class MainActivity : ComponentActivity() {
                 uiState.envelopeState = state.lastEnvelopeState
                 uiState.bandEnergies = state.lastSpectralData.bandEnergies.copyOf()
                 uiState.climaxPhase = state.lastClimaxPhase
+
+                if (supervisor.isLocked() || supervisor.state is AutoLockState.Listening) {
+                    if (supervisor.isLocked()) {
+                        uiState.selectedPresetName = "Auto Boom"
+                    }
+                    uiState.syncFromParams(audioCaptureManager.currentParams)
+                }
             } else {
                 uiState.currentOutput = 0f
                 uiState.detectedBpm = 0f
@@ -165,6 +181,19 @@ class MainActivity : ComponentActivity() {
                         uiState.climaxPhase = 0f
                     },
                     discoveredDevices = discoveredDevices,
+                    onAutoLockClick = {
+                        if (!uiState.isCapturing) {
+                            requestPermissionsAndStart()
+                        }
+                        audioCaptureManager.onAutoLockButton()
+                    },
+                    onAutoLockRevert = {
+                        audioCaptureManager.revertAutoLock()
+                        uiState.syncFromParams(audioCaptureManager.currentParams)
+                    },
+                    onAutoLockKeep = {
+                        audioCaptureManager.keepAutoLock()
+                    },
                     onParameterChanged = { syncParamsToCapture() }
                 )
             }

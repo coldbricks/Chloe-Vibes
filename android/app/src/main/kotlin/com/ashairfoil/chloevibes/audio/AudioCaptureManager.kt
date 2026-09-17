@@ -54,6 +54,7 @@ class ProcessingState {
     val climaxEngine = ClimaxEngine()
 
     @Volatile var lastSpectralData = SpectralData()
+    @Volatile var prevSpectralData: SpectralData? = null
     @Volatile var lastEnergy: Float = 0f
     @Volatile var lastGateOpen: Boolean = false
     @Volatile var lastEnvelopeOutput: Float = 0f
@@ -125,11 +126,13 @@ class AudioCaptureManager(private val context: Context) {
     private val silentSystemAudioRecovery = SilentSystemAudioRecovery()
     @Volatile var captureStatus: String = "Stopped"
         private set
+    private var visualizerSetupFailure: String? = null
     // Session control, intentionally separate from presets and persisted parameters.
     @Volatile var manualTempoBpm: Float = 0f
 
     // Processing state (thread-safe via volatile fields)
     val state = ProcessingState()
+    val autoLock = AutoLockSupervisor()
     private val processingClock = AudioProcessingClock()
 
     /** Queue UI resets so the processing thread supplies the correct epoch. */
@@ -287,6 +290,7 @@ class AudioCaptureManager(private val context: Context) {
 
     /** Apply a preset to all signal processing parameters atomically. */
     fun applyPreset(preset: Preset) {
+        autoLock.cancel()
         paramsRef.set(ProcessingParams(
             mainVolume = preset.mainVolume,
             frequencyMode = preset.frequencyMode,
@@ -320,6 +324,30 @@ class AudioCaptureManager(private val context: Context) {
         ))
     }
 
+    fun startAutoLock() {
+        val nowMs = processingClock.elapsedMs(System.nanoTime())
+        autoLock.startListening(nowMs)
+    }
+
+    fun cancelAutoLock() {
+        autoLock.cancel()
+    }
+
+    fun revertAutoLock() {
+        paramsRef.updateAndGet { autoLock.revert(it) }
+    }
+
+    fun keepAutoLock() {
+        autoLock.keep()
+    }
+
+    fun onAutoLockButton() {
+        val nowMs = processingClock.elapsedMs(System.nanoTime())
+        autoLock.onButton(nowMs)
+    }
+
+    val currentParams: ProcessingParams get() = paramsRef.get()
+
     /**
      * Start audio capture and processing.
      *
@@ -333,6 +361,7 @@ class AudioCaptureManager(private val context: Context) {
         // Never let it share engine state with a new processing thread.
         if (processingThread?.isAlive == true) return false
         sourceMode = mode
+        visualizerSetupFailure = null
         silentSystemAudioRecovery.reset()
         captureStatus = if (mode == AudioSourceMode.SystemAudio) "Waiting for system audio"
             else "Waiting for microphone"
@@ -372,7 +401,8 @@ class AudioCaptureManager(private val context: Context) {
             Log.i("ChloeVibes", "Audio capture started successfully")
         } else {
             running = false
-            captureStatus = if (mode == AudioSourceMode.SystemAudio) "System audio unavailable"
+            captureStatus = if (mode == AudioSourceMode.SystemAudio)
+                visualizerSetupFailure ?: "System audio unavailable"
                 else "Microphone unavailable"
             Log.w("ChloeVibes", "Audio capture failed to start in mode: $mode")
         }
@@ -419,17 +449,24 @@ class AudioCaptureManager(private val context: Context) {
     // -----------------------------------------------------------------------
 
     private fun startVisualizer(): Boolean {
+        visualizerSetupFailure = null
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO)
             != PackageManager.PERMISSION_GRANTED
-        ) return false
+        ) {
+            visualizerSetupFailure = "System audio requires recording permission"
+            captureStatus = visualizerSetupFailure!!
+            return false
+        }
 
-        var pendingVisualizer: Visualizer? = null
-        return try {
+        val result = initializeVisualizer(Visualizer.SUCCESS) {
             val viz = Visualizer(0) // session 0 = system audio output mix
-            pendingVisualizer = viz
-            val maxCapture = Visualizer.getCaptureSizeRange()[1]
-            viz.captureSize = maxCapture.coerceAtMost(FFT_SIZE)
-            viz.setDataCaptureListener(
+            object : VisualizerSetupTarget {
+                override fun configureCaptureSize(): Int {
+                    val maxCapture = Visualizer.getCaptureSizeRange()[1]
+                    return viz.setCaptureSize(maxCapture.coerceAtMost(FFT_SIZE))
+                }
+
+                override fun registerCaptureListener(): Int = viz.setDataCaptureListener(
                 object : Visualizer.OnDataCaptureListener {
                     override fun onWaveFormDataCapture(
                         visualizer: Visualizer,
@@ -483,23 +520,46 @@ class AudioCaptureManager(private val context: Context) {
                 false, // waveform — not needed
                 true   // fft — use this instead
             )
-            synchronized(sampleLock) {
-                if (!running) {
-                    viz.release()
-                    return false
+                override fun enableCapture(): Int = synchronized(sampleLock) {
+                    if (!running) throw IllegalStateException("Capture stopped before enable")
+                    visualizer = viz
+                    useVisualizerFft = true
+                    try {
+                        viz.setEnabled(true).also { status ->
+                            if (status != Visualizer.SUCCESS) detachOwner()
+                        }
+                    } catch (e: Exception) {
+                        // Do not let concurrent stop take ownership of a failed
+                        // session; initializeVisualizer owns its cleanup.
+                        detachOwner()
+                        throw e
+                    }
                 }
-                visualizer = viz
-                useVisualizerFft = true
-                viz.enabled = true
+
+                override fun detachOwner() {
+                    synchronized(sampleLock) {
+                        if (visualizer == null || visualizer === viz) {
+                            visualizer = null
+                            useVisualizerFft = false
+                            capturedMagnitudes = FloatArray(0)
+                            captureCadence.clear()
+                            hasRecentInput = false
+                        }
+                    }
+                }
+                override fun disableCapture() { viz.setEnabled(false) }
+                override fun release() { viz.release() }
             }
-            lastSampleTimeMs = SystemClock.elapsedRealtime()
-            true
-        } catch (e: Exception) {
-            if (visualizer === pendingVisualizer) visualizer = null
-            runCatching { pendingVisualizer?.release() }
-            Log.e("ChloeVibes", "Visualizer initialization failed", e)
-            false
         }
+        if (result.started) {
+            captureStatus = "Waiting for system audio"
+            lastSampleTimeMs = SystemClock.elapsedRealtime()
+        } else {
+            visualizerSetupFailure = result.failureMessage
+            captureStatus = result.failureMessage ?: "System audio unavailable"
+            Log.e("ChloeVibes", captureStatus, result.cause)
+        }
+        return result.started
     }
 
     // -----------------------------------------------------------------------
@@ -639,7 +699,8 @@ class AudioCaptureManager(private val context: Context) {
                     lastSampleTimeMs = nowCaptureMs
                 } else {
                     Log.w("ChloeVibes", "Selected audio source stopped delivering frames")
-                    captureStatus = "Selected audio source stopped delivering frames"
+                    captureStatus = visualizerSetupFailure
+                        ?: "Selected audio source stopped delivering frames"
                     running = false
                     onPipelineFailClosed?.invoke()
                     break
@@ -754,7 +815,10 @@ class AudioCaptureManager(private val context: Context) {
             val rawEnergy = normalizeCaptureEnergy(captureEnergy)
             val energy = sanitizeUnit(rawEnergy * params.mainVolume)
 
-            state.lastSpectralData = spectralData
+            if (freshCapture) {
+                state.prevSpectralData = state.lastSpectralData
+                state.lastSpectralData = spectralData
+            }
             if (sourceMode == AudioSourceMode.Microphone) {
                 captureStatus = when {
                     missingCapture -> "Waiting for microphone"
@@ -780,7 +844,10 @@ class AudioCaptureManager(private val context: Context) {
             // Step 4: Beat detection
             state.beatDetector.setManualTempo(manualTempoBpm.takeIf { it > 0f })
             val (detectedOnset, onsetStrength) = if (freshCapture) {
-                state.beatDetector.process(spectralData.spectralFlux, currentTimeMs)
+                val flux = SpectralAnalyzer.extractFlux(
+                    spectralData, state.prevSpectralData, params.frequencyMode, params.targetFrequency
+                )
+                state.beatDetector.process(flux, currentTimeMs)
             } else {
                 state.beatDetector.advanceTime(currentTimeMs)
                 Pair(false, 0f)
@@ -904,6 +971,19 @@ class AudioCaptureManager(private val context: Context) {
                 val dualCb = onDualOutputUpdate
                 if (dualCb != null) dualCb.invoke(finalOutput, motor2Final)
                 else onOutputUpdate?.invoke(finalOutput)
+            }
+
+            // AUTO-LOCK supervisor: observes frame, manages listen/commit/glide
+            if (freshCapture) {
+                autoLock.pushFrame(currentTimeMs, spectralData, rawEnergy, detectedOnset)
+            }
+            val updatedParams = autoLock.update(
+                currentTimeMs,
+                state.beatDetector.tempoConfidence,
+                params
+            )
+            if (updatedParams !== params) {
+                paramsRef.set(updatedParams)
             }
             if (diagnosticsEnabled) {
                 val diagnosticNow = SystemClock.elapsedRealtime()

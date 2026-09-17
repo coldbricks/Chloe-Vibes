@@ -2,6 +2,7 @@ package com.ashairfoil.chloevibes.audio
 
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.Test
+import kotlin.math.abs
 
 class BeatDetectorTest {
     @Test
@@ -175,6 +176,68 @@ class BeatDetectorTest {
         assertEquals(3500f, old.predictedNextOnsetMs, .001f)
     }
 
+    @Test
+    fun `syncopated and subdivided rhythms lock with perceptual beat and prefire`() {
+        val detector = BeatDetector()
+        // Warm up the 43-frame flux history with baseline noise
+        for (i in 0 until 50) {
+            detector.process(0.02f, i * 20f)
+        }
+        detector.clearTempoLock()
+
+        val pattern = listOf(
+            1000f to 10f, // kick
+            1250f to 4f,  // hat (8th note)
+            1500f to 10f, // kick/snare
+            1750f to 4f,  // hat
+            2000f to 10f, // kick
+            2250f to 4f,  // hat
+            2500f to 10f, // kick/snare
+            2750f to 4f,  // hat
+            3000f to 10f, // kick
+            3250f to 4f,  // hat
+            3500f to 10f  // kick/snare
+        )
+
+        var t = 1000f
+        val dt = 25f
+        var patternIdx = 0
+        var onsetsDetected = 0
+
+        while (t <= 3600f) {
+            var flux = 0.02f
+            if (patternIdx < pattern.size && abs(t - pattern[patternIdx].first) < 1f) {
+                flux = pattern[patternIdx].second
+                patternIdx++
+            }
+            val (isOnset, _) = detector.process(flux, t)
+            if (isOnset) {
+                onsetsDetected++
+            }
+            t += dt
+        }
+
+        assertEquals(pattern.size, patternIdx, "all pattern items should be fed")
+        assertTrue(onsetsDetected >= 8, "most pattern onsets should be detected, got $onsetsDetected")
+
+        // Perceptual folding should recognize the 500ms beat grid:
+        // Confidence must be high (>= 0.70) instead of being crippled to 0.0 by raw CV.
+        assertTrue(
+            detector.tempoConfidence >= 0.70f,
+            "expected high tempo confidence on syncopated music, got ${detector.tempoConfidence}"
+        )
+        assertEquals(500f, detector.tempoIntervalMs, 10f)
+
+        // Next quarter note is at 4000.0.
+        // At 3955.0 (45ms before downbeat), predictive prefire MUST engage!
+        assertTrue(
+            detector.prefireOk(3955f),
+            "prefireOk should be true 45ms before next beat, next=${detector.predictedNextOnsetMs}"
+        )
+        val prefire = detector.takePrefire(3955f)
+        assertNotNull(prefire, "prefire should trigger for quarter-note beat")
+    }
+
     private fun lockedDetector() = BeatDetector().also { detector ->
         for (time in intArrayOf(1000, 1500, 2000, 2500)) {
             assertTrue(detector.process(10f, time.toFloat()).first)
@@ -183,3 +246,4 @@ class BeatDetectorTest {
         assertTrue(detector.tempoConfidence > .6f)
     }
 }
+

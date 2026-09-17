@@ -13,7 +13,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/coldbricks/Chloe-Vibes/releases/latest">What's new in v1.6.2</a>
+  <a href="https://github.com/coldbricks/Chloe-Vibes/releases/latest">What's new in v1.7.0</a>
   &nbsp; · &nbsp;
   <a href="docs/TECHNICAL_REFERENCE.md">Guide &amp; technical reference</a>
   &nbsp; · &nbsp;
@@ -44,10 +44,10 @@ Start with one of **33 presets**, or press **FIND BOOM** on Windows to fit a res
 | **Devices** | Supported vibration and oscillation devices through Buttplug / Intiface | Direct Lovense Bluetooth connection |
 | **Tempo** | Tap four beats or use automatic detection | Tap four beats or use automatic detection |
 | **Timing test** | Tone, sweep, Wet Floor Bass, Tile Room Throb, How Long You Last | Use a playback app as the audio source |
-| **Start simply** | Presets + FIND BOOM | Presets + Simple controls |
+| **Start simply** | Presets + FIND BOOM | Presets + FIND BOOM + Simple controls |
 | **Shape a pulse** | Drag the envelope; expand full tuning | Touch and drag the envelope; switch to Full controls |
 
-**New in 1.6.2:** top-level **Tap Tempo** on Windows and Android; a Windows timing-test panel with selectable tones, a frequency sweep and three looped grooves; faster wakeup after silence, reinforced stop commands, and capture compatibility controls. [Release details](https://github.com/coldbricks/Chloe-Vibes/releases/tag/v1.6.2).
+**New in 1.7.0:** **FIND BOOM on Android** brings automated bass-drum sweet-spot tuning to mobile with live parameter gliding; **musical rhythm intelligence** features perceptual octave interval folding and beat-grid phase alignment to lock syncopated grooves with low-latency predictive prefire; **frequency-targeted transient flux** rejects high-frequency interference in low-pass modes; and resilient **Meta Quest / Android audio recovery**. [Release details](https://github.com/coldbricks/Chloe-Vibes/releases/tag/v1.7.0).
 
 <details>
 <summary>See the Android touch editor</summary>

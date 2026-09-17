@@ -11,3 +11,11 @@ android/local.properties
 
 # Crash logs
 chloe-vibes-crash.log
+
+# Vendor & local build artifacts
+vendor/audio-capture/target/
+vendor/audio-capture/Cargo.lock
+assets/warehouse-strut-loop.wav
+dist/*.exe
+dist/*.apk
+dist/SHA256SUMS.txt

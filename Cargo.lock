@@ -879,7 +879,7 @@ dependencies = [
 
 [[package]]
 name = "chloe-vibes"
-version = "1.6.2"
+version = "1.7.0"
 dependencies = [
  "audio-capture",
  "buttplug",

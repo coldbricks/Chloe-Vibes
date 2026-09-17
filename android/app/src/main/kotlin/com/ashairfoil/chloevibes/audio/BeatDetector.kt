@@ -10,7 +10,9 @@
 
 package com.ashairfoil.chloevibes.audio
 
+import kotlin.math.abs
 import kotlin.math.pow
+import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
 /**
@@ -24,6 +26,20 @@ class BeatDetector {
          * than the historical 76ms (ghosty on residual gate).
          */
         const val PREFIRE_LEAD_MS: Float = 50f
+
+        /**
+         * Fold a raw inter-onset interval into the perceptual beat octave
+         * (70-180 BPM => 333-857ms). Onset detectors track the subdivision grid,
+         * but the envelope and predictive pre-fire must lock to the felt beat.
+         */
+        @JvmStatic
+        fun foldToPerceptualBeat(ioiMs: Float): Float {
+            var t = ioiMs
+            if (t <= 0f) return t
+            while (t < 333f) t *= 2f
+            while (t > 857f) t /= 2f
+            return t
+        }
     }
 
     /** Rolling history of spectral flux values. */
@@ -197,7 +213,7 @@ class BeatDetector {
     }
 
     /** Clear tempo lock and onset history so a dead lock cannot resurrect. */
-    private fun clearTempoLock() {
+    fun clearTempoLock() {
         tempoConfidence = 0f
         tempoIntervalMs = 0f
         predictedNextOnsetMs = 0f
@@ -219,13 +235,11 @@ class BeatDetector {
         }
         val grace = tempoIntervalMs * 1.5f
         if (since <= grace) {
-            if (tempoConfidence > 0.5f) {
-                val intervalsElapsed = (since / tempoIntervalMs).toInt()
-                // takePrefire already advances past the consumed beat. A quiet
-                // process frame must not rewind it to that same beat again.
-                predictedNextOnsetMs =
-                    maxOf(predictedNextOnsetMs,
-                        lastOnsetTimeMs + (intervalsElapsed + 1) * tempoIntervalMs)
+            // Still advance the prediction so the next beat stays on-grid.
+            if (tempoConfidence > 0.5f && predictedNextOnsetMs > 0f) {
+                while (predictedNextOnsetMs <= currentTimeMs) {
+                    predictedNextOnsetMs += tempoIntervalMs
+                }
             }
             return
         }
@@ -237,11 +251,10 @@ class BeatDetector {
             if (tempoConfidence < 0.05f) {
                 clearTempoLock()
             }
-        } else {
-            val intervalsElapsed = (since / tempoIntervalMs).toInt()
-            predictedNextOnsetMs =
-                maxOf(predictedNextOnsetMs,
-                    lastOnsetTimeMs + (intervalsElapsed + 1) * tempoIntervalMs)
+        } else if (predictedNextOnsetMs > 0f) {
+            while (predictedNextOnsetMs <= currentTimeMs) {
+                predictedNextOnsetMs += tempoIntervalMs
+            }
         }
     }
 
@@ -265,29 +278,90 @@ class BeatDetector {
             return
         }
 
-        var mean = 0f
-        for (i in 0 until count) mean += intervals[i]
-        mean /= count
+        // 1. Raw interval statistics
+        var rawMean = 0f
+        for (i in 0 until count) rawMean += intervals[i]
+        rawMean /= count
 
-        var variance = 0f
+        var rawVariance = 0f
         for (i in 0 until count) {
-            val diff = intervals[i] - mean
-            variance += diff * diff
+            val diff = intervals[i] - rawMean
+            rawVariance += diff * diff
         }
-        variance /= count
-        val stdDev = sqrt(variance)
+        rawVariance /= count
+        val rawStdDev = sqrt(rawVariance)
+        val rawCv = if (rawMean > 0f) rawStdDev / rawMean else 1f
+
+        // 2. Folded perceptual beat statistics (70-180 BPM => 333-857ms)
+        val foldedIntervals = FloatArray(count)
+        for (i in 0 until count) {
+            foldedIntervals[i] = foldToPerceptualBeat(intervals[i])
+        }
+        var foldedMean = 0f
+        for (i in 0 until count) foldedMean += foldedIntervals[i]
+        foldedMean /= count
+
+        var foldedVariance = 0f
+        for (i in 0 until count) {
+            val diff = foldedIntervals[i] - foldedMean
+            foldedVariance += diff * diff
+        }
+        foldedVariance /= count
+        val foldedStdDev = sqrt(foldedVariance)
+        val foldedCv = if (foldedMean > 0f) foldedStdDev / foldedMean else 1f
+
+        // 3. Selection: if raw has high jitter (due to subdivisions or syncopation)
+        // and folding recovers a tight rhythmic lock, or if raw is an eighth-note
+        // subdivision grid (mean < 333ms), use folded.
+        val useFolded = (rawCv > 0.12f && foldedCv < rawCv * 0.75f && foldedCv < 0.25f)
+            || (rawMean < 333f && foldedCv < 0.20f)
+            || (rawCv > 0.20f && foldedCv < 0.20f)
+
+        val (chosenInterval, chosenCv) = if (useFolded) {
+            Pair(foldedMean, foldedCv)
+        } else {
+            Pair(rawMean, rawCv)
+        }
 
         // Confidence: low coefficient of variation = high confidence
-        val cv = if (mean > 0f) stdDev / mean else 1f
-        tempoConfidence = (1f - cv * 4f).coerceIn(0f, 1f)
+        tempoConfidence = (1f - chosenCv * 4f).coerceIn(0f, 1f)
         tempoConfidenceAtOnset = tempoConfidence
-        tempoIntervalMs = mean
+        tempoIntervalMs = chosenInterval
 
         if (tempoConfidence > 0.5f) {
-            val lastOnset = onsetTimestamps[(onsetTsIndex - 1 + onsetTimestamps.size) % onsetTimestamps.size]
-            val elapsed = currentTimeMs - lastOnset
-            val intervalsElapsed = (elapsed / mean).toInt()
-            predictedNextOnsetMs = lastOnset + (intervalsElapsed + 1) * mean
+            // Beat-grid phase alignment:
+            // Find which recent onset best anchors the grid phase.
+            // On-grid hits have |t_j - t_anchor| ~= k * chosenInterval.
+            val len = onsetTimestamps.size
+            var bestAnchor = onsetTimestamps[(onsetTsIndex - 1 + len) % len]
+            var bestScore = -1
+
+            val numRecent = minOf(onsetTsCount, len)
+            for (i in 1..numRecent) {
+                val cand = onsetTimestamps[(onsetTsIndex - i + len) % len]
+                var score = 0
+                for (j in 1..numRecent) {
+                    val other = onsetTimestamps[(onsetTsIndex - j + len) % len]
+                    val diff = abs(other - cand)
+                    val q = (diff / chosenInterval).roundToInt()
+                    val err = abs(diff - q * chosenInterval)
+                    if (err <= chosenInterval * 0.15f) {
+                        score++
+                    }
+                }
+                if (score > bestScore) {
+                    bestScore = score
+                    bestAnchor = cand
+                }
+            }
+
+            val elapsed = maxOf(0f, currentTimeMs - bestAnchor)
+            val intervalsElapsed = (elapsed / chosenInterval).toInt()
+            var next = bestAnchor + (intervalsElapsed + 1) * chosenInterval
+            while (next <= currentTimeMs) {
+                next += chosenInterval
+            }
+            predictedNextOnsetMs = next
         } else {
             predictedNextOnsetMs = 0f
         }

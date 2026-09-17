@@ -320,6 +320,82 @@ class SpectralAnalyzer(private val sampleRate: Float = 48000f) {
                 }
             }
         }
+
+        /**
+         * Extract transient flux from a specific frequency range.
+         * In Full mode, returns the full-spectrum flux for golden-test parity.
+         * In LowPass/BandPass modes, isolates energy jumps in the target band
+         * to reject vocal sibilance and cymbals from triggering bass haptics.
+         */
+        fun extractFlux(
+            data: SpectralData,
+            prevData: SpectralData?,
+            mode: FrequencyMode,
+            targetFreq: Float
+        ): Float {
+            return when (mode) {
+                FrequencyMode.Full -> data.spectralFlux
+                FrequencyMode.LowPass -> {
+                    if (prevData != null) {
+                        var flux = 0f
+                        var count = 0f
+                        for (i in 0 until NUM_BANDS) {
+                            val currE = data.bandEnergies[i]
+                            val prevE = prevData.bandEnergies[i]
+                            if (BAND_EDGES[i + 1] <= targetFreq) {
+                                val diff = currE - prevE
+                                if (diff > 0f) flux += diff
+                                count += 1f
+                            } else if (BAND_EDGES[i] < targetFreq) {
+                                val frac = (targetFreq - BAND_EDGES[i]) / (BAND_EDGES[i + 1] - BAND_EDGES[i])
+                                val diff = currE - prevE
+                                if (diff > 0f) flux += diff * frac
+                                count += frac
+                            }
+                        }
+                        if (count > 0f) (flux / count) * 12f else data.spectralFlux
+                    } else {
+                        data.spectralFlux
+                    }
+                }
+                FrequencyMode.HighPass -> {
+                    if (prevData != null) {
+                        var flux = 0f
+                        var count = 0f
+                        for (i in 0 until NUM_BANDS) {
+                            val currE = data.bandEnergies[i]
+                            val prevE = prevData.bandEnergies[i]
+                            if (BAND_EDGES[i] >= targetFreq) {
+                                val diff = currE - prevE
+                                if (diff > 0f) flux += diff
+                                count += 1f
+                            } else if (BAND_EDGES[i + 1] > targetFreq) {
+                                val frac = (BAND_EDGES[i + 1] - targetFreq) / (BAND_EDGES[i + 1] - BAND_EDGES[i])
+                                val diff = currE - prevE
+                                if (diff > 0f) flux += diff * frac
+                                count += frac
+                            }
+                        }
+                        if (count > 0f) (flux / count) * 12f else data.spectralFlux
+                    } else {
+                        data.spectralFlux
+                    }
+                }
+                FrequencyMode.BandPass -> {
+                    if (prevData != null) {
+                        for (i in 0 until NUM_BANDS) {
+                            if (targetFreq >= BAND_EDGES[i] && targetFreq < BAND_EDGES[i + 1]) {
+                                val diff = data.bandEnergies[i] - prevData.bandEnergies[i]
+                                return if (diff > 0f) diff * 12f else 0f
+                            }
+                        }
+                        data.spectralFlux
+                    } else {
+                        data.spectralFlux
+                    }
+                }
+            }
+        }
     }
 }
 

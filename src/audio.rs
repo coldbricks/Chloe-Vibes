@@ -388,6 +388,96 @@ impl SpectralAnalyzer {
             }
         }
     }
+
+    /// Extract transient flux from a specific frequency range.
+    /// In Full mode, returns the full-spectrum flux for golden-test parity.
+    /// In LowPass/BandPass modes, isolates energy jumps in the target band
+    /// to reject vocal sibilance and cymbals from triggering bass haptics.
+    pub fn extract_flux(
+        data: &SpectralData,
+        prev_data: Option<&SpectralData>,
+        mode: FrequencyMode,
+        target_freq: f32,
+    ) -> f32 {
+        match mode {
+            FrequencyMode::Full => data.spectral_flux,
+            FrequencyMode::LowPass => {
+                if let Some(prev) = prev_data {
+                    let mut flux = 0.0f32;
+                    let mut count = 0.0f32;
+                    for (i, (&curr_e, &prev_e)) in data
+                        .band_energies
+                        .iter()
+                        .zip(prev.band_energies.iter())
+                        .enumerate()
+                    {
+                        if BAND_EDGES[i + 1] <= target_freq {
+                            flux += (curr_e - prev_e).max(0.0);
+                            count += 1.0;
+                        } else if BAND_EDGES[i] < target_freq {
+                            let frac =
+                                (target_freq - BAND_EDGES[i]) / (BAND_EDGES[i + 1] - BAND_EDGES[i]);
+                            flux += (curr_e - prev_e).max(0.0) * frac;
+                            count += frac;
+                        }
+                    }
+                    if count > 0.0 {
+                        (flux / count) * 12.0
+                    } else {
+                        data.spectral_flux
+                    }
+                } else {
+                    data.spectral_flux
+                }
+            }
+            FrequencyMode::HighPass => {
+                if let Some(prev) = prev_data {
+                    let mut flux = 0.0f32;
+                    let mut count = 0.0f32;
+                    for (i, (&curr_e, &prev_e)) in data
+                        .band_energies
+                        .iter()
+                        .zip(prev.band_energies.iter())
+                        .enumerate()
+                    {
+                        if BAND_EDGES[i] >= target_freq {
+                            flux += (curr_e - prev_e).max(0.0);
+                            count += 1.0;
+                        } else if BAND_EDGES[i + 1] > target_freq {
+                            let frac = (BAND_EDGES[i + 1] - target_freq)
+                                / (BAND_EDGES[i + 1] - BAND_EDGES[i]);
+                            flux += (curr_e - prev_e).max(0.0) * frac;
+                            count += frac;
+                        }
+                    }
+                    if count > 0.0 {
+                        (flux / count) * 12.0
+                    } else {
+                        data.spectral_flux
+                    }
+                } else {
+                    data.spectral_flux
+                }
+            }
+            FrequencyMode::BandPass => {
+                if let Some(prev) = prev_data {
+                    for (i, (&curr_e, &prev_e)) in data
+                        .band_energies
+                        .iter()
+                        .zip(prev.band_energies.iter())
+                        .enumerate()
+                    {
+                        if target_freq >= BAND_EDGES[i] && target_freq < BAND_EDGES[i + 1] {
+                            return (curr_e - prev_e).max(0.0) * 12.0;
+                        }
+                    }
+                    data.spectral_flux
+                } else {
+                    data.spectral_flux
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1305,6 +1395,24 @@ impl BeatDetector {
         self.matched_prefire_onset_ms = None;
     }
 
+    /// Fold a raw inter-onset interval into the perceptual beat octave
+    /// (70-180 BPM => 333-857ms). Onset detectors track the subdivision grid,
+    /// but the envelope and predictive pre-fire must lock to the felt beat.
+    #[inline]
+    fn fold_to_perceptual_beat(ioi_ms: f32) -> f32 {
+        let mut t = ioi_ms;
+        if t <= 0.0 {
+            return t;
+        }
+        while t < 333.0 {
+            t *= 2.0;
+        }
+        while t > 857.0 {
+            t /= 2.0;
+        }
+        t
+    }
+
     fn decay_tempo_confidence(&mut self, current_time_ms: f32) {
         if self.tempo_confidence <= 0.0 || self.tempo_interval_ms <= 0.0 {
             return;
@@ -1318,13 +1426,10 @@ impl BeatDetector {
         let grace = self.tempo_interval_ms * 1.5;
         if since <= grace {
             // Still advance the prediction so the next beat stays on-grid.
-            if self.tempo_confidence > 0.5 {
-                let intervals_elapsed = (since / self.tempo_interval_ms) as u32;
-                let next = self.last_onset_time_ms
-                    + (intervals_elapsed + 1) as f32 * self.tempo_interval_ms;
-                // take_prefire may already have consumed this deadline. A
-                // quiet analysis frame must not move it backward and rearm it.
-                self.predicted_next_onset_ms = self.predicted_next_onset_ms.max(next);
+            if self.tempo_confidence > 0.5 && self.predicted_next_onset_ms > 0.0 {
+                while self.predicted_next_onset_ms <= current_time_ms {
+                    self.predicted_next_onset_ms += self.tempo_interval_ms;
+                }
             }
             return;
         }
@@ -1337,11 +1442,10 @@ impl BeatDetector {
             if self.tempo_confidence < 0.05 {
                 self.clear_tempo_lock();
             }
-        } else {
-            let intervals_elapsed = (since / self.tempo_interval_ms) as u32;
-            let next =
-                self.last_onset_time_ms + (intervals_elapsed + 1) as f32 * self.tempo_interval_ms;
-            self.predicted_next_onset_ms = self.predicted_next_onset_ms.max(next);
+        } else if self.predicted_next_onset_ms > 0.0 {
+            while self.predicted_next_onset_ms <= current_time_ms {
+                self.predicted_next_onset_ms += self.tempo_interval_ms;
+            }
         }
     }
 
@@ -1370,26 +1474,90 @@ impl BeatDetector {
             return;
         }
 
-        let mean: f32 = intervals[..count].iter().sum::<f32>() / count as f32;
-        let variance: f32 = intervals[..count]
+        // 1. Raw interval statistics
+        let raw_mean: f32 = intervals[..count].iter().sum::<f32>() / count as f32;
+        let raw_variance: f32 = intervals[..count]
             .iter()
-            .map(|&v| (v - mean).powi(2))
+            .map(|&v| (v - raw_mean).powi(2))
             .sum::<f32>()
             / count as f32;
-        let std_dev = variance.sqrt();
+        let raw_std_dev = raw_variance.sqrt();
+        let raw_cv = if raw_mean > 0.0 {
+            raw_std_dev / raw_mean
+        } else {
+            1.0
+        };
+
+        // 2. Folded perceptual beat statistics (70-180 BPM => 333-857ms)
+        let mut folded_intervals = [0.0f32; 15];
+        for i in 0..count {
+            folded_intervals[i] = Self::fold_to_perceptual_beat(intervals[i]);
+        }
+        let folded_mean: f32 = folded_intervals[..count].iter().sum::<f32>() / count as f32;
+        let folded_variance: f32 = folded_intervals[..count]
+            .iter()
+            .map(|&v| (v - folded_mean).powi(2))
+            .sum::<f32>()
+            / count as f32;
+        let folded_std_dev = folded_variance.sqrt();
+        let folded_cv = if folded_mean > 0.0 {
+            folded_std_dev / folded_mean
+        } else {
+            1.0
+        };
+
+        // 3. Selection: if raw has high jitter (due to subdivisions or syncopation)
+        // and folding recovers a tight rhythmic lock, or if raw is an eighth-note
+        // subdivision grid (mean < 333ms), use folded.
+        let use_folded = (raw_cv > 0.12 && folded_cv < raw_cv * 0.75 && folded_cv < 0.25)
+            || (raw_mean < 333.0 && folded_cv < 0.20)
+            || (raw_cv > 0.20 && folded_cv < 0.20);
+
+        let (chosen_interval, chosen_cv) = if use_folded {
+            (folded_mean, folded_cv)
+        } else {
+            (raw_mean, raw_cv)
+        };
 
         // Confidence: low coefficient of variation = high confidence
-        let cv = if mean > 0.0 { std_dev / mean } else { 1.0 };
-        self.tempo_confidence = (1.0 - cv * 4.0).clamp(0.0, 1.0);
+        self.tempo_confidence = (1.0 - chosen_cv * 4.0).clamp(0.0, 1.0);
         self.tempo_confidence_at_onset = self.tempo_confidence;
-        self.tempo_interval_ms = mean;
+        self.tempo_interval_ms = chosen_interval;
 
         if self.tempo_confidence > 0.5 {
+            // Beat-grid phase alignment:
+            // Find which recent onset best anchors the grid phase.
+            // On-grid hits have |t_j - t_anchor| ~= k * chosen_interval.
             let len = self.onset_timestamps.len();
-            let last_onset = self.onset_timestamps[(self.onset_ts_index + len - 1) % len];
-            let elapsed = current_time_ms - last_onset;
-            let intervals_elapsed = (elapsed / mean) as u32;
-            self.predicted_next_onset_ms = last_onset + (intervals_elapsed + 1) as f32 * mean;
+            let mut best_anchor = self.onset_timestamps[(self.onset_ts_index + len - 1) % len];
+            let mut best_score = -1i32;
+
+            let num_recent = self.onset_ts_count.min(len);
+            for i in 1..=num_recent {
+                let cand = self.onset_timestamps[(self.onset_ts_index + len - i) % len];
+                let mut score = 0;
+                for j in 1..=num_recent {
+                    let other = self.onset_timestamps[(self.onset_ts_index + len - j) % len];
+                    let diff = (other - cand).abs();
+                    let q = (diff / chosen_interval).round();
+                    let err = (diff - q * chosen_interval).abs();
+                    if err <= chosen_interval * 0.15 {
+                        score += 1;
+                    }
+                }
+                if score > best_score {
+                    best_score = score;
+                    best_anchor = cand;
+                }
+            }
+
+            let elapsed = (current_time_ms - best_anchor).max(0.0);
+            let intervals_elapsed = (elapsed / chosen_interval).floor() as i32;
+            let mut next = best_anchor + (intervals_elapsed + 1) as f32 * chosen_interval;
+            while next <= current_time_ms {
+                next += chosen_interval;
+            }
+            self.predicted_next_onset_ms = next;
         } else {
             self.predicted_next_onset_ms = 0.0;
         }
@@ -2984,6 +3152,88 @@ mod tests {
         assert!(
             (output1 - output2).abs() < 0.1,
             "stairs should produce similar output in same step"
+        );
+    }
+
+    #[test]
+    fn syncopated_and_subdivided_rhythms_lock_with_perceptual_beat_and_prefire() {
+        let mut bd = BeatDetector::new();
+        // Alternating kick (strong, 500ms grid) and eighth-note hat (250ms offset).
+        // e.g. kicks at 1000, 1500, 2000, 2500, 3000, 3500...
+        // and eighth-note pickups/hats at 1250, 1750, 2250, 2750, 3250...
+        // Raw intervals alternate between 250ms and 250ms/500ms.
+        let pattern = [
+            (1000.0, 10.0), // kick
+            (1250.0, 4.0),  // hat (8th note)
+            (1500.0, 10.0), // kick/snare
+            (1750.0, 4.0),  // hat
+            (2000.0, 10.0), // kick
+            (2250.0, 4.0),  // hat
+            (2500.0, 10.0), // kick/snare
+            (2750.0, 4.0),  // hat
+            (3000.0, 10.0), // kick
+            (3250.0, 4.0),  // hat
+            (3500.0, 10.0), // kick/snare
+        ];
+
+        // Warm up the 43-frame flux history with baseline noise
+        for i in 0..50 {
+            bd.process(0.02, i as f32 * 20.0);
+        }
+        bd.clear_tempo_lock();
+
+        let mut t = 1000.0_f32;
+        let dt = 25.0_f32; // 40 Hz frame rate, aligns with 250ms
+        let mut pattern_idx = 0;
+        let mut onsets_detected = 0;
+
+        while t <= 3600.0 {
+            let mut flux = 0.02;
+            if pattern_idx < pattern.len() && (t - pattern[pattern_idx].0).abs() < 1.0 {
+                flux = pattern[pattern_idx].1;
+                pattern_idx += 1;
+            }
+            let (is_onset, _) = bd.process(flux, t);
+            if is_onset {
+                onsets_detected += 1;
+            }
+            t += dt;
+        }
+
+        assert_eq!(
+            pattern_idx,
+            pattern.len(),
+            "all pattern items should be fed"
+        );
+        assert!(
+            onsets_detected >= 8,
+            "most pattern onsets should be detected, got {onsets_detected}"
+        );
+
+        // Perceptual folding should recognize the 500ms beat grid:
+        // Confidence must be high (>= 0.70) instead of being crippled to 0.0 by raw CV.
+        assert!(
+            bd.tempo_confidence >= 0.70,
+            "expected high tempo confidence on syncopated music, got {}",
+            bd.tempo_confidence
+        );
+        assert!(
+            (bd.tempo_interval_ms - 500.0).abs() <= 10.0,
+            "expected tempo interval ~500ms, got {}",
+            bd.tempo_interval_ms
+        );
+
+        // Next quarter note is at 4000.0.
+        // At 3955.0 (45ms before downbeat), predictive prefire MUST engage!
+        assert!(
+            bd.prefire_ok(3955.0),
+            "prefire_ok should be true 45ms before next beat, next={}",
+            bd.predicted_next_onset_ms
+        );
+        let prefire = bd.take_prefire(3955.0);
+        assert!(
+            prefire.is_some(),
+            "prefire should trigger for quarter-note beat"
         );
     }
 }

@@ -1,6 +1,6 @@
 # ChloeVibes — Technical Reference
 
-Software version **1.6.2**. Product overview and install: [root README](../README.md).
+Software version **1.7.0**. Product overview and install: [root README](../README.md).
 
 This document is the long-form engineering reference (signal chain, protocols, parity, limitations, CI).
 
@@ -17,7 +17,7 @@ This document is the long-form engineering reference (signal chain, protocols, p
 | Spectral resolution | 2048-point FFT, 1024 usable bins, 23.4 Hz per bin at 48 kHz |
 | Output interface | Lovense BLE UART services; Buttplug 9.0.9 client on desktop |
 | Output resolution | Normalized DSP output; Lovense BLE commands use integer intensity 0 to 20 |
-| Software version | 1.6.2 |
+| Software version | 1.7.0 |
 | License | MIT |
 
 ---
@@ -265,8 +265,8 @@ Desktop dispatch compares the final requested values for every vibration and osc
 | Output resolution | Lovense 0–20 integer |
 | Command pacing | Desktop loop: at most 50 Hz; Android ordinary BLE writes: at least 28 ms apart (~36 Hz), stop writes: 12 ms |
 | Desktop stack | Rust, eframe/egui 0.33.3, Buttplug 9.0.9 |
-| Desktop package | `chloe-vibes` 1.6.2 |
-| Android stack | `com.ashairfoil.chloevibes` 1.6.2 (versionCode 9) |
+| Desktop package | `chloe-vibes` 1.7.0 |
+| Android stack | `com.ashairfoil.chloevibes` 1.7.0 (versionCode 10) |
 | Android SDK | Minimum API 26 (Android 8.0); target / compile API 35 |
 | Stop behavior | Both clients: 2 s pipeline watchdog; desktop: panic-stop and stop-error feedback; Android: stop latch |
 | License | MIT |

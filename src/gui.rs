@@ -476,6 +476,7 @@ struct GuiApp {
 
     // NEW: cached spectral data for UI display
     last_spectral: SpectralData,
+    prev_spectral: Option<SpectralData>,
     gate_is_open: bool,
     climax_phase: f32,
 
@@ -1293,6 +1294,7 @@ impl GuiApp {
             last_spectral_sequence: 0,
             last_onset_strength: 0.0,
             last_spectral: SpectralData::default(),
+            prev_spectral: None,
             gate_is_open: false,
             climax_phase: 0.0,
 
@@ -1778,7 +1780,12 @@ impl eframe::App for GuiApp {
 
                 // 1. Read spectral data from capture thread
                 let spectral_frame = self.spectral_data.load_frame();
-                self.last_spectral = spectral_frame.data;
+                let fresh_spectral = spectral_frame.sequence != self.last_spectral_sequence;
+                if fresh_spectral {
+                    self.prev_spectral = Some(self.last_spectral.clone());
+                    self.last_spectral = spectral_frame.data;
+                    self.last_spectral_sequence = spectral_frame.sequence;
+                }
 
                 // 2. Extract energy based on frequency mode
                 let spectral_energy = SpectralAnalyzer::extract_energy(
@@ -1819,12 +1826,6 @@ impl eframe::App for GuiApp {
                 self.raw_energy = stable_energy;
                 self.using_rms_fallback = using_rms_fallback;
 
-                // Fresh-frame guard: UI repaints far faster than capture
-                // (~240fps vs ~90Hz). Re-feeding duplicate flux compresses the
-                // detector's 43-frame window (~6x onset jitter on real music).
-                let fresh_spectral = spectral_frame.sequence != self.last_spectral_sequence;
-                self.last_spectral_sequence = spectral_frame.sequence;
-
                 // 4. Gate FIRST (frozen chain: Spectral → Gate → Beat → …).
                 // Uses raw pre-volume energy so threshold is volume-independent
                 // (Android parity). Same fresh-frame rule: close smoothing is
@@ -1840,9 +1841,15 @@ impl eframe::App for GuiApp {
 
                 // 5. Beat detection + prefire (current-frame gate for prefire)
                 let (detected_onset, onset_strength) = if fresh_spectral {
+                    let flux = SpectralAnalyzer::extract_flux(
+                        &self.last_spectral,
+                        self.prev_spectral.as_ref(),
+                        self.settings.frequency_mode,
+                        self.settings.target_frequency,
+                    );
                     let (onset, strength) = self
                         .beat_detector
-                        .process(self.last_spectral.spectral_flux, current_time_ms);
+                        .process(flux, current_time_ms);
                     self.last_onset_strength = strength;
                     (onset, strength)
                 } else {
