@@ -50,7 +50,6 @@ jobs:
         with:
           distribution: temurin
           java-version: 21
-      - uses: android-actions/setup-android@v3
       - name: Run Kotlin unit + parity tests
         # Runs ParityTest.kt against the committed tests/parity_golden.csv so
         # Rust<->Kotlin engine drift fails CI. Placed before the APK build to
